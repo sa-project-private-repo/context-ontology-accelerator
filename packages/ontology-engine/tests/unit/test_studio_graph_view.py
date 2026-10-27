@@ -230,6 +230,23 @@ def test_term_view_of_a_class_and_a_property():
         graph_view.term_view(draft(), SCHEME, f"{ONTO}Nope", None)
 
 
+def test_a_class_term_says_whether_structured_queries_answer_it():
+    """The Inspector had to guess it from "has any subclass"; the payload now carries serve's answer."""
+    buyer, gold = (f"{ONTO}{n}" for n in ("Buyer", "GoldCustomer"))
+    d = draft()
+    for c in (buyer, gold):
+        d.tbox.add((URIRef(c), RDF.type, OWL.Class))
+    d.tbox.add((URIRef(buyer), OWL.equivalentClass, URIRef(CUSTOMER)))  # equivalent to a mapped class
+    d.tbox.add((URIRef(gold), RDFS.subClassOf, URIRef(VIP)))  # VIP customer has no map, so neither is answered
+    answered = {
+        iri: graph_view.term_view(d, SCHEME, iri, None)["structuredAnswered"]
+        for iri in (CUSTOMER, PARTY, buyer, VIP, gold, ITEM)
+    }
+    assert answered == {CUSTOMER: True, PARTY: True, buyer: True, VIP: False, gold: False, ITEM: False}
+    # A property's answerability is the unmapped-properties check's, not this field.
+    assert "structuredAnswered" not in graph_view.term_view(d, SCHEME, EMAIL, None)
+
+
 def test_term_refs_say_whether_the_draft_declares_them():
     d = draft()
     term = graph_view.term_view(d, SCHEME, CUSTOMER, None)

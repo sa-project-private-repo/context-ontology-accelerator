@@ -47,6 +47,8 @@ from coa_ontology.versions import deploy as version_deploy
 from coa_ontology.versions import router as versions_router
 from fastapi.testclient import TestClient
 
+from . import studio_fakes
+
 pytestmark = pytest.mark.unit
 
 _SMITHY_DIR = Path(__file__).resolve().parents[4] / "models" / "src" / "main" / "smithy"
@@ -296,6 +298,19 @@ def test_ontology_designer_structured_check_bounds_equal_the_model():
         "removedMappedClasses",
         "removedMappedProperties",
     }
+
+
+def test_the_term_view_and_the_model_agree_on_structured_answered():
+    """The Inspector reads this member for a class, so a rename on either side has to fail here."""
+    output = re.search(r"\noperation GetStudioTerm \{.*?\n    output := \{(.*?)\n    \}", _STUDIO, re.S)
+    assert output, "operation GetStudioTerm not found"
+    assert re.search(r"\n\s+structuredAnswered: Boolean\b", output.group(1)), "structuredAnswered not declared"
+    d = studio_fakes.draft()
+    answered = {
+        iri: studio_graph_view.term_view(d, studio_fakes.SCHEME, iri, None)["structuredAnswered"]
+        for iri in (studio_fakes.CUSTOMER, studio_fakes.ITEM)
+    }
+    assert answered == {studio_fakes.CUSTOMER: True, studio_fakes.ITEM: False}
 
 
 def _member_doc(text: str, structure: str, member: str) -> str:

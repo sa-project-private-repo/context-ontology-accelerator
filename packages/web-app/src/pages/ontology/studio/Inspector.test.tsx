@@ -916,28 +916,46 @@ describe("Inspector", () => {
       ).toBeTruthy();
     });
 
-    it("says a class with subclasses is used only through one mapped to a table", () => {
-      // As the Checks tab counts it: a parent of a mapped class is answered through it.
+    it("reads how structured queries reach an unmapped class off the term, not off its subclasses", () => {
+      const THROUGH =
+        "Structured queries can use this term only through a mapped class below it or equivalent to it.";
+      const NOT_AT_ALL = "Structured queries cannot use this term.";
+      const VIP_REF = { iri: VIP, label: "VIP customer", declared: true };
+      // As the Checks tab counts it: a class above or equivalent to a mapped one
+      // is answered through it, whatever subclasses the term itself lists.
       const p = renderInspector({
+        term: { ...CLASS_TERM, mappings: [], structuredAnswered: true },
+      });
+      expect(screen.getByText("Not mapped to a table")).toBeTruthy();
+      expect(screen.getByText(THROUGH)).toBeTruthy();
+      expect(screen.queryByText(NOT_AT_ALL)).toBeNull();
+
+      // Subclasses, none of them mapped: the Checks tab lists the class too.
+      p.rerender({
         term: {
           ...CLASS_TERM,
           mappings: [],
-          children: [{ iri: VIP, label: "VIP customer", declared: true }],
+          structuredAnswered: false,
+          children: [VIP_REF],
         },
       });
-      expect(screen.getByText("Not mapped to a table")).toBeTruthy();
+      expect(screen.getByText(NOT_AT_ALL)).toBeTruthy();
+      expect(screen.queryByText(THROUGH)).toBeNull();
+
+      // An older engine leaves the field out: the same reading.
+      p.rerender({
+        term: { ...CLASS_TERM, mappings: [], children: [VIP_REF] },
+      });
+      expect(screen.getByText(NOT_AT_ALL)).toBeTruthy();
+      expect(screen.queryByText(THROUGH)).toBeNull();
+
+      // Mapped itself: its maps, and neither sentence.
+      p.rerender({ term: { ...CLASS_TERM, structuredAnswered: true } });
       expect(
-        screen.getByText(
-          "Structured queries can use this term only through a subclass mapped to a table.",
-        ),
+        screen.getByText(/TriplesMap_Customer \(table customer\)/),
       ).toBeTruthy();
-      expect(
-        screen.queryByText("Structured queries cannot use this term."),
-      ).toBeNull();
-      p.rerender({ term: { ...CLASS_TERM, mappings: [], children: [] } });
-      expect(
-        screen.getByText("Structured queries cannot use this term."),
-      ).toBeTruthy();
+      expect(screen.queryByText(NOT_AT_ALL)).toBeNull();
+      expect(screen.queryByText(THROUGH)).toBeNull();
     });
   });
 
@@ -1151,6 +1169,39 @@ describe("Inspector", () => {
       p.rerender({
         term: { ...CLASS_TERM, abox: { aboxCount: 3, afterDeploy: false } },
         abox: { ...STALE_ABOX, current: true, conformsToVersion: 3 },
+      });
+      expect(await screen.findByText("Birch")).toBeTruthy();
+      expect(listDomainInstances).toHaveBeenCalledTimes(2);
+    });
+
+    it("reads the examples again for a build of another version, at the same count", async () => {
+      // A rebuild can leave the class's count as it was and still change which
+      // instances it holds: the version the data conforms to says it is another build.
+      const p = renderInspector({ abox: STALE_ABOX });
+      await screen.findByText("Acme");
+      listDomainInstances.mockResolvedValue({
+        instances: [ACME, { ...ACME, iri: "http://e/data/2", label: "Birch" }],
+      });
+      p.rerender({ term: { ...CLASS_TERM }, abox: { ...STALE_ABOX } });
+      expect(listDomainInstances).toHaveBeenCalledTimes(1);
+      p.rerender({
+        abox: { ...STALE_ABOX, current: true, conformsToVersion: 3 },
+      });
+      expect(await screen.findByText("Birch")).toBeTruthy();
+      expect(listDomainInstances).toHaveBeenCalledTimes(2);
+    });
+
+    it("reads the examples again for a count the same version's build changed", async () => {
+      // A rebuild of the same version (a failed build run again, say).
+      const p = renderInspector({ abox: STALE_ABOX });
+      await screen.findByText("Acme");
+      listDomainInstances.mockResolvedValue({
+        instances: [ACME, { ...ACME, iri: "http://e/data/2", label: "Birch" }],
+      });
+      p.rerender({ term: { ...CLASS_TERM }, abox: { ...STALE_ABOX } });
+      expect(listDomainInstances).toHaveBeenCalledTimes(1);
+      p.rerender({
+        term: { ...CLASS_TERM, abox: { aboxCount: 3, afterDeploy: false } },
       });
       expect(await screen.findByText("Birch")).toBeTruthy();
       expect(listDomainInstances).toHaveBeenCalledTimes(2);

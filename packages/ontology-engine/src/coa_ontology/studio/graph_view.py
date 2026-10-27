@@ -296,6 +296,10 @@ def term_view(d: Draft, scheme: IriScheme, iri: str, badges: AboxBadges | None) 
             for m in sorted(maps_of_class(d.r2rml, t), key=str)
         ]
         view["abox"] = badges.badge(iri) if badges else None
+        # Imported here: checks imports this module, so a module-level import would be circular.
+        from .checks import answered_classes, mapped_classes
+
+        view["structuredAnswered"] = t in answered_classes(g, mapped_classes(d.r2rml))
     else:
         view["domain"] = [_ref(g, x) for x in sorted(g.objects(t, RDFS.domain), key=str) if isinstance(x, URIRef)]
         view["range"] = [_ref(g, x) for x in sorted(g.objects(t, RDFS.range), key=str) if isinstance(x, URIRef)]

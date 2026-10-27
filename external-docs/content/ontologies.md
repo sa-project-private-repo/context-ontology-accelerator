@@ -344,7 +344,11 @@ draft is open, the same button reads **Continue in Ontology designer**.
 - **Click a class** to edit it in the **Inspector**: label, description, IRI,
   parents, attributes, grounding to a reference ontology, and, for a property,
   its domain and range. The Inspector also shows the class's table mappings and
-  a few instances from the domain data. A parent, a domain or a range is a link
+  a few instances from the domain data. **Mappings** lists a class's own maps
+  when it has them. A class with no map of its own reads "Structured queries can
+  use this term only through a mapped class below it or equivalent to it." when
+  structured queries still answer it that way, and "Structured queries cannot
+  use this term." when they do not. A parent, a domain or a range is a link
   only when the draft declares it. One that comes from a reference ontology, an
   XSD datatype range or an anonymous class is shown as plain text, because there
   is nothing to open.
@@ -455,8 +459,11 @@ The **Checks** tab checks the revision on screen, again after every change:
   assistant** to have the problems explained and fixes proposed.
 - **Structured queries** lists what the structured query path (SQL over the
   mapped tables) cannot answer once the draft is deployed: classes with no
-  table mapping (not a parent or an equivalent of a mapped class, which
-  structured queries answer through that class), and the attributes and relationships of a mapped class (or
+  table mapping (a class is left out when structured queries answer it through
+  a mapped class: when a mapped class reaches it by going up `rdfs:subClassOf`
+  and across `owl:equivalentClass`, at any depth, or when the class itself
+  states `owl:equivalentClass` to a mapped
+  class), and the attributes and relationships of a mapped class (or
   relationships into one) that have no column or join behind them. It also
   lists classes mapped from more than one table, which structured queries treat
   as one table, and mapped terms whose label is not their table or column name:
@@ -606,10 +613,12 @@ it, and accept again.
     come from induction. A class, attribute or relationship added in the draft
     therefore has no table mapping, and structured queries cannot answer it
     until its datasource is re-induced; the Checks tab and the Accept dialog
-    list them. A class added as a parent or an equivalent of a mapped class is
-    the exception: structured queries answer it through that class, and it is
-    not listed. A class or property renamed in the draft loses the compiled
-    constraints (SHACL shapes) of its old IRI.
+    list them. A class added as a parent of a mapped class, or as an equivalent
+    of one, is the exception: structured queries answer it through that mapped
+    class, and it is not listed. A class that itself states
+    `owl:equivalentClass` to a class that is only answered that way is listed,
+    because that hop reaches only a mapped class. A class or property renamed
+    in the draft loses the compiled constraints (SHACL shapes) of its old IRI.
 
 ### What structured queries answer after an edit
 
@@ -619,8 +628,13 @@ VKG has loaded it:
 
 - **A class you added**, a subclass included, has no table mapping, so
   structured queries do not offer it; facts extracted from documents can fill
-  it after deploy. A class you added as a parent or an equivalent of a mapped
-  class is answered through that class instead, and is not listed.
+  it after deploy. A class a mapped class reaches, by going up
+  `rdfs:subClassOf` and across `owl:equivalentClass` at any depth, is answered
+  through that mapped class instead, and so is a class that itself states
+  `owl:equivalentClass` to a mapped class; neither is listed. The hop the other
+  way round reaches only a mapped class: a class that states
+  `owl:equivalentClass` to a class that is itself only answered that way is
+  listed.
 - **An attribute or relationship you added** to a mapped class, or a
   relationship you added from another class into a mapped class, has no column
   or join behind it. The deploy marks it unmapped, and structured queries leave

@@ -2544,8 +2544,8 @@ export const MESSAGES_JA = {
   "Not mapped to a table": "テーブルにマッピングされていません",
   "Structured queries cannot use this term.":
     "構造化クエリではこの用語を使用できません。",
-  "Structured queries can use this term only through a subclass mapped to a table.":
-    "構造化クエリでは、テーブルにマッピングされたサブクラスを通じてのみこの用語を使用できます。",
+  "Structured queries can use this term only through a mapped class below it or equivalent to it.":
+    "構造化クエリでは、テーブルにマッピングされた下位クラスまたは同等のクラスを通じてのみこの用語を使用できます。",
   Mapping: "マッピング",
   "(table {table})": "（テーブル {table}）",
   "(column {column})": "（列 {column}）",

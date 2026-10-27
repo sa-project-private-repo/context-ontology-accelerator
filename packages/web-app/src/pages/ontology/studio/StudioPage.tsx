@@ -391,6 +391,9 @@ export function StudioPage({
   const [rebaseOffer, setRebaseOffer] = useState<Versions | null>(null);
   const [acceptOpen, setAcceptOpen] = useState(false);
   const [accepting, setAccepting] = useState(false);
+  // Bumped by each accept with Deploy that lands: its deploy rebuilds the
+  // domain data, so the wait for a rebuild starts over.
+  const [deployWait, setDeployWait] = useState(0);
   // The served version: after a rollback it is older than the one the next version builds on.
   const [activeVersion, setActiveVersion] = useState<number | null>(null);
   // The change set previewed on the graph, with the graph after it.
@@ -500,12 +503,16 @@ export function StudioPage({
   /**
    * Reads the Inspector's term `iri`. Resolves what shows the answer: the
    * term, why it could not be read, or nothing to inspect when the draft no
-   * longer has it. Only the newest read shows anything. `quiet`: a read that
-   * fails for another reason rejects instead.
+   * longer has it. Only the newest read shows anything. `quiet` (the domain
+   * data check): a read that fails for another reason rejects instead, and
+   * the read does not become the newest one, so it never takes over a read a
+   * selection asked for. Such a read may end up showing nothing at all (its
+   * load gives up, or a newer load supersedes it), and the Inspector would
+   * then wait for a term nothing reads again.
    */
   const readTerm = useCallback(
     async (iri: string, quiet = false): Promise<() => void> => {
-      const request = ++termRequest.current;
+      const request = quiet ? termRequest.current : ++termRequest.current;
       let show: () => void;
       try {
         const term = await getStudioTerm(apiClient, namespace, proposalId, iri);
@@ -631,10 +638,17 @@ export function StudioPage({
   // version, read the draft again with the Inspector's term, in the
   // background: a read that fails leaves the page as it is, and the next
   // check reads again. This stops after 10 minutes, unless a build runs or
-  // waits.
-  const aboxStale = graph?.abox?.current === false;
+  // waits, and the 10 minutes start over for every further rebuild the page
+  // learns of, so one that failed does not end the wait for the next: another
+  // state of the domain data in the graph, or an accept from this page, whose
+  // deploy rebuilds it (`deployWait`, as the graph cannot show that yet).
+  const staleAbox = graph?.abox?.current === false ? graph.abox : null;
+  // What the page waits for; null while it waits for nothing.
+  const aboxStale = staleAbox
+    ? `${staleAbox.activeVersion}:${staleAbox.conformsToVersion}:${staleAbox.status}`
+    : null;
   useEffect(() => {
-    if (!aboxStale) return;
+    if (aboxStale === null) return;
     const deadline = Date.now() + ABOX_POLL_TIMEOUT_MS;
     let stopped = false;
     let timer = 0;
@@ -656,7 +670,7 @@ export function StudioPage({
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [aboxStale, apiClient, namespace, reload]);
+  }, [aboxStale, deployWait, apiClient, namespace, reload]);
 
   // The Inspector's term: read when another term is wanted. Each reload that
   // finds a new revision reads it again and shows it with the draft, so until
@@ -989,6 +1003,9 @@ export function StudioPage({
           !fresh.auto_deploy_id &&
           !fresh.auto_deploy_held;
         notify(...acceptedFlash(fresh, deploy, awaitDeploy, t));
+        // The deploy rebuilds the domain data once it ends, which the graph
+        // read below is too early to see: wait for that rebuild from here.
+        if (deploy) setDeployWait((n) => n + 1);
         await reload();
         if (awaitDeploy) await followDeployOutcome(fresh);
         return;

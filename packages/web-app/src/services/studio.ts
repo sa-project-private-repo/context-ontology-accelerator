@@ -143,6 +143,12 @@ export interface StudioTerm {
     parentTriplesMap?: string | null;
   }[];
   abox?: { aboxCount: number | null; afterDeploy: boolean } | null;
+  /**
+   * Classes: true when structured queries answer the class, through its own
+   * mapping or through a mapped class below it or equivalent to it, as the
+   * Checks tab counts it. Older engines do not send it.
+   */
+  structuredAnswered?: boolean;
 }
 
 export interface StudioTermHit {

@@ -1147,6 +1147,13 @@ describe("StudioPage", () => {
       conformsToVersion: 3,
       reason: null,
     };
+    /** Another term, so a read the user's selection started is told from the check's. */
+    const ORDER_TERM: StudioTerm = {
+      ...CUSTOMER_TERM,
+      iri: ORDER,
+      label: "Order",
+      labels: [{ value: "Order", lang: null }],
+    };
 
     /** The namespace's domain data (GET .../abox), built for `version` while v3 is active. */
     function domainData(version: number, extra: Record<string, unknown> = {}) {
@@ -1284,6 +1291,70 @@ describe("StudioPage", () => {
       expect(input.value).toBe("Client");
     });
 
+    it("shows the term a selection asked for when the check's graph read fails", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      studio.getStudioGraph.mockResolvedValue({ ...GRAPH, abox: STALE });
+      getDomainAbox.mockResolvedValue(domainData(3));
+      studio.getStudioTerm.mockResolvedValue(CUSTOMER_TERM);
+      renderPage();
+      fireEvent.click(await screen.findByText("select Customer"));
+      expect(await screen.findByDisplayValue("Customer")).toBeTruthy();
+
+      // The check's reload starts, and its draft read is held: the selection below lands inside it.
+      const heldDraft = deferred<StudioDraft>();
+      studio.getStudioDraft.mockReturnValueOnce(heldDraft.promise);
+      await wait(15_100);
+
+      // The user selects another class; the check reads the same term after it.
+      const selectionRead = deferred<StudioTerm>();
+      studio.getStudioTerm.mockReturnValueOnce(selectionRead.promise);
+      fireEvent.click(screen.getByText("select Order"));
+      studio.getStudioTerm.mockResolvedValue(ORDER_TERM);
+      studio.getStudioGraph.mockRejectedValueOnce(
+        new TypeError("Failed to fetch"),
+      );
+      await act(async () => heldDraft.resolve(draft()));
+
+      // The check's reload ended at its graph read: the selection's read still shows.
+      await act(async () => selectionRead.resolve(ORDER_TERM));
+      expect(await screen.findByDisplayValue("Order")).toBeTruthy();
+      expect(screen.queryByText("Could not load the term")).toBeNull();
+    });
+
+    it("shows the term a selection asked for when a reload supersedes the check's", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      studio.getStudioGraph.mockResolvedValue({ ...GRAPH, abox: STALE });
+      getDomainAbox.mockResolvedValue(domainData(3));
+      studio.getStudioTerm.mockResolvedValue(CUSTOMER_TERM);
+      renderPage();
+      fireEvent.click(await screen.findByText("select Customer"));
+      expect(await screen.findByDisplayValue("Customer")).toBeTruthy();
+
+      const heldDraft = deferred<StudioDraft>();
+      studio.getStudioDraft.mockReturnValueOnce(heldDraft.promise);
+      await wait(15_100);
+
+      // The user selects another class, then both reads of it are held.
+      const selectionRead = deferred<StudioTerm>();
+      studio.getStudioTerm.mockReturnValueOnce(selectionRead.promise);
+      fireEvent.click(screen.getByText("select Order"));
+      const checkRead = deferred<StudioTerm>();
+      studio.getStudioTerm.mockReturnValueOnce(checkRead.promise);
+      await act(async () => heldDraft.resolve(draft()));
+
+      // Another focus reloads on the same revision: it reads no term, and it
+      // supersedes the check's reload, which then shows nothing.
+      fireEvent.click(screen.getByText("focus Order"));
+      await waitFor(() =>
+        expect(studio.getStudioGraph).toHaveBeenCalledTimes(3),
+      );
+      await act(async () => {
+        checkRead.resolve(ORDER_TERM);
+        selectionRead.resolve(ORDER_TERM);
+      });
+      expect(await screen.findByDisplayValue("Order")).toBeTruthy();
+    });
+
     it("reads no history: the older revisions loaded stay", async () => {
       vi.useFakeTimers({ shouldAdvanceTime: true });
       const entry = (revision: number, line: string) => ({
@@ -1366,6 +1437,139 @@ describe("StudioPage", () => {
       await wait(60_000);
       expect(getDomainAbox).toHaveBeenCalledTimes(polls + 1);
       expect(studio.getStudioGraph).toHaveBeenCalledTimes(1);
+    });
+
+    /** The counts dimmed, a failed build for `built` behind them, and the first 10 minutes over. */
+    async function gaveUpWaiting(built = 2): Promise<number> {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      studio.getStudioGraph.mockResolvedValue({
+        ...GRAPH,
+        abox: {
+          ...STALE,
+          conformsToVersion: built,
+          reason: `The domain data was built for v${built}; v3 is active`,
+        },
+      });
+      getDomainAbox.mockResolvedValue(domainData(built, { status: "FAILED" }));
+      renderPage();
+      await screen.findByText("counts dimmed");
+      await wait(11 * 60_000);
+      const polls = getDomainAbox.mock.calls.length;
+      await wait(60_000);
+      expect(getDomainAbox).toHaveBeenCalledTimes(polls);
+      return polls;
+    }
+
+    /** The domain data, and the graph, built for v4 while v4 is active. */
+    function builtForV4() {
+      getDomainAbox.mockResolvedValue(
+        domainData(4, { current: true, activeVersion: 4 }),
+      );
+      studio.getStudioGraph.mockResolvedValue({
+        ...GRAPH,
+        abox: { ...CURRENT, conformsToVersion: 4, activeVersion: 4 },
+      });
+    }
+
+    it("waits again when the graph reports another build to wait for", async () => {
+      const polls = await gaveUpWaiting();
+
+      // A deploy elsewhere makes v4 active: a reload reads that, and the wait
+      // starts over for the rebuild it asks for.
+      studio.getStudioGraph.mockResolvedValue({
+        ...GRAPH,
+        abox: {
+          ...STALE,
+          activeVersion: 4,
+          reason: "The domain data was built for v2; v4 is active",
+        },
+      });
+      fireEvent.click(screen.getByText("focus Order"));
+      await waitFor(() =>
+        expect(studio.getStudioGraph).toHaveBeenCalledTimes(2),
+      );
+
+      builtForV4();
+      await wait(15_100);
+      expect(getDomainAbox).toHaveBeenCalledTimes(polls + 1);
+      await waitFor(() =>
+        expect(screen.queryByText("counts dimmed")).toBeNull(),
+      );
+    });
+
+    it("waits again when the graph reports a build that started for the same version", async () => {
+      const polls = await gaveUpWaiting();
+
+      // A build of v3 started after the one that failed: the versions are
+      // those of the failed build, so only the status says there is a new one.
+      studio.getStudioGraph.mockResolvedValue({
+        ...GRAPH,
+        abox: { ...STALE, status: "BUILDING" },
+      });
+      fireEvent.click(screen.getByText("focus Order"));
+      await waitFor(() =>
+        expect(studio.getStudioGraph).toHaveBeenCalledTimes(2),
+      );
+
+      getDomainAbox.mockResolvedValue(domainData(3));
+      studio.getStudioGraph.mockResolvedValue({ ...GRAPH, abox: CURRENT });
+      await wait(15_100);
+      expect(getDomainAbox).toHaveBeenCalledTimes(polls + 1);
+      await waitFor(() =>
+        expect(screen.queryByText("counts dimmed")).toBeNull(),
+      );
+    });
+
+    it("waits again when a rebuild landed for a version that is stale too", async () => {
+      const polls = await gaveUpWaiting(1);
+
+      // The build that followed the failed one landed for v2, which v3 being
+      // active leaves stale: only the version the data conforms to says the
+      // page has a further rebuild to wait for.
+      studio.getStudioGraph.mockResolvedValue({ ...GRAPH, abox: STALE });
+      fireEvent.click(screen.getByText("focus Order"));
+      await waitFor(() =>
+        expect(studio.getStudioGraph).toHaveBeenCalledTimes(2),
+      );
+
+      getDomainAbox.mockResolvedValue(domainData(3));
+      studio.getStudioGraph.mockResolvedValue({ ...GRAPH, abox: CURRENT });
+      await wait(15_100);
+      expect(getDomainAbox).toHaveBeenCalledTimes(polls + 1);
+      await waitFor(() =>
+        expect(screen.queryByText("counts dimmed")).toBeNull(),
+      );
+    });
+
+    it("waits again for the rebuild an accept from this page asks for", async () => {
+      const polls = await gaveUpWaiting();
+
+      // The accept publishes v4 and deploys it, which rebuilds the domain data.
+      // The graph still reports the build for v2, so only the accept says so.
+      acceptProposal.mockResolvedValue({
+        proposal_id: "p-1",
+        status: "accepting",
+      });
+      fireEvent.click(topBarAccept());
+      const dialog = screen.getByRole("dialog", { name: "Accept revision 2" });
+      await within(dialog).findByText("Classes removed (1)");
+      getProposal.mockResolvedValue({
+        proposal_id: "p-1",
+        status: "accepted",
+        published_version: 4,
+        auto_deploy_id: "d-1",
+        metadata: { label: "Shipping" },
+      });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Accept" }));
+      await wait(2100); // The accept lands on the first poll of the proposal.
+      expect(await screen.findByText(/Published as version v4\./)).toBeTruthy();
+
+      builtForV4();
+      await wait(15_100);
+      expect(getDomainAbox.mock.calls.length).toBeGreaterThan(polls);
+      await waitFor(() =>
+        expect(screen.queryByText("counts dimmed")).toBeNull(),
+      );
     });
   });
 

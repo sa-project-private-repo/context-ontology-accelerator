@@ -323,6 +323,33 @@ def test_a_parent_or_an_equivalent_of_a_mapped_class_is_answered_through_it():
     assert _structured(d, only={agent, PARTY, buyer, purchase})["unmappedClasses"]["count"] == 0
 
 
+def test_a_class_an_answered_class_states_equivalence_to_is_answered_too():
+    """The docs claimed nothing carries on from an answered class; serve's path carries on through it."""
+    group = URIRef(f"{ONTO}Group")
+    d = draft()
+    d.tbox.add((group, RDF.type, OWL.Class))
+    # Party is answered through Customer, its mapped subclass, and the path from Customer carries on
+    # across the equivalence Party states, so serve answers Group through Customer as well.
+    d.tbox.add((URIRef(PARTY), OWL.equivalentClass, group))
+    assert [t["iri"] for t in _structured(d)["unmappedClasses"]["terms"]] == [ITEM, VIP]
+
+
+def test_a_class_stating_equivalence_to_an_answered_class_is_not_answered():
+    """Checks closed owl:equivalentClass backwards from every answered class; serve only reaches a mapped one."""
+    buyer, same_party, purchase = (f"{ONTO}{n}" for n in ("Buyer", "SameParty", "Purchase"))
+    d = draft()
+    for c in (buyer, same_party, purchase):
+        d.tbox.add((URIRef(c), RDF.type, OWL.Class))
+    # Party is answered through Customer, its mapped subclass, but Party itself carries no mapping, so
+    # serve lists a class equivalent to Party, and a class equivalent to that one.
+    d.tbox.add((URIRef(buyer), OWL.equivalentClass, URIRef(PARTY)))
+    d.tbox.add((URIRef(same_party), OWL.equivalentClass, URIRef(buyer)))
+    # Order is mapped, so the forward path from it answers Purchase; the pair is a cycle.
+    d.tbox.add((URIRef(ORDER), OWL.equivalentClass, URIRef(purchase)))
+    d.tbox.add((URIRef(purchase), OWL.equivalentClass, URIRef(ORDER)))
+    assert [t["iri"] for t in _structured(d)["unmappedClasses"]["terms"]] == [buyer, ITEM, same_party, VIP]
+
+
 def test_a_class_named_only_by_an_untyped_map_is_not_mapped():
     d = draft()
     d.r2rml.remove((URIRef(f"{ONTO}TriplesMap_Order"), RDF.type, None))

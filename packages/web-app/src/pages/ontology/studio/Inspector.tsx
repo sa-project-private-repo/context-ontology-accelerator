@@ -716,10 +716,11 @@ function TermForms({
                 {t("Not mapped to a table")}
               </Box>
               <Box variant="small" color="text-body-secondary">
-                {/* As the Checks count it: a class above a mapped class is answered through it. */}
-                {isClass && (term.children ?? []).length > 0
+                {/* The engine judges this as the Checks do; its subclasses say
+                    nothing about it, as none of them need be mapped. */}
+                {isClass && term.structuredAnswered
                   ? t(
-                      "Structured queries can use this term only through a subclass mapped to a table.",
+                      "Structured queries can use this term only through a mapped class below it or equivalent to it.",
                     )
                   : t("Structured queries cannot use this term.")}
               </Box>

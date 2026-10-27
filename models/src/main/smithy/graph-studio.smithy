@@ -879,6 +879,9 @@ operation GetStudioTerm {
 
         /// ABox badge (classes, when the namespace has an ABox).
         abox: StudioAboxBadge
+
+        /// True when structured queries answer the class (classes): it is mapped, a mapped class reaches it by a forward `rdfs:subClassOf`/`owl:equivalentClass` path, or it states `owl:equivalentClass` to a mapped class.
+        structuredAnswered: Boolean
     }
 
     errors: [
@@ -1156,7 +1159,7 @@ operation RebaseStudioDraft {
     ]
 }
 
-/// What accepting the current revision would publish: the diff with the base version, renames and merges, the governed metrics it breaks, and what structured queries cannot answer among the terms it adds or changes. Accept itself is `AcceptProposal` with this `revision` as `expectedRevision`.
+/// What accepting the current revision would publish: the diff with the base version, renames and merges, the governed metrics it breaks, and what structured queries cannot answer among the terms it adds or changes and the classes the base version answers and the draft does not. Accept itself is `AcceptProposal` with this `revision` as `expectedRevision`.
 ///
 /// Errors: 404 `ProposalNotFound` or `StudioDraftNotOpen`.
 @readonly

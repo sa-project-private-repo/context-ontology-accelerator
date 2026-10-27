@@ -212,22 +212,28 @@ def mapped_classes(r2rml: Graph) -> set[URIRef]:
     }
 
 
-def _answered_classes(g: Graph, mapped: set[URIRef]) -> set[URIRef]:
-    """The mapped classes, every class one of them is a subclass of (at any depth), and their equivalents.
+def answered_classes(g: Graph, mapped: set[URIRef]) -> set[URIRef]:
+    """The mapped classes and the unmapped ones structured queries still answer, by serve's rule.
 
-    The VKG answers such a class through the mapped class below it, and the query console does not
-    refuse it (serve's ``refuse_vkg_terms``); ``owl:equivalentClass`` counts either way.
+    Serve's rule (``coa_serve.tier2.unmapped_terms``, whose ``coa:isMapped true`` is this ``mapped``):
+    a class without a mapping is answered when a mapped class reaches it by a forward
+    ``rdfs:subClassOf|owl:equivalentClass`` path, or when the class itself states
+    ``owl:equivalentClass`` to a mapped class. A class whose own ``owl:equivalentClass``
+    names a class that is only answered, not a mapped one, is not answered (an equivalence the
+    answered class states is part of the forward path, and does answer the other class): serve lists
+    it as a term no table maps, and both Tier 2 writers decline a question about it. The query console
+    (``refuse_vkg_terms``) is looser and refuses no such class.
     """
     answered = set(mapped)
     stack = list(mapped)
     while stack:
         c = stack.pop()
-        equivalents = {*g.objects(c, OWL.equivalentClass), *g.subjects(OWL.equivalentClass, c)}
-        for n in {*g.objects(c, RDFS.subClassOf), *equivalents}:
-            if isinstance(n, URIRef) and n not in answered:
+        for n in (*g.objects(c, RDFS.subClassOf), *g.objects(c, OWL.equivalentClass)):
+            if isinstance(n, URIRef) and n not in answered:  # a class already answered ends a cycle
                 answered.add(n)
                 stack.append(n)
-    return answered
+    # The one hop serve allows the other way round, stated on the unmapped class's own side.
+    return answered | {c for m in mapped for c in g.subjects(OWL.equivalentClass, m) if isinstance(c, URIRef)}
 
 
 def _group(terms: list[dict[str, Any]]) -> dict[str, Any]:
@@ -269,9 +275,10 @@ def structured_check(d: Draft, *, base_maps_tables: bool, only: set[str] | None 
     (``ops.property_maps``), and a property is unmapped on a mapped class when it is not mapped and one
     of its domains is, or, for a relationship, one of its ranges (the NL-to-SQL foreign-key walk follows
     a relationship from both ends). Its ``domainIri`` is that mapped class: the first mapped domain by
-    IRI, else the first mapped range. ``unmappedClasses`` leaves out a class that is not mapped but is a
-    parent or an equivalent of a mapped one (:func:`_answered_classes`), as serve does: structured
-    queries answer it through that class. A mapped class or attribute is listed in ``labelDiffers`` when its
+    IRI, else the first mapped range. ``unmappedClasses`` leaves out a class that is not mapped but that
+    a mapped class reaches by a forward ``rdfs:subClassOf|owl:equivalentClass`` path, or that itself
+    states ``owl:equivalentClass`` to a mapped class (:func:`answered_classes`, serve's rule): structured
+    queries answer it through that mapped class. A mapped class or attribute is listed in ``labelDiffers`` when its
     label is not the table or column name NL-to-SQL keeps writing; a class read from several tables (a
     table is a datasource and a qualified name, ``ops.map_tables``) is listed in ``multiTableClasses``
     instead.
@@ -282,7 +289,7 @@ def structured_check(d: Draft, *, base_maps_tables: bool, only: set[str] | None 
     g, r2rml = d.tbox, d.r2rml
     classes, obj_props, dt_props = schema_subjects(g)
     mapped = mapped_classes(r2rml)
-    answered = _answered_classes(g, mapped)
+    answered = answered_classes(g, mapped)
     tables = {c: ops.class_tables(r2rml, c) for c in mapped}
     unmapped_classes: list[dict[str, Any]] = []
     unmapped_properties: list[dict[str, Any]] = []
@@ -453,7 +460,7 @@ def structured(
     caller passes it (``base_tbox``), only when the draft deletes a mapped term: their labels are only
     there. ``only`` limits the :func:`structured_check` groups, not the deletions, which a diff lists as
     removed; with ``base_tbox`` it also keeps the classes that version answered and ``d`` does not
-    (:func:`_answered_classes`), which an edit to another term can leave unanswered (a mapped class no
+    (:func:`answered_classes`), which an edit to another term can leave unanswered (a mapped class no
     longer below its parent). ``error`` says that version could not be read: ``mapsNoTable`` is then
     false and nothing is listed as deleted.
     """
@@ -469,8 +476,8 @@ def structured(
         base_r2rml, classes, properties, error = Graph(), [], [], BASE_MAPPING_ERROR
     base = Draft(base_tbox if base_tbox is not None else Graph(), base_r2rml)
     if only is not None and base_tbox is not None:
-        was_answered = _answered_classes(base_tbox, mapped_classes(base_r2rml))
-        only = only | {str(c) for c in was_answered - _answered_classes(d.tbox, mapped_classes(d.r2rml))}
+        was_answered = answered_classes(base_tbox, mapped_classes(base_r2rml))
+        only = only | {str(c) for c in was_answered - answered_classes(d.tbox, mapped_classes(d.r2rml))}
     return {
         **structured_check(d, base_maps_tables=bool(mapped_classes(base_r2rml)), only=only),
         **removed_mapped(base, classes, properties),
