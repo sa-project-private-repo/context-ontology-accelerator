@@ -102,6 +102,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         comments=None,
         super_classes=None,
         is_mapped=False,
+        physical_name="",
     ):
         """Persist a class into the ontology's graph in the bound namespace.
 
@@ -113,6 +114,8 @@ class NeptuneAnalyticsGraphStore(GraphStore):
             super_classes: Parent class URIs (``rdfs:subClassOf`` targets).
             is_mapped: Tier-2 R2RML-answerability marker; accepted for protocol
                 parity but not persisted on this backend (see the note below).
+            physical_name: The class's table, from the R2RML; accepted for protocol
+                parity but not persisted, like ``is_mapped``.
 
         Returns:
             The stored class as a dict.
@@ -130,7 +133,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         # Until then, NA-backed namespaces carry no isMapped marker and serve treats
         # absent as unmapped (i.e. NA classes are hidden from the structured
         # Tier-2 prompt rather than wrongly exposed).
-        _ = is_mapped  # accepted for protocol parity; NA persistence is a follow-up
+        _ = is_mapped, physical_name  # accepted for protocol parity; NA persistence is a follow-up
         return na_store.store_class(
             ontology_uri,
             class_uri,
@@ -148,6 +151,10 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         comment="",
         domains=None,
         ranges=None,
+        unmapped=False,
+        physical_name="",
+        mapped_domains=(),
+        mapped_ranges=(),
     ):
         """Persist a property into the ontology's graph in the bound namespace.
 
@@ -158,10 +165,22 @@ class NeptuneAnalyticsGraphStore(GraphStore):
             comment: Definition/comment for the property.
             domains: Domain class URIs for the property.
             ranges: Range URIs (class IRIs for object properties, datatypes otherwise).
+            unmapped: Tier-2 marker for a property no mapping maps although one of
+                its domains (or, for a relationship, one of its ranges) is mapped;
+                accepted for protocol parity but not persisted, like ``is_mapped``
+                on :meth:`store_class`.
+            physical_name: The property's column, from the R2RML; accepted for
+                protocol parity but not persisted either.
+            mapped_domains: The classes the mapping puts the property on; accepted for
+                protocol parity but not persisted either.
+            mapped_ranges: The classes its joins reach; accepted for protocol parity
+                but not persisted either.
 
         Returns:
             The stored property as a dict.
         """
+        # NA carries no isMapped marker on classes either (see store_class)
+        _ = unmapped, physical_name, mapped_domains, mapped_ranges
         return na_store.store_property(
             ontology_uri,
             prop_uri,
@@ -215,8 +234,8 @@ class NeptuneAnalyticsGraphStore(GraphStore):
     def count_classes_and_properties(self, ontology_id):
         """Neptune Analytics does not implement deduped count reconciliation.
 
-        Returns ``None`` so the accept-flow reconcile step
-        (``_reconcile_counts``) leaves the registry counts unchanged.
+        Returns ``None`` so a caller reconciling counts leaves the registry
+        counts unchanged.
         Computing this would require an opencypher aggregation over the
         ontology's vertices — out of scope for this backend, which is
         not the default workbench backend.

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 from ..step_ids import StepId
 from ..trace import TraceCollector, client_error_detail
+from .domain_abox import DomainAboxAugmenter
 from .graph_traverser import GraphTraverser
 from .synthesizer import MAX_PROMPT_CHUNKS, SynthesisResult, Synthesizer
 from .vector_retriever import VectorRetriever
@@ -99,6 +100,7 @@ class KnowledgeRetriever:
         graph_traverser: GraphTraverser | None,
         synthesizer: Synthesizer,
         lexical_retriever: BaselineLexicalRetriever | None = None,
+        domain_abox: DomainAboxAugmenter | None = None,
     ):
         """Wire the retrieval sources and synthesizer for Tier 3.
 
@@ -107,11 +109,13 @@ class KnowledgeRetriever:
             graph_traverser: Optional Neptune graph traverser.
             synthesizer: LLM synthesizer that composes the final answer.
             lexical_retriever: Optional graphrag lexical baseline retriever.
+            domain_abox: Optional reader of domain ABox facts, used on the lexical path.
         """
         self._vector = vector_retriever
         self._graph = graph_traverser
         self._synthesizer = synthesizer
         self._lexical = lexical_retriever
+        self._domain_abox = domain_abox
 
     @property
     def vector_retriever(self) -> VectorRetriever | None:
@@ -127,6 +131,10 @@ class KnowledgeRetriever:
         graphrag_toolkit) on the default hand-rolled path.
         """
         return self._lexical is not None
+
+    def set_lexical_retriever(self, lexical_retriever: BaselineLexicalRetriever | None) -> None:
+        """Set the lexical baseline retriever, which ``main`` builds for the query path after the rest of serve."""
+        self._lexical = lexical_retriever
 
     async def resolve(
         self,
@@ -427,6 +435,7 @@ class KnowledgeRetriever:
                 )
             vec_chunks = list(baseline_result.chunks)
             graph_entities = list(baseline_result.entities)
+            chunk_ids = baseline_result.chunk_ids
         except Exception as exc:
             logger.error("lexical_retrieval_unhandled_error", error_type=type(exc).__name__, exc_info=True)
             detail = "retrieval_error"
@@ -443,6 +452,19 @@ class KnowledgeRetriever:
             trace.record(StepId.LEXICAL_BASELINE_RETRIEVE, "error", 0, detail=detail)
             vec_chunks = []
             graph_entities = []
+            chunk_ids = ()
+
+        domain_facts: list[str] = []
+        domain_version: str | None = None
+        if self._domain_abox is not None:
+            facts, domain_step = await self._domain_abox.augment(namespace, graph_entities, chunk_ids=chunk_ids)
+            trace_steps.append(domain_step)
+            trace.record(
+                domain_step["step"], domain_step["status"], domain_step["durationMs"], detail=domain_step.get("detail")
+            )
+            if facts is not None:
+                domain_facts = list(facts.facts)
+                domain_version = facts.version
 
         if catalog_summary is not None:
             trace_steps.append(
@@ -464,6 +486,8 @@ class KnowledgeRetriever:
                 catalog_summary=catalog_summary,
                 conversation_history=conversation_history,
                 model_id=model_id,
+                domain_facts=domain_facts or None,
+                domain_version=domain_version,
             )
             trace_steps.append(
                 {

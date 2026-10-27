@@ -456,7 +456,8 @@ export const MESSAGES_JA = {
     "このメトリクスを計算する SQL 式です。データソースで使用する SQL 方言ごとに 1 つ追加してください。",
   "Add dialect": "SQL 方言を追加",
   Remove: "削除",
-  "SUM(orders.total_amount)": "SUM(orders.total_amount)",
+  "SELECT SUM(total_amount) FROM orders":
+    "SELECT SUM(total_amount) FROM orders",
   "AI Context (optional)": "AI コンテキスト（任意）",
   "Alternative names users might use when asking about this metric.":
     "このメトリクスについて質問するときに利用者が使う可能性がある別名です。",
@@ -1157,6 +1158,7 @@ export const MESSAGES_JA = {
   accepting: "承認中",
   pending: "待機中",
   updated: "更新済み",
+  cancelled: "キャンセル済み",
   "Failed to delete ontology: {error}":
     "オントロジーを削除できませんでした: {error}",
   "Failed to delete ontology": "オントロジーを削除できませんでした",
@@ -1564,8 +1566,8 @@ export const MESSAGES_JA = {
     "編集内容（Turtle、R2RML、グラウンディングの選択）を、承認せずにドラフトへ保存します。",
   "Read-only quality checks: reasoner consistency (HermiT), structural metrics, and design pitfalls (OoPS!, if enabled). Doesn't change the proposal.":
     "読み取り専用の品質チェックです。推論の整合性（HermiT）、構造メトリクス、設計上の問題（OoPS!、有効な場合）を確認します。提案は変更しません。",
-  "Merges this draft into the namespace's live ontology (graph, search index, storage). Runs in the background; can't be undone here.":
-    "このドラフトを名前空間の公開オントロジー（グラフ、検索インデックス、ストレージ）へマージします。バックグラウンドで実行され、ここでは元に戻せません。",
+  "Publishes this draft as the namespace's next ontology version. With “Deploy immediately” it also becomes the served ontology; otherwise deploy it later from Ontology › Induction › Versions.":
+    "このドラフトを名前空間の次のオントロジーバージョンとして公開します。「すぐにデプロイ」をオンにすると提供中のオントロジーにもなります。オフの場合は、後で「オントロジー › 誘導 › バージョン」からデプロイしてください。",
   "Already accepted": "承認済み",
   "Accept proposal": "提案を承認",
   "Proposal {id}…": "提案 {id}…",
@@ -1576,8 +1578,8 @@ export const MESSAGES_JA = {
   "Accepting proposal…": "提案を承認中…",
   "Waiting for embeddings to become searchable in the vector index.":
     "埋め込みがベクトルインデックスで検索可能になるのを待っています。",
-  "Merging into ontology graph (Neptune + AOSS + S3 + embeddings).":
-    "オントロジーグラフへマージしています（Neptune + AOSS + S3 + 埋め込み）。",
+  "Publishing a new ontology version (merge, snapshot, VKG artifacts).":
+    "新しいオントロジーバージョンを公開しています（マージ、スナップショット、VKG ファイル）。",
   "Save or discard your edits first": "先に編集を保存するか破棄してください",
   "Accept with unrepaired datatype issues?":
     "未修復のデータ型問題があるまま承認しますか？",
@@ -1941,6 +1943,8 @@ export const MESSAGES_JA = {
   "Ontology context loaded.": "オントロジーコンテキストを読み込みました。",
   "Ontop could not translate SPARQL to SQL.":
     "Ontop は SPARQL を SQL に変換できませんでした。",
+  "The VKG still serves {vkgVersion}; the ontology is {ontologyVersion}.":
+    "VKG はまだ {vkgVersion} を提供しています。オントロジーは {ontologyVersion} です。",
   "Ontop could not translate SPARQL to SQL: {reason}.":
     "Ontop は SPARQL を SQL に変換できませんでした: {reason}。",
   "Ontop could not translate the SPARQL to SQL":
@@ -2239,4 +2243,730 @@ export const MESSAGES_JA = {
     "。このデータソースは、その誘導を開始した後に再スキャン・再承認されました。",
   "The pending proposal was built on the older source, so accepting it won't include the re-scan's changes. Re-run the induction on the current source, then accept the new proposal.":
     "保留中の提案は以前のデータソースに基づいているため、承認しても再スキャンの変更は含まれません。現在のデータソースで誘導をやり直し、新しい提案を承認してください。",
+  // Ontology versions: publish on accept, deploy and roll back.
+  "Deploy immediately": "すぐにデプロイ",
+  "Published as version v{version}.":
+    "バージョン v{version} として公開しました。",
+  "Deploy it from Ontology › Induction › Versions.":
+    "「オントロジー › 誘導 › バージョン」からデプロイしてください。",
+  "Deployment started. Follow it in Ontology › Induction › Versions.":
+    "デプロイを開始しました。進行状況は「オントロジー › 誘導 › バージョン」で確認できます。",
+  "Deployment requested. Check Ontology › Induction › Versions for its status.":
+    "デプロイを要求しました。状態は「オントロジー › 誘導 › バージョン」で確認してください。",
+  "Waiting for the deployment to start…": "デプロイの開始を待っています…",
+  "Version v{version} was published but not deployed":
+    "バージョン v{version} は公開されましたが、デプロイされていません",
+  "Deploying would break governed metrics: {names}. Review the impact and deploy from Ontology › Induction › Versions.":
+    "デプロイするとガバナンス対象のメトリクスが壊れます: {names}。影響を確認し、「オントロジー › 誘導 › バージョン」からデプロイしてください。",
+  "Another deployment was running. Deploy this version from Ontology › Induction › Versions when it finishes.":
+    "別のデプロイが実行中でした。完了後に「オントロジー › 誘導 › バージョン」からこのバージョンをデプロイしてください。",
+  "The deployment could not start: {reason}.":
+    "デプロイを開始できませんでした: {reason}。",
+  "The deployment could not start: {reason}. Retry from Ontology › Induction › Versions.":
+    "デプロイを開始できませんでした: {reason}。「オントロジー › 誘導 › バージョン」から再試行してください。",
+  Versions: "バージョン",
+  Version: "バージョン",
+  Published: "公開済み",
+  "Publishing…": "公開中…",
+  "Publish failed": "公開に失敗",
+  Deployed: "デプロイ済み",
+  "Deploying…": "デプロイ中…",
+  "Partially deployed: redeploy to finish":
+    "一部のみデプロイ済み: 再デプロイして完了してください",
+  "Deploy failed": "デプロイに失敗",
+  Deploy: "デプロイ",
+  Redeploy: "再デプロイ",
+  "Roll back": "ロールバック",
+  "Deploy v{version}": "v{version} をデプロイ",
+  "Redeploy v{version}": "v{version} を再デプロイ",
+  "Roll back to v{version}": "v{version} にロールバック",
+  "Deploy version {version}": "バージョン {version} をデプロイ",
+  "Redeploy version {version}": "バージョン {version} を再デプロイ",
+  "Roll back to version {version}": "バージョン {version} にロールバック",
+  "{action}?": "{action}しますか？",
+  "Stage graph": "グラフをステージング",
+  "Swap graph": "グラフを切り替え",
+  "Replace embeddings": "埋め込みを置き換え",
+  "Update registry": "レジストリを更新",
+  "Publish VKG files": "VKG ファイルを公開",
+  "Request VKG reload": "VKG の再読み込みを要求",
+  Done: "完了",
+  "In progress": "実行中",
+  "Not started": "未開始",
+  "Classes {changes}": "クラス {changes}",
+  "Classes {changes}, properties ~{properties}":
+    "クラス {changes}、プロパティ ~{properties}",
+  "{kind}: +{added} / −{removed} / ~{changed}":
+    "{kind}: +{added} / −{removed} / ~{changed}",
+  "Could not check deployment impact": "デプロイの影響を確認できませんでした",
+  "The deployment impact could not be checked.":
+    "デプロイの影響を確認できませんでした。",
+  "Checking deployment impact…": "デプロイの影響を確認中…",
+  "A deployment is running": "デプロイを実行中です",
+  "Acknowledge the metrics this deploy breaks first.":
+    "先に、このデプロイで壊れるメトリクスを確認してください。",
+  "Could not load versions": "バージョンを読み込めませんでした",
+  "Redeploy required": "再デプロイが必要です",
+  "The deployment of v{version} failed after the served graph may already have been replaced, so the graph, embeddings and VKG files can be out of step. Deploy v{version} again to finish.":
+    "v{version} のデプロイは、提供中のグラフが置き換えられた可能性がある段階で失敗したため、グラフ、埋め込み、VKG ファイルの内容が一致していない可能性があります。v{version} をもう一度デプロイして完了してください。",
+  "Latest deployment: v{version}": "最新のデプロイ: v{version}",
+  "The next version builds on v{head}, not the active v{active}; its changes carry over unless you revert them.":
+    "次のバージョンはアクティブな v{active} ではなく v{head} を基に作成されます。元に戻さない限り、その変更は引き継がれます。",
+  "Loading versions": "バージョンを読み込み中",
+  "No versions yet. Accepting a proposal publishes version 1.":
+    "バージョンはまだありません。提案を承認するとバージョン 1 が公開されます。",
+  Retired: "廃止",
+  "Existing ontology": "既存のオントロジー",
+  Proposal: "提案",
+  "Published by": "公開者",
+  Changes: "変更",
+  "Details of version {version}": "バージョン {version} の詳細",
+  "Could not load version details": "バージョンの詳細を読み込めませんでした",
+  Close: "閉じる",
+  "v{version} details": "v{version} の詳細",
+  "Close dialog": "ダイアログを閉じる",
+  "This replaces the served ontology graph and its embeddings with v{version}, and asks the VKG to reload its mappings, which takes effect within a few minutes.":
+    "提供中のオントロジーグラフとその埋め込みを v{version} に置き換え、VKG にマッピングの再読み込みを要求します。反映には数分かかります。",
+  "{count} governed metric will lose its linked class":
+    "ガバナンス対象のメトリクス {count} 件がリンク先のクラスを失います",
+  "{count} governed metrics will lose their linked class":
+    "ガバナンス対象のメトリクス {count} 件がリンク先のクラスを失います",
+  "These metrics stay defined but point at classes v{version} no longer contains.":
+    "これらのメトリクスは定義されたまま残りますが、v{version} に含まれなくなったクラスを参照します。",
+  "Removed class": "削除されるクラス",
+  "I understand these metrics will break":
+    "これらのメトリクスが壊れることを理解しました",
+  // Domain data tab (domain ABox) and the Tier 3 domain-facts step.
+  "{label} is not in the rebuilt domain ABox.":
+    "{label} は再構築されたドメイン ABox にありません。",
+  "All classes": "すべてのクラス",
+  "Could not load the domain ABox": "ドメイン ABox を読み込めませんでした",
+  "Could not queue a rebuild": "再構築をキューに追加できませんでした",
+  "Instances, relations and evidence extracted from the namespace's documents for the deployed ontology version.":
+    "デプロイ済みのオントロジーバージョンに沿って、名前空間のドキュメントから抽出したインスタンス、リレーション、エビデンスです。",
+  "No ontology version is active to build from.":
+    "構築元となるアクティブなオントロジーバージョンがありません。",
+  Rebuild: "再構築",
+  "Domain ABox": "ドメイン ABox",
+  "Last built {time}": "最終構築: {time}",
+  "Out of date": "最新ではありません",
+  Instances: "インスタンス",
+  Relations: "リレーション",
+  Evidence: "エビデンス",
+  "Last build failed": "前回の構築に失敗しました",
+  "Loading domain ABox": "ドメイン ABox を読み込み中",
+  "Could not load instances": "インスタンスを読み込めませんでした",
+  "Loading instances": "インスタンスを読み込み中",
+  "No instances match the filter.":
+    "フィルターに一致するインスタンスはありません。",
+  "No instances yet.": "インスタンスはまだありません。",
+  "Filter by class": "クラスで絞り込む",
+  "Find instances by label": "ラベルでインスタンスを検索",
+  "Filter instances": "インスタンスを絞り込む",
+  "Open {label} ({classLabel})": "{label}（{classLabel}）を開く",
+  "Other labels": "その他のラベル",
+  "Load more": "さらに読み込む",
+  "Could not load the instance": "インスタンスを読み込めませんでした",
+  "Could not load mappings": "マッピングを読み込めませんでした",
+  "Could not reset the mapping": "マッピングをリセットできませんでした",
+  "Loading mappings": "マッピングを読み込み中",
+  "No mappings match the filter.":
+    "フィルターに一致するマッピングはありません。",
+  "No class mappings yet.": "クラスのマッピングはまだありません。",
+  "No relation mappings yet.": "リレーションのマッピングはまだありません。",
+  "No attribute mappings yet.": "属性のマッピングはまだありません。",
+  "Search the ontology's classes.": "オントロジーのクラスを検索します。",
+  "Search the ontology's object properties.":
+    "オントロジーのオブジェクトプロパティを検索します。",
+  "Type to search object properties…":
+    "オブジェクトプロパティを検索する文字列を入力…",
+  "Search the ontology's datatype properties.":
+    "オントロジーのデータ型プロパティを検索します。",
+  "Type to search datatype properties…":
+    "データ型プロパティを検索する文字列を入力…",
+  auto: "自動",
+  manual: "手動",
+  Stale: "失効",
+  "Mapping kind": "マッピングの種類",
+  "How the strings found in the documents map to ontology terms. A change queues a rebuild.":
+    "ドキュメント内で見つかった文字列とオントロジー用語との対応です。変更すると再構築がキューに追加されます。",
+  Mappings: "マッピング",
+  "Found in documents": "ドキュメント内の表現",
+  "Maps to": "対応先",
+  "Change target of {key}": "{key} の対応先を変更",
+  "Change target": "対応先を変更",
+  "Reset {key} to auto": "{key} を自動に戻す",
+  "Reset to auto": "自動に戻す",
+  "Chosen by the next build": "次回の構築で決定",
+  "Use free attribute": "自由属性を使用",
+  Ignore: "無視",
+  "Pick a target first.": "先に対応先を選択してください。",
+  "Currently: {target}": "現在: {target}",
+  Target: "対応先",
+  Direction: "方向",
+  "Could not change the mapping": "マッピングを変更できませんでした",
+  Forward: "順方向",
+  "From {from} to {to}": "{from} から {to} へ",
+  Inverse: "逆方向",
+  "Also known as {labels}": "別名: {labels}",
+  "No attributes": "属性はありません",
+  free: "自由",
+  Value: "値",
+  Links: "リンク",
+  "No links": "リンクはありません",
+  "Showing the first {count} incoming links.":
+    "受信リンクのうち最初の {count} 件を表示しています。",
+  "No evidence": "エビデンスはありません",
+  "{file}, chunk {index}": "{file}、チャンク {index}",
+  "Showing the first {count} evidence chunks.":
+    "エビデンスのチャンクのうち最初の {count} 件を表示しています。",
+  Building: "構築中",
+  "Rebuild queued": "再構築を待機中",
+  "Build failed": "構築に失敗しました",
+  "Not built": "未構築",
+  "No ontology version deployed":
+    "デプロイ済みのオントロジーバージョンはありません",
+  "Active v{version}": "アクティブ v{version}",
+  "Built for v{built}, no active version":
+    "v{built} 向けに構築、アクティブなバージョンなし",
+  "Built for v{built}, active v{active}":
+    "v{built} 向けに構築、アクティブ v{active}",
+  Ignored: "無視",
+  "Free attribute": "自由属性",
+  "{label} (inverse)": "{label}（逆方向）",
+  "Domain data": "ドメインデータ",
+  "Domain facts": "ドメインファクト",
+  // Ontology designer
+  "no version": "バージョンなし",
+  "v{version}": "v{version}",
+  "Add a subclass of {label}": "{label} のサブクラスを追加",
+  "Add a relationship from {label}": "{label} からのリレーションシップを追加",
+  "Rename {label}": "{label} の名前を変更",
+  "Delete {label}": "{label} を削除",
+  "Merge classes": "クラスを統合",
+  "Rebased onto {version}: {replayed} change(s) replayed, {skipped} skipped.":
+    "{version} にリベースしました: {replayed} 件の変更を再適用し、{skipped} 件をスキップしました。",
+  "Rebased onto {version}: {replayed} change(s) replayed.":
+    "{version} にリベースしました: {replayed} 件の変更を再適用しました。",
+  "The draft is already built on the newest version.":
+    "ドラフトはすでに最新バージョンをベースにしています。",
+  "Accepted.": "承認しました。",
+  "Published as version v{version}. Its deployment is on the Versions tab.":
+    "バージョン v{version} として公開しました。デプロイの状況は「バージョン」タブで確認できます。",
+  "Published as version v{version}. Deploy it from the Versions tab.":
+    "バージョン v{version} として公開しました。「バージョン」タブからデプロイしてください。",
+  "Accept failed. Accept again to retry.":
+    "承認に失敗しました。もう一度承認して再試行してください。",
+  "Accept is still running after 5 minutes; refresh the page to check.":
+    "5 分経過しても承認処理が続いています。ページを更新して確認してください。",
+  "Could not load the designer draft":
+    "デザイナーのドラフトを読み込めませんでした",
+  "Proposal {id}": "提案 {id}",
+  "This proposal is not open in the Ontology designer.":
+    "この提案はオントロジーデザイナーで開かれていません。",
+  "It is {status}. Only a pending or updated proposal, or one whose accept failed, opens in the Ontology designer.":
+    "この提案の状態は「{status}」です。オントロジーデザイナーで開けるのは、レビュー待ちまたは更新済みの提案か、承認に失敗した提案だけです。",
+  "Open in Ontology designer": "オントロジーデザイナーで開く",
+  "{count} classes selected": "{count} 件のクラスを選択中",
+  "Delete selected": "選択項目を削除",
+  "Merge…": "統合…",
+  "Could not load the term": "用語を読み込めませんでした",
+  "{revision}, {count} class": "{revision}、{count} クラス",
+  "{revision}, {count} classes": "{revision}、{count} クラス",
+  "Back to proposal": "提案に戻る",
+  Undo: "元に戻す",
+  Redo: "やり直す",
+  History: "履歴",
+  Accept: "承認",
+  "This proposal is {status}; its draft is read-only.":
+    "この提案の状態は「{status}」のため、ドラフトは読み取り専用です。",
+  "A newer version was published": "新しいバージョンが公開されました",
+  Rebase: "リベース",
+  "This draft was built on {base}, and the newest version is {head}. Rebase to replay your changes on it before accepting.":
+    "このドラフトは {base} をベースにしていますが、最新バージョンは {head} です。承認する前にリベースして、変更を最新バージョンに再適用してください。",
+  Inspector: "インスペクター",
+  Merge: "統合",
+  "Relationship label": "リレーションシップのラベル",
+  "Properties that use the class": "このクラスを使用するプロパティ",
+  "Keep them": "保持する",
+  "Remove the class from their domain or range. Their table mappings are removed with the class.":
+    "プロパティのドメインまたは範囲からこのクラスを外します。プロパティのテーブルへのマッピングもクラスと一緒に削除されます。",
+  "Delete them": "削除する",
+  "Delete them and their mappings too.":
+    "プロパティとそのマッピングも削除します。",
+  "The other class's references move to it and its labels become alternative labels.":
+    "もう一方のクラスへの参照はこのクラスに移り、そのラベルは代替ラベルになります。",
+  "Some changes do not apply to the newest version":
+    "一部の変更を最新バージョンに適用できません",
+  "Rebase without the checked ops": "チェックした操作を除いてリベース",
+  "Exact match": "完全一致",
+  "Close match": "近似一致",
+  "No grounding": "グラウンディングなし",
+  "Evidence for {label}": "{label} のエビデンス",
+  "{count} evidence": "エビデンス {count} 件",
+  "Select a class in the graph to inspect and edit it.":
+    "グラフでクラスを選択すると、内容を確認して編集できます。",
+  "Delete property": "プロパティを削除",
+  "This term is read-only here: the draft cannot change, or the term belongs to another ontology.":
+    "この用語はここでは読み取り専用です。ドラフトを変更できないか、用語が別のオントロジーに属しています。",
+  "Language: {lang}": "言語: {lang}",
+  "Save label": "ラベルを保存",
+  "Save description": "説明を保存",
+  "Change IRI": "IRI を変更",
+  "New IRI": "新しい IRI",
+  Parents: "親クラス",
+  "Remove parent {label}": "親クラス {label} を削除",
+  "Add parent": "親クラスを追加",
+  "Add a parent class…": "親クラスを追加…",
+  "Subclasses ({count})": "サブクラス（{count}）",
+  "Relationships and attributes": "リレーションシップと属性",
+  "(anonymous datatype)": "（匿名のデータ型）",
+  "(anonymous class)": "（匿名のクラス）",
+  open: "制限なし",
+  "Delete property {label}": "プロパティ {label} を削除",
+  "New attribute label": "新しい属性のラベル",
+  "New attribute": "新しい属性",
+  "New attribute datatype": "新しい属性のデータ型",
+  "Add attribute": "属性を追加",
+  Grounding: "グラウンディング",
+  "The reference-ontology class this class stands for.":
+    "このクラスが表す参照オントロジーのクラスです。",
+  "Grounding kind": "グラウンディングの種類",
+  "Grounding target": "グラウンディング先",
+  "Save grounding": "グラウンディングを保存",
+  "Change domain": "ドメインを変更",
+  "Change the domain class…": "ドメインのクラスを変更…",
+  "Change range": "範囲を変更",
+  "Change the range class…": "範囲のクラスを変更…",
+  "Choose a datatype": "データ型を選択",
+  "Change datatype": "データ型を変更",
+  "The datatype follows column {column}.": "データ型は列 {column} に従います。",
+  "Not mapped to a table": "テーブルにマッピングされていません",
+  "Structured queries cannot use this term.":
+    "構造化クエリではこの用語を使用できません。",
+  "Structured queries can use this term only through a subclass mapped to a table.":
+    "構造化クエリでは、テーブルにマッピングされたサブクラスを通じてのみこの用語を使用できます。",
+  Mapping: "マッピング",
+  "(table {table})": "（テーブル {table}）",
+  "(column {column})": "（列 {column}）",
+  "(references {map})": "（{map} を参照）",
+  "Filled after deploy: the active version has no such class yet.":
+    "デプロイ後に表示されます。アクティブなバージョンにはまだこのクラスがありません。",
+  "{count} instance in the active version":
+    "アクティブなバージョンのインスタンス {count} 件",
+  "{count} instances in the active version":
+    "アクティブなバージョンのインスタンス {count} 件",
+  "Out of date: {reason}": "最新ではありません: {reason}",
+  "Type to search…": "検索する文字列を入力…",
+  "Search failed. Edit the text to try again.":
+    "検索に失敗しました。テキストを編集して再試行してください。",
+  "Classes removed ({count})": "削除されるクラス（{count}）",
+  "Relationships removed ({count})": "削除されるリレーションシップ（{count}）",
+  "Attributes removed ({count})": "削除される属性（{count}）",
+  "Accept revision {revision}": "リビジョン {revision} を承認",
+  "The draft becomes the next version as it is: {added} added, {changed} changed and {removed} removed term(s) compared with no version.":
+    "ドラフトはそのまま次のバージョンになります。バージョンなしの状態と比べて、追加 {added} 件、変更 {changed} 件、削除 {removed} 件の用語があります。",
+  "The draft becomes the next version as it is: {added} added, {changed} changed and {removed} removed term(s) compared with v{version}.":
+    "ドラフトはそのまま次のバージョンになります。v{version} と比べて、追加 {added} 件、変更 {changed} 件、削除 {removed} 件の用語があります。",
+  "Rebase first": "先にリベースしてください",
+  "A newer version was published after this draft was built. Rebase the draft, review it, and accept again.":
+    "このドラフトの作成後に新しいバージョンが公開されました。ドラフトをリベースし、内容を確認してから再度承認してください。",
+  "Open the Ontology designer to rebase it.":
+    "オントロジーデザイナーを開いてリベースしてください。",
+  "and {count} more": "ほか {count} 件",
+  "Renamed or merged ({count})": "名前の変更または統合（{count}）",
+  "{from} merged into {to}": "{from} を {to} に統合",
+  "{from} renamed to {to}": "{from} を {to} に名前変更",
+  "This draft maps no table; structured queries are off after deploy.":
+    "このドラフトはテーブルを 1 つもマッピングしていません。デプロイ後は構造化クエリが使えなくなります。",
+  "Not answered by structured queries ({count})":
+    "構造化クエリで回答できない用語（{count}）",
+  "Removed from structured queries ({count})":
+    "構造化クエリから外れる用語（{count}）",
+  "Governed metrics this version breaks":
+    "このバージョンで壊れるガバナンス対象のメトリクス",
+  "{name} (uses {class})": "{name}（{class} を使用）",
+  "An automatic deployment is held until you deploy this version from Ontology › Induction › Versions and acknowledge them.":
+    "「オントロジー › 誘導 › バージョン」からこのバージョンをデプロイしてこれらを確認するまで、自動デプロイは保留されます。",
+  Opened: "開始",
+  "Refresh history": "履歴を更新",
+  "Change history": "変更履歴",
+  "Revision {revision}": "リビジョン {revision}",
+  Undone: "取り消し済み",
+  "{author}, {time}": "{author}、{time}",
+  // The lines of the change history, by the codes the engine sends.
+  "Opened the draft on v{version}": "v{version} をベースにドラフトを開きました",
+  "Opened the draft on no version": "バージョンなしでドラフトを開きました",
+  "Undid revision {revision}": "リビジョン {revision} を元に戻しました",
+  "Rebased onto v{version}": "v{version} にリベースしました",
+  "Rebased onto no version": "バージョンなしにリベースしました",
+  "Added class {label}": "クラス {label} を追加しました",
+  "Renamed {term} to {label}": "{term} の名前を {label} に変更しました",
+  "Changed the description of {term}": "{term} の説明を変更しました",
+  "Changed the IRI of {term} to {newTerm}":
+    "{term} の IRI を {newTerm} に変更しました",
+  "Deleted class {term} (detach its properties)":
+    "クラス {term} を削除しました（プロパティは保持）",
+  "Deleted class {term} (delete its properties)":
+    "クラス {term} を削除しました（プロパティも削除）",
+  "Merged {source} into {target}": "{source} を {target} に統合しました",
+  "Made {term} a subclass of {parent}":
+    "{term} を {parent} のサブクラスにしました",
+  "Removed {parent} from the parents of {term}":
+    "{term} の親クラスから {parent} を外しました",
+  "Added relationship {label} from {domain} to {range}":
+    "{domain} から {range} へのリレーションシップ {label} を追加しました",
+  "Added attribute {label} to {domain}":
+    "{domain} に属性 {label} を追加しました",
+  "Changed the {fields} of {term}": "{term} の{fields}を変更しました",
+  // A history line's property fields, and how a list of them is joined.
+  domain: "ドメイン",
+  range: "範囲",
+  label: "ラベル",
+  comment: "説明",
+  "{items}, {item}": "{items}、{item}",
+  "Deleted property {term}": "プロパティ {term} を削除しました",
+  "Removed the grounding of {term}": "{term} のグラウンディングを解除しました",
+  "Grounded {term} to {target} (exact)":
+    "{term} を {target} にグラウンディングしました（完全一致）",
+  "Grounded {term} to {target} (close)":
+    "{term} を {target} にグラウンディングしました（近似一致）",
+  "Replaced the datatype {old} with {new}":
+    "データ型 {old} を {new} に置き換えました",
+  "Reverted a change": "変更を元に戻しました",
+  // The warnings of a change, by the codes the engine sends.
+  "{source} and {target} are mapped to tables {sourceTables} and {targetTables}; structured SQL will describe them as one table.":
+    "{source} と {target} はそれぞれテーブル {sourceTables} と {targetTables} にマッピングされています。構造化 SQL では 1 つのテーブルとして記述されます。",
+  "{property} is mapped from table {tables}; with the domain {domain}, SPARQL through the VKG no longer offers it on {mappedClass}, but NL-to-SQL still does.":
+    "{property} はテーブル {tables} からマッピングされています。ドメインを {domain} にすると、VKG 経由の SPARQL では {mappedClass} で使えなくなりますが、NL-to-SQL では引き続き使えます。",
+  "{property} is mapped by {map}; with the domain {domain}, SPARQL through the VKG no longer offers it on {mappedClass}, but NL-to-SQL still does.":
+    "{property} は {map} でマッピングされています。ドメインを {domain} にすると、VKG 経由の SPARQL では {mappedClass} で使えなくなりますが、NL-to-SQL では引き続き使えます。",
+  "{property} joins to {mappedClass} in the mapping; with the range {range}, SPARQL through the VKG no longer offers it as a join to {mappedClass}, but NL-to-SQL still does.":
+    "{property} はマッピングで {mappedClass} に結合しています。範囲を {range} にすると、VKG 経由の SPARQL では {mappedClass} への結合として使えなくなりますが、NL-to-SQL では引き続き使えます。",
+  "{property} is mapped through an IRI template, so the mapping cannot confirm its range {range}":
+    "{property} は IRI テンプレートでマッピングされているため、範囲 {range} をマッピングで確認できません",
+  "{deleted} was the domain of {property}, which is mapped from table {tables}; its domain is now {classes}.":
+    "{deleted} は {property} のドメインでした。{property} はテーブル {tables} からマッピングされているため、ドメインは {classes} になりました。",
+  "{deleted} was the domain of {property}, which is mapped by {map}; its domain is now {classes}.":
+    "{deleted} は {property} のドメインでした。{property} は {map} でマッピングされているため、ドメインは {classes} になりました。",
+  "{deleted} was the range of {property}, which joins to {classes} in the mapping; its range is now {classes}.":
+    "{deleted} は {property} の範囲でした。{property} はマッピングで {classes} に結合しているため、範囲は {classes} になりました。",
+  "Another class is also labelled '{label}': {iri}":
+    "別のクラスにも同じラベル「{label}」が付いています: {iri}",
+  "Another relationship is also labelled '{label}': {iri}":
+    "別のリレーションシップにも同じラベル「{label}」が付いています: {iri}",
+  "Another attribute is also labelled '{label}': {iri}":
+    "別の属性にも同じラベル「{label}」が付いています: {iri}",
+  "Load older revisions": "以前のリビジョンを読み込む",
+  "Add subclass": "サブクラスを追加",
+  "Add relationship": "リレーションシップを追加",
+  Rename: "名前を変更",
+  "Showing {shown} of {total} classes within two steps of {label} (more neighbours are hidden).":
+    "{label} から 2 ステップ以内の {total} 件中 {shown} 件のクラスを表示しています（ほかの隣接クラスは非表示）。",
+  "Showing {shown} of {total} classes within two steps of {label}.":
+    "{label} から 2 ステップ以内の {total} 件中 {shown} 件のクラスを表示しています。",
+  "Find a class": "クラスを検索",
+  "Find a class to focus on…": "フォーカスするクラスを検索…",
+  "Show all classes": "すべてのクラスを表示",
+  "Double-click a class to focus on it.":
+    "クラスをダブルクリックするとフォーカスします。",
+  "Instance counts are dimmed: {reason}.":
+    "インスタンス数は薄く表示されています: {reason}。",
+  "Instance counts are dimmed.": "インスタンス数は薄く表示されています。",
+  "Actions for {label}": "{label} の操作",
+  "This proposal is open in the Ontology designer. The page was reloaded; review the draft and accept again.":
+    "この提案はオントロジーデザイナーで開かれています。ページを再読み込みしました。ドラフトを確認してから再度承認してください。",
+  "Only a pending or updated proposal, or one whose accept failed, opens in the Ontology designer.":
+    "オントロジーデザイナーで開けるのは、レビュー待ちまたは更新済みの提案か、承認に失敗した提案だけです。",
+  "A newer ontology version was published after this draft was built. Rebase the draft in the {studio}, review the result, and accept again.":
+    "このドラフトの作成後に新しいオントロジーバージョンが公開されました。{studio}でドラフトをリベースし、結果を確認してから再度承認してください。",
+  "Continue in Ontology designer": "オントロジーデザイナーで続ける",
+  "Editing in Ontology designer": "オントロジーデザイナーで編集中",
+  "Open Ontology designer": "オントロジーデザイナーを開く",
+  "This proposal is edited in the Ontology designer, so its Turtle, entity and grounding editors are read-only here. Accepting publishes the designer draft (revision {revision}).":
+    "この提案はオントロジーデザイナーで編集されているため、ここでは Turtle、エンティティ、グラウンディングのエディターは読み取り専用です。承認するとデザイナーのドラフト（リビジョン {revision}）が公開されます。",
+  "These edits cannot be saved: this proposal is open in the Ontology designer, which owns its draft. Refresh to discard them.":
+    "これらの編集は保存できません。この提案はオントロジーデザイナーで開かれており、ドラフトはオントロジーデザイナーが管理しています。更新すると編集は破棄されます。",
+  "Rebase required": "リベースが必要です",
+  "Ontology designer": "オントロジーデザイナー",
+  to: "接続先",
+  from: "接続元",
+  "Another change was applied first. The draft was reloaded; check it and try again.":
+    "別の変更が先に適用されました。ドラフトを再読み込みしたので、内容を確認してもう一度お試しください。",
+  "The request failed (HTTP {status}). Reload the page and try again.":
+    "リクエストに失敗しました（HTTP {status}）。ページを再読み込みしてもう一度お試しください。",
+  "You are not authorized to perform this action.":
+    "この操作を実行する権限がありません。",
+  new: "新規",
+  "Filled after deploy: the active version has no such class yet":
+    "デプロイ後に表示されます。アクティブなバージョンにはまだこのクラスがありません",
+  "{count} instance in the active version's domain data":
+    "アクティブなバージョンのドメインデータのインスタンス {count} 件",
+  "{count} instances in the active version's domain data":
+    "アクティブなバージョンのドメインデータのインスタンス {count} 件",
+  "{base} ({reason})": "{base}（{reason}）",
+  "out of date": "最新ではありません",
+  "Revision {revision}, built on no version":
+    "リビジョン {revision}（ベースのバージョンなし）",
+  "Revision {revision}, built on v{version}":
+    "リビジョン {revision}（v{version} ベース）",
+  // Ontology designer assistant
+  "A message is at most {max} characters.":
+    "メッセージは {max} 文字以内で入力してください。",
+  "Answer from the assistant": "アシスタントからの回答",
+  Applied: "適用済み",
+  "Applied in revision {revision}": "リビジョン {revision} で適用済み",
+  "Apply all": "すべて適用",
+  "Apply selected ({count})": "選択した項目を適用（{count}）",
+  "Ask the assistant to review or change the draft, for example “Medication needs a parent class Treatment”. It proposes change sets; nothing changes until you apply one.":
+    "ドラフトのレビューや変更をアシスタントに依頼できます。例:「Medication に親クラス Treatment が必要です」。アシスタントは変更セットを提案し、適用するまでドラフトは変更されません。",
+  "Ask the assistant to review or change the draft… (Ctrl+Enter sends)":
+    "ドラフトのレビューや変更をアシスタントに依頼…（Ctrl+Enter で送信）",
+  Assistant: "アシスタント",
+  "Change set": "変更セット",
+  "Change set: {changes}": "変更セット: {changes}",
+  Chat: "チャット",
+  Discard: "破棄",
+  Discarded: "破棄済み",
+  "Hide preview": "プレビューを非表示",
+  "Message from {author}": "{author} からのメッセージ",
+  "Message to the assistant": "アシスタントへのメッセージ",
+  "Op {index}": "操作 {index}",
+  "Other change sets": "その他の変更セット",
+  "Previewing a change set: green is added, orange changed and red removed.":
+    "変更セットをプレビューしています。緑は追加、オレンジは変更、赤は削除を表します。",
+  Send: "送信",
+  "Sent with: {labels}": "一緒に送信: {labels}",
+  "Sent with: {labels} (the first {max} of {count} selected)":
+    "一緒に送信: {labels}（選択した {count} 件のうち最初の {max} 件）",
+  "Show on graph": "グラフに表示",
+  "Steps ({count})": "ステップ（{count}）",
+  "The assistant is still working on the previous message.":
+    "アシスタントはまだ前のメッセージを処理しています。",
+  "The assistant is working": "アシスタントが処理中です",
+  "The draft changed": "ドラフトが変更されました",
+  "The draft is read-only.": "ドラフトは読み取り専用です。",
+  "The turn ended early.": "応答が途中で終了しました。",
+  "Working…": "処理中…",
+  "“{change}” does not apply: {message}":
+    "「{change}」を適用できません: {message}",
+  // A role that reads a namespace but cannot change its ontology
+  "Your role on this namespace does not allow this.":
+    "この名前空間でのロールでは、この操作はできません。",
+  "Your role on this namespace can read and query this draft, but not change it.":
+    "この名前空間でのロールでは、このドラフトの参照とクエリはできますが、変更はできません。",
+  "Your role on this namespace can read this proposal, but not change, validate, cancel or accept it.":
+    "この名前空間でのロールでは、この提案を参照できますが、変更、検証、キャンセル、承認はできません。",
+  "Your role on this namespace cannot deploy or roll back versions.":
+    "この名前空間でのロールでは、バージョンのデプロイやロールバックはできません。",
+  "How the strings found in the documents map to ontology terms. Your role on this namespace cannot change them.":
+    "ドキュメント内で見つかった文字列とオントロジー用語との対応です。この名前空間でのロールでは変更できません。",
+  "Ontologies available for grounding. Your role on this namespace cannot load, upload or delete them.":
+    "グラウンディングに利用できるオントロジーです。この名前空間でのロールでは、読み込み、アップロード、削除はできません。",
+  // Ontology designer checks, queries and questions
+  "Source tables": "ソーステーブル",
+  "The draft maps no tables.": "ドラフトはテーブルをマッピングしていません。",
+  "Not in the source catalog: {tables}": "ソースカタログにありません: {tables}",
+  "Every mapped table is in the source catalog.":
+    "マッピングされたテーブルはすべてソースカタログにあります。",
+  "The namespace has no domain data yet.":
+    "この名前空間にはまだドメインデータがありません。",
+  "No class with instances is removed, renamed or merged.":
+    "インスタンスを持つクラスの削除、名前変更、統合はありません。",
+  "has {count} instance and is renamed to {name}.":
+    "にはインスタンスが {count} 件あり、{name} に名前が変更されます。",
+  "has {count} instances and is renamed to {name}.":
+    "にはインスタンスが {count} 件あり、{name} に名前が変更されます。",
+  "has {count} instance and is merged into {name}.":
+    "にはインスタンスが {count} 件あり、{name} に統合されます。",
+  "has {count} instances and is merged into {name}.":
+    "にはインスタンスが {count} 件あり、{name} に統合されます。",
+  "has {count} instance and is removed.":
+    "にはインスタンスが {count} 件あり、削除されます。",
+  "has {count} instances and is removed.":
+    "にはインスタンスが {count} 件あり、削除されます。",
+  "The domain data is being rebuilt; counts may be out of date.":
+    "ドメインデータを再構築中のため、件数が最新でない可能性があります。",
+  "Document mappings": "ドキュメントのマッピング",
+  "No version is active yet.": "アクティブなバージョンはまだありません。",
+  "{count} mapping would go stale: {targets}":
+    "{count} 件のマッピングが古くなります: {targets}",
+  "{count} mappings would go stale: {targets}":
+    "{count} 件のマッピングが古くなります: {targets}",
+  "No document mapping would go stale.":
+    "古くなるドキュメントのマッピングはありません。",
+  "{label} ({count})": "{label}（{count}）",
+  "{label} ({name})": "{label}（{name}）",
+  "Structured queries": "構造化クエリ",
+  "{count} attribute or relationship of a mapped class, or relationship into one, has no column or join behind it. Structured queries do not use it.":
+    "マッピング済みクラスの属性またはリレーションシップと、マッピング済みクラスへのリレーションシップのうち、{count} 件には対応する列や結合がありません。構造化クエリでは使用されません。",
+  "{count} attributes or relationships of mapped classes, or relationships into them, have no column or join behind them. Structured queries do not use them.":
+    "マッピング済みクラスの属性またはリレーションシップと、マッピング済みクラスへのリレーションシップのうち、{count} 件には対応する列や結合がありません。構造化クエリでは使用されません。",
+  "{count} mapped class is deleted; structured queries no longer answer from its tables.":
+    "マッピング済みの {count} 件のクラスが削除されます。構造化クエリはそのテーブルから回答しなくなります。",
+  "{count} mapped classes are deleted; structured queries no longer answer from their tables.":
+    "マッピング済みの {count} 件のクラスが削除されます。構造化クエリはそれらのテーブルから回答しなくなります。",
+  "{count} mapped attribute or relationship is deleted; structured queries no longer use its column or join.":
+    "マッピング済みの {count} 件の属性またはリレーションシップが削除されます。構造化クエリはその列や結合を使用しなくなります。",
+  "{count} mapped attributes or relationships are deleted; structured queries no longer use their columns or joins.":
+    "マッピング済みの {count} 件の属性またはリレーションシップが削除されます。構造化クエリはそれらの列や結合を使用しなくなります。",
+  "{count} class is mapped from more than one table; structured queries treat it as one table.":
+    "{count} 件のクラスは複数のテーブルからマッピングされています。構造化クエリでは 1 つのテーブルとして扱われます。",
+  "{count} classes are mapped from more than one table; structured queries treat each of them as one table.":
+    "{count} 件のクラスは複数のテーブルからマッピングされています。構造化クエリでは、それぞれ 1 つのテーブルとして扱われます。",
+  "{count} class has no table mapping. Structured queries cannot answer it; facts extracted from documents can fill it after deploy.":
+    "{count} 件のクラスはテーブルにマッピングされていません。構造化クエリでは回答できません。デプロイ後、ドキュメントから抽出した事実で補完される場合があります。",
+  "{count} classes have no table mapping. Structured queries cannot answer them; facts extracted from documents can fill them after deploy.":
+    "{count} 件のクラスはテーブルにマッピングされていません。構造化クエリでは回答できません。デプロイ後、ドキュメントから抽出した事実で補完される場合があります。",
+  "{count} mapped term has a label that differs from its table or column name. Structured queries keep using the table or column name.":
+    "マッピング済みの {count} 件の用語は、ラベルがテーブル名または列名と異なります。構造化クエリでは引き続きテーブル名または列名が使われます。",
+  "{count} mapped terms have a label that differs from their table or column name. Structured queries keep using the table and column names.":
+    "マッピング済みの {count} 件の用語は、ラベルがテーブル名または列名と異なります。構造化クエリでは引き続きテーブル名と列名が使われます。",
+  "Every class has a table mapping, and so do the attributes and relationships of mapped classes and the relationships into them.":
+    "すべてのクラスがテーブルにマッピングされており、マッピング済みクラスの属性とリレーションシップ、およびマッピング済みクラスへのリレーションシップもマッピングされています。",
+  "Governed metrics": "ガバナンス対象のメトリクス",
+  "No metric would break.": "壊れるメトリクスはありません。",
+  "{metric} needs {class}": "{metric} には {class} が必要です",
+  "Run full validation": "完全な検証を実行",
+  "The validation failed.": "検証を実行できませんでした。",
+  "The validation passed.": "検証に合格しました。",
+  "The validation found problems.": "検証で問題が見つかりました。",
+  "The checks found these problems in the draft. Explain them and propose fixes:":
+    "チェックでドラフトに次の問題が見つかりました。内容を説明し、修正を提案してください:",
+  "Checks of revision {revision}": "リビジョン {revision} のチェック",
+  Checks: "チェック",
+  "Check again": "再チェック",
+  "{count} error": "エラー {count} 件",
+  "{count} errors": "エラー {count} 件",
+  "{count} warning": "警告 {count} 件",
+  "{count} warnings": "警告 {count} 件",
+  "{count} info": "情報 {count} 件",
+  "No structural problem found.": "構造上の問題は見つかりませんでした。",
+  // The findings and the data checks' errors, by the codes the engine sends.
+  "The domain of {property} is {domain}, which is not a class of the draft":
+    "{property} のドメイン {domain} はドラフトのクラスではありません",
+  "The range of {property} is {range}, which is not a class of the draft":
+    "{property} の範囲 {range} はドラフトのクラスではありません",
+  "The range of the attribute {property} is {range}, which is not a datatype the Ontology designer accepts":
+    "属性 {property} の範囲 {range} は、オントロジーデザイナーで使えるデータ型ではありません",
+  "The attribute {property} has the class {range} as its range, not a datatype":
+    "属性 {property} の範囲がデータ型ではなくクラス {range} になっています",
+  "These classes are subclasses of each other: {classes}":
+    "これらのクラスは互いのサブクラスになっています: {classes}",
+  "{term} has no label": "{term} にラベルがありません",
+  "{count} classes share the label '{label}'":
+    "{count} 件のクラスが同じラベル「{label}」を使っています",
+  "{count} relationships share the label '{label}'":
+    "{count} 件のリレーションシップが同じラベル「{label}」を使っています",
+  "{count} attributes share the label '{label}'":
+    "{count} 件の属性が同じラベル「{label}」を使っています",
+  "{count} terms share the label '{label}'":
+    "{count} 件の用語が同じラベル「{label}」を使っています",
+  "{term} has no relationship, parent or attribute":
+    "{term} にはリレーションシップ、親クラス、属性のいずれもありません",
+  "The source catalog could not be read.":
+    "ソースカタログを読み取れませんでした。",
+  "The domain data could not be read.":
+    "ドメインデータを読み取れませんでした。",
+  "The document mappings could not be read.":
+    "ドキュメントのマッピングを読み取れませんでした。",
+  "Breaking metrics could not be checked; the graph database may be unreachable.":
+    "壊れるメトリクスを確認できませんでした。グラフデータベースに接続できない可能性があります。",
+  "The table mappings of the version the draft was built on could not be read.":
+    "ドラフトがベースにしているバージョンのテーブルマッピングを読み取れませんでした。",
+  "Only the worst {count} findings are listed.":
+    "重大度の高い {count} 件の検出結果のみを表示しています。",
+  "Ask the assistant": "アシスタントに質問",
+  "Compared with the data": "データとの比較",
+  "Full validation": "完全な検証",
+  "It fails with: {error}": "次のエラーで失敗します: {error}",
+  "Help me with this query on {where}:":
+    "{where} に対するこのクエリについて手伝ってください:",
+  "What the query reads": "クエリの対象",
+  "Query text": "クエリテキスト",
+  Run: "実行",
+  "Insert sample": "サンプルを挿入",
+  "A query is at most {max} characters.":
+    "クエリは {max} 文字以内で入力してください。",
+  "Runs on the database with your own grants; the VKG maps the active version, not the draft.":
+    "ご自身の権限でデータベース上で実行します。VKG がマッピングするのはドラフトではなく、アクティブなバージョンです。",
+  "This proposal is {status}, so its draft can no longer be queried.":
+    "この提案の状態は「{status}」のため、ドラフトはクエリできなくなりました。",
+  "This proposal is being accepted, so its draft cannot be queried.":
+    "この提案は承認中のため、ドラフトはクエリできません。",
+  "{count} row": "{count} 行",
+  "{count} rows": "{count} 行",
+  "{ms} ms": "{ms} ミリ秒",
+  "revision {revision}": "リビジョン {revision}",
+  "only the first rows are shown; add a LIMIT":
+    "先頭の行のみ表示しています。LIMIT を追加してください",
+  "No rows.": "行がありません。",
+  "SQL that ran": "実行された SQL",
+  "Which medications did each patient receive?":
+    "各患者はどの薬を投与されましたか？",
+  "Expected answer (optional)": "期待される回答（任意）",
+  "Patient names with medication names": "患者名と薬剤名",
+  "Add question": "質問を追加",
+  "The assistant is still working on another message; check again when it is done.":
+    "アシスタントはまだ別のメッセージを処理しています。完了してからもう一度チェックしてください。",
+  "Competency questions are what the ontology must answer. Every draft of the namespace shares them; Check asks the assistant to test one against this draft.":
+    "コンピテンシー質問は、オントロジーが答えられなければならない質問です。名前空間のすべてのドラフトで共有されます。「チェック」を押すと、アシスタントがこのドラフトで質問を検証します。",
+  "No question yet.": "質問はまだありません。",
+  "Not checked": "未チェック",
+  "Expected: {expectation}": "期待される回答: {expectation}",
+  "(revision {revision}, {count} row)": "（リビジョン {revision}、{count} 行）",
+  "(revision {revision}, {count} rows)":
+    "（リビジョン {revision}、{count} 行）",
+  "(another draft, {count} row)": "（別のドラフト、{count} 行）",
+  "(another draft, {count} rows)": "（別のドラフト、{count} 行）",
+  Check: "チェック",
+  "Open query": "クエリを開く",
+  Questions: "質問",
+  "Ran a {language} query: {count} row":
+    "{language} クエリを実行しました: {count} 行",
+  "Ran a {language} query: {count} rows":
+    "{language} クエリを実行しました: {count} 行",
+  "Open in Query console": "クエリコンソールで開く",
+  "Draft + documents (SPARQL)": "ドラフトとドキュメント（SPARQL）",
+  "Lexical graph (Cypher)": "語彙グラフ（Cypher）",
+  "Database via VKG (SPARQL)": "VKG 経由のデータベース（SPARQL）",
+  Answerable: "回答可能",
+  "Expressible, no data": "表現可能（データなし）",
+  "Not expressible": "表現不可",
+  "How the strings found in the documents map to ontology terms. A target can be changed again once an ontology version is deployed.":
+    "ドキュメント内で見つかった文字列とオントロジー用語との対応です。オントロジーのバージョンがデプロイされると、対応先を再び変更できます。",
+  "Pick a direction first.": "先に方向を選択してください。",
+  "The property's domain and range decide which way fits.":
+    "どちらの方向が合うかは、プロパティのドメインとレンジで決まります。",
+  "Choose a direction": "方向を選択",
+  "Edited in Ontology designer": "オントロジーデザイナーで編集済み",
+  "The Turtle, graph and classes below are the induction this proposal started from. Accepting published the designer draft (revision {revision}) as version v{version}; see Ontology › Induction › Versions.":
+    "以下の Turtle、グラフ、クラスは、この提案の元になった誘導の結果です。承認によりデザイナーのドラフト（リビジョン {revision}）がバージョン v{version} として公開されました。「オントロジー › 誘導 › バージョン」を参照してください。",
+  "Loading the conversation": "会話を読み込み中",
+  "A message, with the terms sent with it, is at most 8 KB; Japanese, Korean and other non-Latin characters take up to 3 bytes each.":
+    "メッセージは、一緒に送る用語を含めて最大 8 KB です。日本語、韓国語などのラテン文字以外の文字は 1 文字あたり最大 3 バイトになります。",
+  "The validation's status could not be read":
+    "検証の状態を読み取れませんでした",
+  "Validation of revision {revision}, out of date: run it again.":
+    "リビジョン {revision} の検証結果は古くなっています。もう一度実行してください。",
+  "A query is at most 8 KB; Japanese, Korean and other non-Latin characters take up to 3 bytes each.":
+    "クエリは最大 8 KB です。日本語、韓国語などのラテン文字以外の文字は 1 文字あたり最大 3 バイトになります。",
+  'Check question "{question}"': "質問「{question}」をチェック",
+  'Open query of question "{question}"': "質問「{question}」のクエリを開く",
+  'Edit question "{question}"': "質問「{question}」を編集",
+  'Delete question "{question}"': "質問「{question}」を削除",
+  "Delete question?": "質問を削除しますか？",
+  "It is removed, with its last check, for every draft of this namespace and cannot be undone.":
+    "この質問は最後のチェック結果とともに、この名前空間のすべてのドラフトから削除されます。この操作は元に戻せません。",
+  "It is removed for every draft of this namespace and cannot be undone.":
+    "この質問は、この名前空間のすべてのドラフトから削除されます。この操作は元に戻せません。",
+  "The request was blocked before it reached the server, most likely because it is larger than 8 KB (Japanese, Korean and other non-Latin characters take up to 3 bytes each). Shorten the text and try again.":
+    "リクエストはサーバーに届く前にブロックされました。8 KB を超えていることが主な原因と考えられます（日本語、韓国語などのラテン文字以外の文字は 1 文字あたり最大 3 バイトになります）。テキストを短くしてもう一度お試しください。",
+  "Published as version v{version}, but not deployed.":
+    "バージョン v{version} として公開しましたが、デプロイはされていません。",
+  "This change is too large to send: a change is at most 8 KB, and Japanese, Korean and other non-Latin characters take up to 3 bytes each. Shorten the text.":
+    "この変更は大きすぎるため送信できません。変更は最大 8 KB で、日本語、韓国語などのラテン文字以外の文字は 1 文字あたり最大 3 バイトになります。テキストを短くしてください。",
+  "Pick a target class first.": "先に対象クラスを選択してください。",
+  "Retired: its ontology was deleted": "廃止（オントロジーは削除済み）",
+  "Requested by {user}": "要求者: {user}",
 } as const;

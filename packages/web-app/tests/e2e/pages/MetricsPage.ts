@@ -56,7 +56,7 @@ export class MetricsPage {
     await this.page.getByRole("option").first().click();
 
     await this.page
-      .getByPlaceholder("SUM(orders.total_amount)")
+      .getByPlaceholder("SELECT SUM(total_amount) FROM orders")
       .fill(opts.expression);
 
     await this.page
@@ -82,7 +82,9 @@ export class MetricsPage {
     await expect(
       this.page.getByRole("heading", { name: `Edit ${name}` }),
     ).toBeVisible();
-    const expr = this.page.getByPlaceholder("SUM(orders.total_amount)").first();
+    const expr = this.page
+      .getByPlaceholder("SELECT SUM(total_amount) FROM orders")
+      .first();
     await expr.fill(newExpression);
     await this.page.getByRole("button", { name: "Save changes" }).click();
     await expect(

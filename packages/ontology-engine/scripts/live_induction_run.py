@@ -69,7 +69,12 @@ BACKEND = os.environ["WORKBENCH_BACKEND"]
 if BACKEND == "opensearch_neptune":
     REQUIRED = ["NDB_ENDPOINT", "OSS_ENDPOINT", "DYNAMODB_TABLE"]
 elif BACKEND == "na_only":
-    REQUIRED = ["NA_GRAPH_ID", "DYNAMODB_TABLE"]
+    # Accept publishes an ontology version; only a deployment puts it in the graph
+    # and the vector store, and deployments require opensearch_neptune.
+    sys.exit(
+        "WORKBENCH_BACKEND=na_only is not supported: accepting a proposal publishes an ontology version, "
+        "and deploying it requires WORKBENCH_BACKEND=opensearch_neptune."
+    )
 else:
     sys.exit(f"Unsupported WORKBENCH_BACKEND: {BACKEND!r}")
 
@@ -355,6 +360,7 @@ def _positive_int_env(name: str, default: int, *, maximum: int) -> int:
 
 _ACCEPT_POLL_TIMEOUT_S = _positive_int_env("INDUCTION_ACCEPT_POLL_TIMEOUT_S", 300, maximum=3600)
 _ACCEPT_POLL_INTERVAL_S = 2
+_DEPLOY_POLL_TIMEOUT_S = _positive_int_env("INDUCTION_DEPLOY_POLL_TIMEOUT_S", 900, maximum=3600)
 
 
 def _poll_proposal_terminal(proposal_id: str, namespace: str) -> dict:
@@ -396,15 +402,58 @@ def _poll_proposal_terminal(proposal_id: str, namespace: str) -> dict:
         time.sleep(_ACCEPT_POLL_INTERVAL_S)
 
 
+def _wait_for_auto_deploy(proposal_id: str, namespace: str) -> dict:
+    """Wait for the deployment the accept started; return its DEPLOYED row.
+
+    Accept only publishes a version; Neptune and OpenSearch change when that
+    version is deployed. The worker records ``auto_deploy_id`` (or
+    ``auto_deploy_held``) just after it flips the proposal to ``accepted``, so the
+    proposal is polled for it first. Raises ``RuntimeError`` when the deploy was
+    held or failed, and ``TimeoutError`` when it does not finish in time.
+    """
+    from coa_ontology import dynamo_store
+    from coa_ontology.versions import registry
+
+    deadline = time.time() + _DEPLOY_POLL_TIMEOUT_S
+    deployment_id = None
+    last_status = None
+    while True:
+        if deployment_id is None:
+            item = dynamo_store.get_proposal_by_id(
+                proposal_id, namespace=namespace, hydrate_turtle=False, hydrate_matches=False, hydrate_constraints=False
+            )
+            held = (item or {}).get("auto_deploy_held")
+            if held:
+                raise RuntimeError(f"the auto-deploy of {proposal_id} was held: {held}")
+            deployment_id = (item or {}).get("auto_deploy_id")
+        if deployment_id is not None:
+            row = registry.get_deployment(namespace, deployment_id) or {}
+            status = row.get("status")
+            if status != last_status:
+                print(f"    deploy poll: {deployment_id} status={status}", flush=True)
+                last_status = status
+            if status == registry.DEPLOYED:
+                return row
+            if status == registry.DEPLOY_FAILED:
+                raise RuntimeError(f"deployment {deployment_id} failed: {row.get('error') or '(no error)'}")
+        if time.time() >= deadline:
+            what = f"deployment {deployment_id} still {last_status!r}" if deployment_id else "no auto-deploy recorded"
+            raise TimeoutError(f"accept of {proposal_id}: {what} after {_DEPLOY_POLL_TIMEOUT_S}s")
+        time.sleep(_ACCEPT_POLL_INTERVAL_S)
+
+
 def accept_proposal_direct(proposal_id: str, namespace: str = "default") -> dict:
     """Accept a proposal in-process and BLOCK until it reaches a terminal state.
 
     Calls :func:`app.proposals.accept_proposal` (which returns 202 +
-    ``status="accepting"`` and spawns a background worker), then polls the
-    proposal to the terminal ``accepted`` state. Returns a normalized dict:
+    ``status="accepting"`` and spawns a background worker), polls the
+    proposal to the terminal ``accepted`` state, then waits for the deployment
+    of the version it published (:func:`_wait_for_auto_deploy`), when it
+    published one. Returns a normalized dict:
 
-        {"proposal_id", "status", "ontology_id", "graph_uri",
-         "already_accepted": bool, "proposal": <terminal proposal record>}
+        {"proposal_id", "status", "ontology_id", "graph_uri", "embeddings",
+         "already_accepted": bool, "proposal": <terminal proposal record>,
+         "deployment": <DEPLOYED row, or None when no version was published>}
 
     ``already_accepted`` is True when the proposal was ALREADY ``accepted``
     before this call (``accept_proposal`` short-circuits and returns
@@ -416,10 +465,13 @@ def accept_proposal_direct(proposal_id: str, namespace: str = "default") -> dict
     proposal accept is merged under that single target ontology (using
     the /accept body's ``ontology_id`` field). When unset, each proposal
     uses its own embedded ``ontology_id`` — the original per-proposal
-    behaviour.
+    behaviour. A namespace publishes versions of one ontology only, so a target
+    that differs from the namespace's ontology is rejected with 409; that is
+    raised as ``RuntimeError``.
     """
     from coa_control_plane_server.models.proposal_status import ProposalStatus
     from coa_ontology.proposals import AcceptProposalRequest, accept_proposal
+    from fastapi import HTTPException
 
     raw_target = os.environ.get("INDUCTION_TARGET_ONTOLOGY_ID")
     if raw_target:
@@ -429,7 +481,15 @@ def accept_proposal_direct(proposal_id: str, namespace: str = "default") -> dict
         target = None
     body = AcceptProposalRequest(ontology_id=target) if target else None
 
-    resp = accept_proposal(proposal_id, body=body, namespace=namespace)
+    try:
+        resp = accept_proposal(proposal_id, body=body, namespace=namespace)
+    except HTTPException as e:
+        if e.status_code != 409:
+            raise
+        raise RuntimeError(
+            f"accept of {proposal_id} was rejected: {e.detail} Run against a fresh INDUCTION_NAMESPACE, or set "
+            "INDUCTION_TARGET_ONTOLOGY_ID so the target is the namespace's ontology."
+        ) from e
     # 202 fast-path idempotency: an already-accepted proposal returns
     # status="accepted" WITHOUT starting a worker (proposals.accept_proposal
     # short-circuit). Anything else is "accepting" → poll to terminal.
@@ -437,6 +497,12 @@ def accept_proposal_direct(proposal_id: str, namespace: str = "default") -> dict
     if not already_accepted and resp.status != ProposalStatus.ACCEPTING.value:
         raise RuntimeError(f"expected 202 accept status 'accepting', got {resp.status!r}")
     item = _poll_proposal_terminal(proposal_id, namespace=namespace)
+    # The worker records ``published_version`` together with ``accepted`` and then starts the
+    # deployment of that version. An accept that published nothing (the live integ test's
+    # stand-in for the worker) started no deployment, so there is nothing to wait for.
+    deployment = (
+        _wait_for_auto_deploy(proposal_id, namespace=namespace) if item.get("published_version") is not None else None
+    )
 
     from coa_ontology.stores.neptune_db_graph import _ontology_graph_uri
 
@@ -445,7 +511,7 @@ def accept_proposal_direct(proposal_id: str, namespace: str = "default") -> dict
     # Embedding count for the OSS-visibility poll (§_verify_opensearch_neptune).
     # The async accept worker no longer returns an in-process ingest result, so
     # read the authoritative deduped count off the ontology registry row that
-    # the worker wrote. 0/absent → the poll's target is 0 (passes on first
+    # the deployment wrote. 0/absent means the poll's target is 0 (passes on first
     # visible doc) rather than asserting a count we can't know.
     # NOTE (weakened check): on the absent-row path this degrades the downstream
     # OSS-visibility poll to "pass on the first visible doc" — it cannot assert
@@ -469,6 +535,7 @@ def accept_proposal_direct(proposal_id: str, namespace: str = "default") -> dict
         "embeddings": {"count": embedding_count},
         "already_accepted": already_accepted,
         "proposal": item,
+        "deployment": deployment,
     }
 
 
@@ -630,92 +697,6 @@ def _verify_opensearch_neptune(
     return n_triples, expected, visible
 
 
-def _verify_na_only(tag: str, ontology_uri: str, ns: str, accept_result: dict) -> tuple[int, int, int]:
-    """Verify the na_only backend wrote what we expect.
-
-    For NA, the "graph" is the set of class/property nodes bound to the
-    ontology — there's no named graph / Turtle bulk load. Embeddings
-    live on Embedding nodes with a native vector index.
-
-    Returns (graph_nodes, embeddings_expected, embeddings_visible).
-    """
-    from coa_ontology.catalog import na_store
-
-    expected = accept_result.get("embeddings", {}).get("count", 0)
-
-    # Count the catalog graph nodes (Class + Property) scoped to this ontology
-    # AND namespace — reads must always filter by namespace.
-    with Step(f"{tag} NA count classes+properties for ontology (namespace={ns!r})"):
-        ns_param = ns or "default"
-        # Classes
-        c_res = na_store._oc_query(
-            "MATCH (o:Ontology)-[:DEFINES]->(c:Class)"
-            " WHERE o.`~id` = $ouri AND o.namespace = $ns"
-            " AND c.namespace = $ns"
-            " RETURN count(c) AS n",
-            {"ouri": na_store._nid(ontology_uri, ns_param), "ns": ns_param},
-        )
-        n_classes = c_res.get("results", [{}])[0].get("n", 0)
-        # Properties
-        p_res = na_store._oc_query(
-            "MATCH (o:Ontology)-[:DEFINES]->(p:Property)"
-            " WHERE o.`~id` = $ouri AND o.namespace = $ns"
-            " AND p.namespace = $ns"
-            " RETURN count(p) AS n",
-            {"ouri": na_store._nid(ontology_uri, ns_param), "ns": ns_param},
-        )
-        n_props = p_res.get("results", [{}])[0].get("n", 0)
-        n_triples = n_classes + n_props  # "graph size" proxy
-        print(f"  classes={n_classes}  properties={n_props}  (ontology={ontology_uri!r})")
-
-    # Sample a few class/property labels scoped by namespace
-    with Step(f"{tag} NA sample defined classes"):
-        sample = na_store._oc_query(
-            "MATCH (o:Ontology)-[:DEFINES]->(c:Class)"
-            " WHERE o.`~id` = $ouri AND o.namespace = $ns"
-            " AND c.namespace = $ns"
-            " RETURN c.label AS label, id(c) AS nid LIMIT 10",
-            {"ouri": na_store._nid(ontology_uri, ns_param), "ns": ns_param},
-        )
-        for r in sample.get("results", []):
-            print(f"  class: {r.get('label')!r}  (nid={r.get('nid')})")
-
-    # Count embeddings stored for this ontology & namespace
-    with Step(f"{tag} NA count embeddings for ontology (namespace={ns!r})"):
-        visible = len(na_store.list_embeddings_for_ontology(ontology_uri, limit=10000, namespace=ns_param))
-        print(f"  embeddings visible: {visible}/{expected}")
-
-    # k-NN self-match using the first stored class embedding as the probe vector
-    with Step(f"{tag} NA k-NN self-match"):
-        first = na_store.list_embeddings_for_ontology(ontology_uri, entity_type="class", limit=1, namespace=ns_param)
-        if not first:
-            print("  (skip) no class embeddings to probe")
-        else:
-            probe_uri = first[0]["entity_uri"]
-            entity_embs = na_store.get_embeddings_for_entity(probe_uri, entity_type="class", namespace=ns_param)
-            if not entity_embs:
-                print("  (skip) could not read vector back")
-            else:
-                probe_vec = entity_embs[0]["vector"]
-                hits = na_store.search_nearest(
-                    vector=probe_vec,
-                    embedding_type=entity_embs[0]["embedding_type"],
-                    model_id=entity_embs[0]["model_id"],
-                    entity_type="class",
-                    ontology_id=ontology_uri,
-                    top_k=3,
-                    namespace=ns_param,
-                )
-                if hits:
-                    print(
-                        f"  top-1: {hits[0].get('entity_uri')!r}"
-                        f"  score={hits[0].get('score'):.4f}"
-                        f"  (probe={probe_uri!r})"
-                    )
-
-    return n_triples, expected, visible
-
-
 def _run_one_iteration(idx: int, total: int, datasource_id: str, label: str) -> dict:
     """Run one full induction+accept flow for a single datasource.
 
@@ -830,8 +811,6 @@ def _run_one_iteration(idx: int, total: int, datasource_id: str, label: str) -> 
         n_triples, expected, visible = _verify_opensearch_neptune(
             tag=tag, ontology_uri=ontology_uri, verify_graph=verify_graph, accept_result=a
         )
-    elif BACKEND == "na_only":
-        n_triples, expected, visible = _verify_na_only(tag=tag, ontology_uri=ontology_uri, ns=ns, accept_result=a)
     else:
         n_triples = expected = visible = 0
 
@@ -1174,9 +1153,6 @@ def main() -> int:
         print(f"  NDB_ENDPOINT:  {os.environ['NDB_ENDPOINT']}")
         print(f"  OSS_ENDPOINT:  {os.environ['OSS_ENDPOINT']}")
         print(f"  OSS_INDEX:     {os.environ['OSS_INDEX']}")
-    elif BACKEND == "na_only":
-        print(f"  NA_GRAPH_ID:   {os.environ['NA_GRAPH_ID']}")
-        print(f"  NA_REGION:     {os.environ['NA_REGION']}")
     catalog_source = os.environ.get("CATALOG_SOURCE", "http")
     if catalog_source == "smus":
         print(f"  catalog:       SMUS (domain={os.environ.get('SMUS_DOMAIN_ID', '?')})")
@@ -1288,10 +1264,6 @@ def main() -> int:
                 continue
             with Step(f"DUMP {r['datasource_id']} — OSS + Neptune state"):
                 _full_dump(r["ontology_uri"], oss, OSS_INDEX)
-    else:
-        # na_only: the per-iteration verification already printed class
-        # samples and k-NN hits. Skip the full dump to keep output readable.
-        pass
 
     _print_summary(wall)
 

@@ -104,12 +104,15 @@ class GraphVertex(BaseModel):
     is_mapped: bool = Field(
         default=False,
         description=(
-            "Whether this vertex carries the ``coa:isMapped`` marker — i.e. it "
-            "is backed by an R2RML mapping and therefore answerable by the "
-            "structured Tier-2 (NL→SPARQL/NL→SQL) path. Structured/table-backed "
-            "classes are True; unstructured-induced and foundational classes are "
-            "False (the marker is absent). Pulled from the top-level "
-            "``coa:isMapped`` triple and excluded from ``edges``."
+            "Whether this vertex carries ``coa:isMapped true``: it is backed by an "
+            "R2RML mapping and therefore answerable by the structured Tier-2 "
+            "(NL-to-SPARQL / NL-to-SQL) path. Structured/table-backed classes are "
+            "True; unstructured-induced and foundational classes are False (the "
+            "marker is absent). An attribute or relationship (``owl:DatatypeProperty`` "
+            "or ``owl:ObjectProperty``) that no mapping maps although one of its "
+            "domains (or, for a relationship, one of its ranges) is mapped carries "
+            "``coa:isMapped false`` and is False too. Pulled from the "
+            "top-level ``coa:isMapped`` triple and excluded from ``edges``."
         ),
     )
     edges: list[GraphEdge] = Field(
@@ -118,7 +121,13 @@ class GraphVertex(BaseModel):
             "Outgoing edges. ``rdf:type``, ``rdfs:label``, ``rdfs:comment``, and "
             "``coa:isMapped`` are pulled into the top-level ``types``, "
             "``labels``, ``comments``, and ``is_mapped`` fields and excluded from "
-            "this list to keep it focused on schema relationships."
+            "this list to keep it focused on schema relationships. A mapped class "
+            "read from one table, and a mapped attribute read from one column, also "
+            "carry a ``coa:physicalName`` literal edge: the table or column name, "
+            "which deploy derives from the R2RML mapping like ``coa:isMapped``. A "
+            "mapped property whose domain (or range) is not the class its mapping "
+            "reads it from (or joins it to) carries ``coa:mappedDomain`` (or "
+            "``coa:mappedRange``) edges to those classes, derived the same way."
         ),
     )
 

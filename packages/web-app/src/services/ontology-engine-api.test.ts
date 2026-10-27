@@ -14,6 +14,7 @@ import {
   updateProposal,
   acceptProposal,
   cancelProposal,
+  repairProposalDatatypes,
   rejectProposals,
   validateProposal,
   getProposalValidationJob,
@@ -200,6 +201,32 @@ describe("ontology-engine API wrappers", () => {
     expect(post).toHaveBeenCalledWith("/namespaces/ns/proposals/p1/accept", {
       ontology_id: "o1",
     });
+  });
+
+  it("repairProposalDatatypes POSTs an empty body, or dry_run for a preview", async () => {
+    await repairProposalDatatypes(api, "ns", "p1");
+    expect(post).toHaveBeenLastCalledWith(
+      "/namespaces/ns/proposals/p1/repair-datatypes",
+      {},
+    );
+    await repairProposalDatatypes(api, "ns", "p1", { dryRun: true });
+    expect(post).toHaveBeenLastCalledWith(
+      "/namespaces/ns/proposals/p1/repair-datatypes",
+      { dry_run: true },
+    );
+  });
+
+  it("repairProposalDatatypes sends the reviewed revision of a designer draft", async () => {
+    await repairProposalDatatypes(api, "ns", "p1", { expectedRevision: 4 });
+    expect(post).toHaveBeenLastCalledWith(
+      "/namespaces/ns/proposals/p1/repair-datatypes",
+      { expectedRevision: 4 },
+    );
+    await repairProposalDatatypes(api, "ns", "p1", { expectedRevision: 0 });
+    expect(post).toHaveBeenLastCalledWith(
+      "/namespaces/ns/proposals/p1/repair-datatypes",
+      { expectedRevision: 0 },
+    );
   });
 
   it("cancelProposal POSTs to the cancel endpoint", async () => {

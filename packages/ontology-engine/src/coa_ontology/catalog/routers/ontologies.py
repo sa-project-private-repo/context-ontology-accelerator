@@ -23,8 +23,9 @@ exist and merges the uploaded content into it when it does (graph
 triples accumulate via SPARQL set semantics; the registry row is
 refreshed with the latest counts). The upload paths delegate to
 :func:`coa_ontology.catalog.ingest.ingest_ontology_and_wait`
-(ingest + embedding-readiness wait); the underlying ``ingest_ontology``
-also powers ``POST /ontology/proposals/{id}/accept``.
+(ingest + embedding-readiness wait). ``POST /ontology/proposals/{id}/accept``
+does not use it: accept publishes an ontology version, which a deployment
+(:mod:`coa_ontology.versions.deploy`) then materializes.
 """
 
 import contextlib
@@ -34,9 +35,12 @@ import logging
 import os
 import re
 import socket
+import time
 import urllib.parse
+import uuid
 from datetime import UTC, datetime
 from threading import Thread
+from typing import Annotated, Literal
 
 # Request/response bodies come from the Smithy-generated control-plane models
 # (single source of truth for the wire contract) rather than hand-rolled
@@ -64,10 +68,11 @@ from coa_control_plane_server.models.list_ontologies_response_content import (
 from coa_control_plane_server.models.ontology_record import (
     OntologyRecord as _OntologyRecord,
 )
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
 from coa_ontology import dynamo_store
+from coa_ontology.abox import build as abox_build
 from coa_ontology.catalog.ingest import (
     ONTOLOGY_STATUS_INGESTING,
     IngestConflictError,
@@ -90,6 +95,10 @@ from coa_ontology.catalog.turtle_export import format_grouped_turtle
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
 from coa_ontology.stores import build_stores as _build_stores  # noqa: F401 (re-exported)
 from coa_ontology.stores.base import GraphStore, VectorStore
+from coa_ontology.studio import queries as studio_queries
+from coa_ontology.versions import deploy as version_deploy
+from coa_ontology.versions import registry as version_registry
+from coa_ontology.versions import storage as version_storage
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -254,7 +263,8 @@ def list_ontologies(
         limit=skip + page_size,
         exclusive_start_key=start_key,
     )
-    body = page_body("ontologies", [_to_record(r) for r in rows[skip:]], next_key, scope=scope)
+    page = _sweep_dead_deletes(namespace, rows[skip:])
+    body = page_body("ontologies", [_to_record(r) for r in page], next_key, scope=scope)
     return ListOntologiesResponseContent(**body)
 
 
@@ -373,6 +383,8 @@ def get_ontology(ontology_id: str, namespace: str = "default"):
         HTTPException: 404 when the ontology exists in neither the registry nor the graph.
     """
     reg = dynamo_store.get_ontology_registry(namespace, ontology_id)
+    if reg:
+        _sweep_dead_deletes(namespace, [reg])
     graph_row = _graph(namespace).get_ontology(ontology_id)
     merged = _merge_registry_and_graph(reg, graph_row)
     if not merged:
@@ -524,7 +536,7 @@ def _induced_ontologies_present(namespace: str, exclude_ontology_id: str | None 
     return rows
 
 
-def _mark_delete_error(namespace: str, ontology_id: str, error: str) -> None:
+def _mark_delete_error(namespace: str, ontology_id: str, error: str, lock_id: str | None = None) -> None:
     """Record why an async delete's teardown failed, on the registry row.
 
     Mirrors the accept flow's ``accept_error``: a row left in ``deleting`` is
@@ -533,36 +545,234 @@ def _mark_delete_error(namespace: str, ontology_id: str, error: str) -> None:
     running and offer a "retry delete". Best-effort + truncated: a large error
     (e.g. one embedding vectors in it) must not itself blow the 400 KB DDB item
     limit and fail this write. A cleared ``delete_error`` (see the route) means
-    a fresh delete attempt is underway.
+    a fresh delete attempt is underway. Never recreates a row that is already
+    gone (a graph-only ontology, or a teardown that finished meanwhile), and with
+    ``lock_id`` (the worker's) only stamps the row while that delete still owns it.
     """
     with contextlib.suppress(Exception):
-        dynamo_store.update_ontology_registry(namespace, ontology_id, delete_error=str(error)[:1000])
+        if not dynamo_store.set_ontology_delete_error(
+            namespace, ontology_id, str(error)[:1000], delete_lock_id=lock_id
+        ):
+            log.info(
+                "Registry row of ontology %s in %s is gone or re-issued; delete_error not recorded",
+                ontology_id,
+                namespace,
+            )
 
 
-def _delete_ontology_backend(namespace: str, ontology_id: str, proposal_ids: list[str] | None = None) -> None:
+# ``delete_error`` stamped on read for a delete whose worker is gone (see _sweep_dead_deletes).
+_DEAD_DELETE_ERROR = "Delete worker did not complete; retry the delete."
+
+
+def _sweep_dead_deletes(namespace: str, rows: list[dict]) -> list[dict]:
+    """Stamp ``delete_error`` on ``deleting`` rows whose worker is gone, so the UI offers a retry.
+
+    Mirrors the stale-version sweep. A worker that died with its task (ECS restart)
+    leaves its row ``deleting`` with no ``delete_error``; it is recognised by its
+    ``delete_lock_id`` not being the live deploy-lock holder (the lock is free,
+    stale, or held by another id; a legacy row without the id never matches). The
+    stamp only lands while the row is still that unstamped delete, so a worker that
+    finished, failed or was re-issued meanwhile wins and the lost race logs at INFO.
+    Best-effort, like the other read sweeps: a DDB error is logged, not raised.
+    Rows are updated in place; returns ``rows``.
+
+    Known and accepted: a single teardown step longer than ``STALE_SECONDS`` gets a
+    live worker stamped dead. A retry before that worker heartbeats again takes the
+    stale lock over and runs a second worker beside it; after the heartbeat, a retry
+    gets 409 until the first worker ends. Once a row is stamped the UI stops polling
+    it, so the worker's eventual outcome shows on the next refresh.
+    """
+    pending = [r for r in rows if r.get("status") == ONTOLOGY_STATUS_DELETING and not r.get("delete_error")]
+    if not pending:
+        return rows
+    try:
+        holder = version_registry.deploy_lock_holder(namespace)
+    except Exception:  # noqa: BLE001 (must not fail the read the user polls)
+        log.warning("Could not read the deploy lock of %s; dead-delete sweep skipped", namespace, exc_info=True)
+        return rows
+    for row in pending:
+        lock_id = row.get("delete_lock_id") or None
+        if lock_id is not None and lock_id == holder:
+            continue  # its worker still holds the lock
+        oid = row.get("ontology_id", "")
+        try:
+            stamped = dynamo_store.set_ontology_delete_error(
+                namespace, oid, _DEAD_DELETE_ERROR, only_unstamped_delete=True, delete_lock_id=lock_id
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("Could not mark the dead delete of %s in %s", oid, namespace, exc_info=True)
+            continue
+        if stamped:
+            log.warning("Delete of ontology %s in %s did not complete (worker gone); marked for retry", oid, namespace)
+            row["delete_error"] = _DEAD_DELETE_ERROR
+        else:
+            log.info("Delete of ontology %s in %s changed since it was read; not marked", oid, namespace)
+    return rows
+
+
+# How a delete stops serving its ontology (see _version_reset_for_delete).
+VersionReset = Literal["reset", "resume"]
+
+
+def _version_reset_for_delete(
+    namespace: str, ontology_id: str, ontology_type: str | None, versions: list[dict]
+) -> VersionReset | None:
+    """How deleting ``ontology_id`` stops serving it: ``"reset"``, ``"resume"`` or None (it is not served).
+
+    Decided from ACTIVE and ``versions`` (newest first) alone. No version at or below
+    the reset floor can be deployed, so a non-null ACTIVE version is in the current
+    lineage, and the PUBLISHED versions above the floor all snapshot one ontology
+    (accept refuses another id while that lineage has a head). A failed or running
+    publish on top may name another ontology (concurrent accepts), so it never
+    decides.
+
+    - ACTIVE serves a version: ``"reset"`` iff that version snapshots ``ontology_id``.
+    - The newest PUBLISHED version above the floor (the lineage head; published,
+      never deployed) snapshots ``ontology_id``: ``"reset"``, so the floor moves past
+      it and the next publish does not build on the deleted ontology.
+    - ACTIVE records that an earlier attempt of this delete already reset it
+      (``reset_by_ontology_id``): ``"resume"``, which only clears ``latest/`` and
+      notifies; ACTIVE and its floor stay as they are.
+    - Without versions (a namespace from before versions), the namespace's only
+      induced ontology is the served one; with several, none is. Foundational and
+      uploaded graphs are never served through ``latest/``.
+    """
+    active = version_registry.get_active(namespace) or {}
+    if active.get("version") is not None:
+        served = next((v for v in versions if v["version"] == active["version"]), None)
+        return "reset" if served and served.get("ontology_id") == ontology_id else None
+    floor = int(active.get("reset_after_version") or 0)
+    head = version_registry.published_head(versions, floor)
+    if head is not None and head.get("ontology_id") == ontology_id:
+        return "reset"
+    if active.get("reset_by_ontology_id") == ontology_id:
+        return "resume"
+    if versions:
+        return None
+    only_induced = ontology_type == _INDUCED_ONTOLOGY_TYPE and not _induced_ontologies_present(
+        namespace, exclude_ontology_id=ontology_id
+    )
+    return "reset" if only_induced else None
+
+
+def _require_delete_lock(namespace: str, lock_id: str | None) -> None:
+    """Raise :class:`DeployLockLostError` unless the delete still holds the deploy lock (refreshing it)."""
+    if lock_id is not None and not version_registry.heartbeat_deploy_lock(namespace, lock_id):
+        raise version_registry.DeployLockLostError(lock_id)
+
+
+def _reset_versions_after_delete(
+    namespace: str, ontology_id: str, lock_id: str | None, *, resume: bool = False
+) -> None:
+    """Stop serving a deleted domain ontology: reset ACTIVE, empty ``latest/``, tell VKG, then clear its ABox.
+
+    Before versions existed VKG kept serving a deleted ontology from ``latest/``.
+    Version history is kept; the next publish starts without a parent. With
+    ``resume`` an earlier attempt already reset ACTIVE, so it is left alone (its
+    floor too) and only the lock is checked. Every step is idempotent and retried;
+    one that keeps failing raises, and so does a lost deploy lock (the ACTIVE reset,
+    or the resume check, is fenced on ``lock_id``).
+    """
+    label = f"delete[{namespace}]"
+    if resume:
+        version_deploy._retry(f"{label} check the deploy lock", lambda: _require_delete_lock(namespace, lock_id))
+    else:
+        # reset_active lists the versions afresh instead of reusing the route's list, so
+        # the floor also covers a version reserved after the route's publish gate (an
+        # accept that read the row just before the "deleting" flip); that version is
+        # retired with the deleted ontology and its accept can be repeated.
+        version_deploy._retry(
+            f"{label} reset ACTIVE",
+            lambda: version_registry.reset_active(namespace, ontology_id=ontology_id, fence_deployment_id=lock_id),
+        )
+    version_deploy._retry(f"{label} clear latest/", lambda: version_storage.clear_latest(namespace))
+    version_deploy._retry(f"{label} notify", lambda: version_deploy.emit_ontology_deployed(namespace, None, None))
+    # After VKG stopped serving: dropping a large ABox graph may be slow or fail, and must not keep
+    # VKG serving the deleted ontology meanwhile.
+    version_deploy._retry(f"{label} clear the domain ABox", lambda: abox_build.clear_abox(namespace))
+    # A build already past its ACTIVE check can still swap its ABox in (or write READY) after the
+    # clear above. ACTIVE is reset now, so a requested build clears whatever it leaves behind.
+    try:
+        abox_build.request_build(namespace, "domain ontology deleted")
+    except Exception:  # noqa: BLE001 (best effort: the delete must not fail over a missed rebuild)
+        log.warning("%s: could not request the domain ABox rebuild", label, exc_info=True)
+
+
+def _heartbeat_delete_lock(namespace: str, lock_id: str | None) -> None:
+    """Refresh the deploy lock a delete holds, so a long teardown is not taken over as stale.
+
+    Never raises: the graph may already be dropped, so the teardown must run on.
+    """
+    if lock_id is None:
+        return
+    try:
+        held = version_registry.heartbeat_deploy_lock(namespace, lock_id)
+    except Exception:  # noqa: BLE001
+        log.warning("Could not heartbeat deploy lock %s in %s", lock_id, namespace, exc_info=True)
+        return
+    if not held:
+        log.warning("Delete lost deploy lock %s in %s to another holder; finishing the teardown", lock_id, namespace)
+
+
+def _delete_ontology_backend(
+    namespace: str,
+    ontology_id: str,
+    proposal_ids: list[str] | None = None,
+    *,
+    version_reset: VersionReset | None = None,
+    lock_id: str | None = None,
+) -> None:
+    """Run :func:`_tear_down_ontology`, then release the namespace deploy lock ``lock_id``.
+
+    The route takes the deploy lock before it starts this worker, so no deployment
+    starts mid-delete. It is released whatever the teardown's outcome, including
+    the hard-gate early returns.
+    """
+    try:
+        _tear_down_ontology(namespace, ontology_id, proposal_ids, version_reset, lock_id)
+    finally:
+        if lock_id:
+            version_deploy.release_lock(namespace, lock_id)
+
+
+def _tear_down_ontology(
+    namespace: str,
+    ontology_id: str,
+    proposal_ids: list[str] | None,
+    version_reset: VersionReset | None,
+    lock_id: str | None,
+) -> None:
     """Tear down an ontology asynchronously, then remove its registry row.
 
     Runs in a daemon thread after the route has flipped the registry row to
     ``status="deleting"`` (the client-visible status — GET /ontologies keeps
     listing the ontology as "Delete in progress" while this runs). Order:
-    Neptune named-graph DROP → AOSS embedding teardown (wait until the deleted
-    vectors are no longer searchable) → proposal cleanup → **delete the
-    registry row last**, so the ontology only disappears
-    from the catalog once its graph + embeddings are actually gone. This also
-    avoids the API Gateway 29s timeout (504) on large ontologies.
+    Neptune named-graph DROP, then version reset (domain ontology only), then AOSS
+    embedding teardown (wait until the deleted vectors are no longer
+    searchable), then proposal cleanup, and **delete the registry row last**, so the
+    ontology only disappears from the catalog once its graph + embeddings are
+    actually gone. This also avoids the API Gateway 29s timeout (504) on large
+    ontologies.
 
-    Failure handling — the registry row is the recovery anchor. The graph DROP
-    and embedding teardown are **hard gates**: if either raises (Neptune/AOSS
-    throttling, IAM, connectivity), we log and RETURN WITHOUT deleting the
-    registry row, so the ontology stays in ``status="deleting"`` rather than
-    vanishing from the catalog while orphaned triples/vectors remain. A
-    re-issued DELETE is idempotent and retries the teardown from the top.
+    Failure handling — the registry row is the recovery anchor. The graph DROP,
+    the version reset and the embedding teardown are **hard gates**: if one
+    raises (Neptune/AOSS/S3/EventBridge throttling, IAM, connectivity), we log
+    and RETURN WITHOUT deleting the registry row, so the ontology stays in
+    ``status="deleting"`` rather than vanishing from the catalog while orphaned
+    triples/vectors remain or VKG still serves it. A re-issued DELETE is
+    idempotent and retries the teardown from the top.
 
     ECS restart caveat: this runs in a daemon thread, so a task restart (normal
     during a deploy) mid-teardown kills it before the registry row is removed —
     same recoverable outcome as a hard-gate failure: the row stays ``deleting``
     and a re-issued DELETE recovers it. (Per the accepted design; a durable
     job queue would remove even this window but isn't warranted here.)
+
+    Versions: the deploy lock ``lock_id`` is heartbeated after the graph DROP and
+    after the embedding teardown, since together they can outlast the lock's stale
+    threshold. With ``version_reset`` (the route found it is served, see
+    :func:`_version_reset_for_delete`) it stops being served right after the DROP
+    (:func:`_reset_versions_after_delete`).
     """
     graph_store, vector_store = _stores(namespace)
 
@@ -581,8 +791,26 @@ def _delete_ontology_backend(namespace: str, ontology_id: str, proposal_ids: lis
         )
         # deleteError is returned by ListOntologies: the exception type only, the
         # message (graph endpoint, query detail) stays in the log line above.
-        _mark_delete_error(namespace, ontology_id, f"Graph delete failed: {type(e).__name__}")
+        _mark_delete_error(namespace, ontology_id, f"Graph delete failed: {type(e).__name__}", lock_id)
         return
+    _heartbeat_delete_lock(namespace, lock_id)
+
+    # Hard gate (domain ontology only): stop serving it right after the DROP, so VKG
+    # does not keep serving a dropped graph through the slow embedding teardown. On
+    # failure the row stays; a re-issued DELETE re-runs the (idempotent) reset.
+    if version_reset:
+        try:
+            _reset_versions_after_delete(namespace, ontology_id, lock_id, resume=version_reset == "resume")
+        except Exception as e:
+            log.error(
+                "Version reset failed for ontology %s in %s; leaving row in 'deleting' "
+                "for retry (VKG may still serve latest/)",
+                ontology_id,
+                namespace,
+                exc_info=True,
+            )
+            _mark_delete_error(namespace, ontology_id, f"Version reset failed: {type(e).__name__}", lock_id)
+            return
 
     # Hard gate 2: AOSS embedding teardown. Same rationale — leaving embeddings
     # behind causes stale search results + storage/quota bleed, so don't remove
@@ -618,8 +846,9 @@ def _delete_ontology_backend(namespace: str, ontology_id: str, proposal_ids: lis
             namespace,
             exc_info=True,
         )
-        _mark_delete_error(namespace, ontology_id, f"Embedding delete failed: {type(e).__name__}")
+        _mark_delete_error(namespace, ontology_id, f"Embedding delete failed: {type(e).__name__}", lock_id)
         return
+    _heartbeat_delete_lock(namespace, lock_id)
 
     # Delete the proposals (DDB rows + S3 artifacts) tied to this ontology —
     # both the ones that produced it AND the ones grounded against it — so they
@@ -629,7 +858,12 @@ def _delete_ontology_backend(namespace: str, ontology_id: str, proposal_ids: lis
     # rather than blocking the whole delete on it.
     for pid in proposal_ids or []:
         try:
-            dynamo_store.delete_proposal(namespace, pid)
+            # A proposal open in the Ontology designer has draft graphs in Neptune, named only in its STUDIOGRAPH
+            # row. That row stays while it still names one (a DROP failed), for the namespace purge. If the
+            # deletion below fails, the proposal keeps a closed row and its draft can no longer be queried,
+            # which is acceptable for a proposal of a deleted ontology.
+            dropped = studio_queries.drop_draft_graph(namespace, pid)
+            dynamo_store.delete_proposal(namespace, pid, keep=() if dropped else (studio_queries.GRAPH_SK,))
         except Exception:
             log.warning(
                 "Proposal delete failed for %s (ontology %s in %s) — continuing",
@@ -644,17 +878,22 @@ def _delete_ontology_backend(namespace: str, ontology_id: str, proposal_ids: lis
     # (recoverable by re-issuing DELETE); log so it's visible to ops.
     try:
         dynamo_store.delete_ontology_registry(namespace, ontology_id)
-    except Exception:
+    except Exception as e:
         log.error(
             "Registry row delete failed for ontology %s in %s — row stuck in 'deleting'; re-issue DELETE to recover",
             ontology_id,
             namespace,
             exc_info=True,
         )
+        _mark_delete_error(namespace, ontology_id, f"Registry row delete failed: {type(e).__name__}", lock_id)
 
 
 @router.delete("/", status_code=200)
-def delete_ontologies(namespace: str = "default", ontology_id: str | None = None):
+def delete_ontologies(
+    namespace: str = "default",
+    ontology_id: str | None = None,
+    x_coa_principal: Annotated[str | None, Header()] = None,
+):
     """Delete ontology data for a namespace.
 
     Handles two modes on the same ``DELETE /ontologies`` route: a single-ontology
@@ -678,9 +917,33 @@ def delete_ontologies(namespace: str = "default", ontology_id: str | None = None
     (their DynamoDB rows + S3 artifacts), so the proposals catalog doesn't keep
     entries pointing at a graph that no longer exists.
 
+    A single-ontology delete holds the namespace deploy lock (holder
+    ``delete-…``, recorded on the row as ``delete_lock_id``) until its worker
+    finishes. It is refused (409) while a deployment or another ontology's
+    delete holds the lock, and while a version publishes that snapshots this
+    ontology or would land while this delete stops serving it. Re-issued while
+    this ontology's own delete still runs, it returns 202 without starting a
+    second worker; if that delete already failed but its worker has not yet
+    released the lock, 409 "still finishing". A graph-only ontology has no row
+    to record the holder, so its re-issue gets the "another delete" 409. A
+    worker that dies with its task (ECS restart) leaves the lock held until it
+    goes stale (``registry.STALE_SECONDS``); after that reads mark the row with
+    a retryable ``delete_error`` and a re-issued DELETE takes the lock over and
+    retries the teardown.
+
     When ``ontology_id`` is omitted, delete ALL ontology data for the namespace
-    (named graphs, the AOSS vector index, and all DynamoDB records).
+    (named graphs, the AOSS vector index, and all DynamoDB records, the version
+    rows and the deploy lock included, whatever deployment holds it). Only the
+    control plane's namespace teardown may do that. It calls the service directly
+    without ``X-Coa-Principal``, which the API proxy sets on every public call
+    (the authorizer denies an empty or blank principal), so a call that carries
+    the header and no ``ontology_id`` gets 422: API Gateway does not enforce
+    ``@required``. The wipe first stops the domain ABox builds and waits out the
+    writes of one still running (``abox_build.stop_builds``), as long as a MOVE in
+    doubt is waited out (``DEPLOY_AMBIGUOUS_MOVE_WAIT_SECONDS``).
     """
+    if not ontology_id and x_coa_principal is not None:
+        raise HTTPException(422, "ontology_id is required")
     graph_store, vector_store = _stores(namespace)
 
     # Single-ontology delete (query param present): mark the row "deleting" now
@@ -692,68 +955,148 @@ def delete_ontologies(namespace: str = "default", ontology_id: str | None = None
         graph_exists = graph_store.get_ontology_by_uri(ontology_id) is not None
         if not registry_row and not graph_exists:
             raise HTTPException(404, "Ontology not found")
-        # Guard: while any induced ontology exists, refuse to delete a NON-induced
-        # (user-loaded / foundational) ontology — an induced ontology is derived
-        # from and grounded against those, so removing one out from under it would
-        # leave the induced ontology dangling. Deleting an induced ontology itself
-        # stays allowed (it excludes itself from the check), otherwise induced
-        # ontologies could never be removed. Enforces the rule for direct API
-        # callers regardless of the UI.
-        ontology_type = (registry_row or {}).get("ontology_type")
-        if ontology_type != _INDUCED_ONTOLOGY_TYPE:
-            induced = _induced_ontologies_present(namespace, exclude_ontology_id=ontology_id)
-            if induced:
-                induced_ids = sorted({r.get("ontology_id", "") for r in induced if r.get("ontology_id")})
-                log.info(
-                    "Refusing delete of ontology %s in %s — %d induced ontology(ies) present: %s",
-                    ontology_id,
-                    namespace,
-                    len(induced),
-                    induced_ids,
-                )
+        # Hold the namespace deploy lock for the whole delete: a running deployment
+        # refuses it (409) and no deployment starts until the worker releases the
+        # lock. A refusal below, before the worker starts, releases it here.
+        delete_id = f"{version_registry.DELETE_LOCK_PREFIX}{uuid.uuid4().hex[:8]}"
+        try:
+            version_registry.acquire_deploy_lock(namespace, delete_id)
+        except version_registry.DeployLockHeldError as e:
+            holder = e.deployment_id
+            if not holder:  # released before its holder could be read
                 raise HTTPException(
-                    409,
-                    "Cannot delete this ontology while induced ontologies exist in the namespace. "
-                    "Delete the induced ontologies first, then retry.",
-                )
-        proposal_ids = _proposal_ids_to_delete_with_ontology(namespace, ontology_id, registry_row)
-        # Flip to "deleting" synchronously so the very next GET /ontologies
-        # reflects the in-progress state. No-op if there's no registry row
-        # (graph-only ontology) — the async teardown still runs. If the status
-        # flip fails we abort with 500 rather than starting teardown: otherwise
-        # the row would stay status=None and the ontology would vanish abruptly
-        # at the end instead of showing "Delete in progress".
-        if registry_row:
-            try:
-                # Clear any delete_error from a prior failed attempt so a
-                # re-issued DELETE reads as "in progress", not "stuck".
-                dynamo_store.update_ontology_registry(
-                    namespace, ontology_id, status=ONTOLOGY_STATUS_DELETING, delete_error=""
-                )
-            except Exception as e:
-                log.error(
-                    "Failed to mark ontology %s in %s as deleting — aborting delete",
-                    ontology_id,
-                    namespace,
-                    exc_info=True,
-                )
-                raise HTTPException(500, "Failed to mark ontology for deletion; please retry") from e
-        Thread(
-            target=_delete_ontology_backend,
-            args=(namespace, ontology_id, proposal_ids),
-            daemon=True,
-        ).start()
+                    409, "Another deployment or delete is in progress in this namespace; retry shortly."
+                ) from e
+            if not holder.startswith(version_registry.DELETE_LOCK_PREFIX):
+                raise HTTPException(
+                    409, f"Deployment {holder} is in progress in this namespace; retry once it finishes."
+                ) from e
+            row = registry_row or {}
+            own = row.get("status") == ONTOLOGY_STATUS_DELETING and row.get("delete_lock_id") == holder
+            if own and not row.get("delete_error"):
+                return Response(status_code=202)  # this ontology's own delete still runs
+            if own:  # it failed, but its worker has not released the lock yet
+                raise HTTPException(409, "This ontology's previous delete is still finishing; retry shortly.") from e
+            raise HTTPException(409, "Another ontology delete is in progress in this namespace; retry shortly.") from e
+        try:
+            # Read again under the lock: a deployment that held it until now may have rewritten the row.
+            registry_row = dynamo_store.get_ontology_registry(namespace, ontology_id)
+            # Guard: while any induced ontology exists, refuse to delete a NON-induced
+            # (user-loaded / foundational) ontology — an induced ontology is derived
+            # from and grounded against those, so removing one out from under it would
+            # leave the induced ontology dangling. Deleting an induced ontology itself
+            # stays allowed (it excludes itself from the check), otherwise induced
+            # ontologies could never be removed. Enforces the rule for direct API
+            # callers regardless of the UI.
+            ontology_type = (registry_row or {}).get("ontology_type")
+            if ontology_type != _INDUCED_ONTOLOGY_TYPE:
+                induced = _induced_ontologies_present(namespace, exclude_ontology_id=ontology_id)
+                if induced:
+                    induced_ids = sorted({r.get("ontology_id", "") for r in induced if r.get("ontology_id")})
+                    log.info(
+                        "Refusing delete of ontology %s in %s — %d induced ontology(ies) present: %s",
+                        ontology_id,
+                        namespace,
+                        len(induced),
+                        induced_ids,
+                    )
+                    raise HTTPException(
+                        409,
+                        "Cannot delete this ontology while induced ontologies exist in the namespace. "
+                        "Delete the induced ontologies first, then retry.",
+                    )
+            versions = version_registry.list_versions(namespace)  # sweeps a dead publish to PUBLISH_FAILED
+            version_reset = _version_reset_for_delete(namespace, ontology_id, ontology_type, versions)
+            # No publish may snapshot this ontology while its graph is dropped, or land
+            # while this delete stops serving. Not atomic with accept's "deleting" check:
+            # an accept that read the row just before the flip below may still publish,
+            # which then acts as an accept issued after this delete.
+            head = versions[0] if versions else {}
+            if head.get("status") == version_registry.PUBLISHING and (
+                head.get("ontology_id") == ontology_id or version_reset
+            ):
+                raise HTTPException(409, "A version publish is in progress; retry after it finishes.")
+            proposal_ids = _proposal_ids_to_delete_with_ontology(namespace, ontology_id, registry_row)
+            # Flip to "deleting" synchronously so the very next GET /ontologies
+            # reflects the in-progress state. No-op if there's no registry row
+            # (graph-only ontology) — the async teardown still runs. If the status
+            # flip fails we abort with 500 rather than starting teardown: otherwise
+            # the row would stay status=None and the ontology would vanish abruptly
+            # at the end instead of showing "Delete in progress".
+            if registry_row:
+                try:
+                    # Clear any delete_error from a prior failed attempt so a
+                    # re-issued DELETE reads as "in progress", not "stuck"; record
+                    # the lock holder so a re-issue can recognise this delete.
+                    dynamo_store.update_ontology_registry(
+                        namespace,
+                        ontology_id,
+                        status=ONTOLOGY_STATUS_DELETING,
+                        delete_error="",
+                        delete_lock_id=delete_id,
+                    )
+                except Exception as e:
+                    log.error(
+                        "Failed to mark ontology %s in %s as deleting — aborting delete",
+                        ontology_id,
+                        namespace,
+                        exc_info=True,
+                    )
+                    raise HTTPException(500, "Failed to mark ontology for deletion; please retry") from e
+            Thread(
+                target=_delete_ontology_backend,
+                args=(namespace, ontology_id, proposal_ids),
+                kwargs={"version_reset": version_reset, "lock_id": delete_id},
+                daemon=True,
+            ).start()
+        except Exception:
+            version_deploy.release_lock(namespace, delete_id)
+            raise
         return Response(status_code=202)
 
-    # 1. List all ontologies and drop their named graphs
-    registry_rows = dynamo_store.list_ontologies_registry(namespace)
+    # 0. Stop the domain ABox builds for good, then wait out the writes of one still running, so
+    # none lands after the drops and the purge below. Each document source the pipeline deleted
+    # requests a build when its own deletion pipeline ends. The pipeline stopped the builds before
+    # it deleted them; a build may have started since (that lease went stale) or just before.
+    # Not best-effort: a write landing after the purge is the race this prevents.
+    settle = abox_build.stop_builds(namespace)
+    if settle > 0:
+        log.info("Waiting %.0fs for the stopped domain ABox build of namespace %s to settle", settle, namespace)
+        time.sleep(settle)
+
+    # 1. List all ontologies and drop their named graphs. The version rows name the domain
+    # ontology too: a deployment writes its registry row in its registry step, after the swap
+    # and the embeddings, so a first one that failed between its swap and that step left a
+    # served graph no registry row names, and the purge below deletes the version rows, the
+    # last record of that graph.
+    registry_ids = [row.get("ontology_id", "") for row in dynamo_store.list_ontologies_registry(namespace)]
+    version_ids = [row.get("ontology_id", "") for row in version_registry.list_versions(namespace)]
     graphs_dropped = 0
-    for row in registry_rows:
-        ontology_id = row.get("ontology_id", "")
+    for ontology_id in dict.fromkeys(registry_ids + version_ids):
         if ontology_id:
             with contextlib.suppress(Exception):
                 if graph_store.delete_ontology(ontology_id):
                     graphs_dropped += 1
+    # Leftover deployment staging graphs (they can hold sample column values). They
+    # are named after the DEPLOY rows, so this must run before the DDB purge below.
+    # Best-effort like the graph drops above.
+    try:
+        version_deploy.drop_staging_graphs(namespace)
+    except Exception:  # noqa: BLE001
+        log.warning("Could not drop the deployment staging graphs of namespace %s", namespace, exc_info=True)
+    # The domain ABox graph (and an in-flight build's staging graph, named in the ABOX row the
+    # purge below deletes). Best-effort like the drops above.
+    try:
+        abox_build.drop_graphs(namespace)
+    except Exception:  # noqa: BLE001
+        log.warning("Could not drop the domain ABox graphs of namespace %s", namespace, exc_info=True)
+    # The designer draft graphs, named in STUDIOGRAPH rows the purge below deletes. Best-effort too.
+    # A draft load still running drops what it wrote: the rows are closed first, and a load that
+    # starts later finds the domain ABox lock taken in step 0.
+    try:
+        studio_queries.drop_all_draft_graphs(namespace)
+    except Exception:  # noqa: BLE001
+        log.warning("Could not drop the designer draft graphs of namespace %s", namespace, exc_info=True)
 
     # 2. Delete the entire AOSS vector index for the namespace.
     #

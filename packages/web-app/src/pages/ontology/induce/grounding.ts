@@ -411,7 +411,17 @@ function sqlIdentSegments(turtleLiteral: string): string[] {
   }
   // 2. Turtle escapes.
   s = s.replace(/\\(.)/g, "$1");
-  // 3. Split on the dots BETWEEN delimited identifiers only. A table
+  // 3. The SQL identifier segments.
+  return splitSqlIdentPath(s);
+}
+
+/**
+ * Split a possibly-quoted, possibly-qualified SQL name (an ``rr:tableName`` or
+ * ``rr:column`` value) into its bare segments: ``"public"."customers"`` gives
+ * ``["public", "customers"]``.
+ */
+export function splitSqlIdentPath(s: string): string[] {
+  // Split on the dots BETWEEN delimited identifiers only. A table
   // legitimately named ``q1.results`` is ONE delimited identifier, so splitting
   // on every dot would report its schema as ``q1``. Mirrors
   // ``coa_common.constants.split_sql_ident_path`` on the producing side.

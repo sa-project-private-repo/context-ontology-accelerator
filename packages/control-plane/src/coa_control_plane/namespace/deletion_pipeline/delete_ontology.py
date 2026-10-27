@@ -5,7 +5,7 @@
 
 Reuses the existing ontology-engine HTTP teardown and S3 sweep from
 ``cleanup.py`` — this step just runs them as their own Step Functions task
-so the ontology-engine's slow, best-effort HTTP call (up to 120s) has its
+so the ontology-engine's slow, best-effort HTTP call (up to 300s) has its
 own retry policy separate from the rest of the pipeline.
 """
 

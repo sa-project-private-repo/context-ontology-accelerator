@@ -163,7 +163,13 @@ class RedshiftDataAPIExecutor:
         sql = self._prepare_sql(sql, glue_database, max_rows)
 
         statement_id = await self._start_statement(sql, workgroup)
-        await self._wait_for_completion(statement_id, timeout_seconds)
+        try:
+            await self._wait_for_completion(statement_id, timeout_seconds)
+        except (RedshiftTimeoutError, asyncio.CancelledError):
+            # Our deadline passed, or the caller stopped waiting: cancel the statement
+            # too, or it keeps running on the warehouse.
+            self._cancel_in_background(statement_id)
+            raise
         rows, columns, has_more = await self._get_results(statement_id, max_rows)
 
         duration_ms = int((time.perf_counter() - start) * 1000)
@@ -183,6 +189,7 @@ class RedshiftDataAPIExecutor:
             truncated=has_more,
             duration_ms=duration_ms,
             engine="redshift",
+            sql=sql,
         )
 
     async def health_check(self) -> dict[str, Any]:
@@ -388,6 +395,20 @@ class RedshiftDataAPIExecutor:
             ),
         )
         return response["Id"]
+
+    def _cancel_in_background(self, statement_id: str) -> None:
+        """Ask the Data API to cancel ``statement_id`` without awaiting it.
+
+        A plain submit, not an await, so a cancelled caller cannot skip it.
+        """
+        _EXECUTOR.submit(self._cancel_quietly, statement_id)
+
+    def _cancel_quietly(self, statement_id: str) -> None:
+        """Best-effort cancel; a failure here must not mask the timeout."""
+        try:
+            self._client.cancel_statement(Id=statement_id)
+        except Exception:  # noqa: BLE001 - the timeout is the error worth raising
+            logger.warning("redshift_cancel_statement_failed", statement_id=statement_id, exc_info=True)
 
     async def _wait_for_completion(self, statement_id: str, timeout_seconds: int) -> None:
         loop = asyncio.get_running_loop()

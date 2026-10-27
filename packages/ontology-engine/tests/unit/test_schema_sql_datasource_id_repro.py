@@ -61,7 +61,7 @@ def _reader_for(ds_id: str) -> dict:
     }
 
 
-def _run(monkeypatch: pytest.MonkeyPatch, *, extra_datasource_ids: list[str] | None):
+def _run(monkeypatch: pytest.MonkeyPatch, *, extra_datasource_ids: list[str] | None, **kwargs):
     """Run _generate_schema_sql with the scan returning ONLY source 1 (the race)."""
     from coa_ontology import proposals
 
@@ -82,7 +82,9 @@ def _run(monkeypatch: pytest.MonkeyPatch, *, extra_datasource_ids: list[str] | N
         patch("coa_ontology.induce_catalog._resolve_datazone_project_id", return_value=("proj-1", "ns-uuid")),
         patch("coa_common.metadata_store.catalog_reader.read_approved_catalog", side_effect=_fake_read),
     ):
-        return proposals._generate_schema_sql("ns", "ont-1", _MAPPING_TURTLE, extra_datasource_ids=extra_datasource_ids)
+        return proposals._generate_schema_sql(
+            "ns", "ont-1", _MAPPING_TURTLE, extra_datasource_ids=extra_datasource_ids, **kwargs
+        )
 
 
 @pytest.mark.unit
@@ -113,3 +115,45 @@ def test_extra_ids_union_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     # Each table declared exactly once despite _DS1 appearing in both scan and extra.
     for t in _ALL_TABLES:
         assert ddl.count(f'CREATE TABLE IF NOT EXISTS "{t}" (') == 1, f"{t} not declared exactly once"
+
+
+@pytest.mark.unit
+def test_without_the_scan_only_the_given_ids_are_described(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``scan_accepted=False`` (publishing a snapshot) describes exactly the ids passed, never the scan's."""
+    from coa_ontology.proposals import SchemaSqlGenerationError
+
+    # The scan would add source 1; without it the mapping's brands/products tables are undeclared.
+    with pytest.raises(SchemaSqlGenerationError):
+        _run(monkeypatch, extra_datasource_ids=[_DS2], scan_accepted=False)
+    ddl = _run(monkeypatch, extra_datasource_ids=[_DS1, _DS2], scan_accepted=False)
+    assert all(f'CREATE TABLE IF NOT EXISTS "{t}" (' in ddl for t in _ALL_TABLES)
+
+
+@pytest.mark.unit
+def test_a_mapped_table_the_catalog_lacks_raises_the_coverage_error_unwrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The coverage failure keeps its own type through the catalog wrapper."""
+    from coa_ontology.proposals import SchemaSqlCoverageError
+
+    with pytest.raises(SchemaSqlCoverageError) as exc:
+        _run(monkeypatch, extra_datasource_ids=[_DS2], scan_accepted=False)
+    assert exc.value.missing == ['"brands"', '"products"']
+
+
+@pytest.mark.unit
+def test_a_mapping_whose_datasource_exposes_no_tables_is_a_coverage_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No tables is the empty state only when the mapping names none; otherwise every mapped table is missing."""
+    from coa_ontology.proposals import SchemaSqlCoverageError
+
+    with pytest.raises(SchemaSqlCoverageError) as exc:
+        _run(monkeypatch, extra_datasource_ids=["33333333-3333-3333-3333-333333333333"], scan_accepted=False)
+    assert exc.value.missing == sorted(f'"{t}"' for t in _ALL_TABLES)
+
+
+@pytest.mark.unit
+def test_a_mapping_without_any_datasource_is_a_coverage_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No datasource is the empty state only when the mapping names no tables."""
+    from coa_ontology.proposals import SchemaSqlCoverageError
+
+    with pytest.raises(SchemaSqlCoverageError) as exc:
+        _run(monkeypatch, extra_datasource_ids=[], scan_accepted=False)
+    assert exc.value.missing == sorted(f'"{t}"' for t in _ALL_TABLES)

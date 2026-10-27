@@ -2236,6 +2236,29 @@ describe("SourcesStack", () => {
         }),
       });
     });
+
+    it("SourcesDocAboxRequestFn is deployed in VPC and reaches ontology-engine over Cloud Map", () => {
+      // ontology-engine's /internal/abox/requests is VPC-only, so the Lambda must
+      // sit in the VPC and be given the Cloud Map endpoint (the lambda SG already
+      // allows egress to the ECS SG on 8001).
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-doc-abox-request$"),
+        Handler: "handler.handler",
+        Runtime: "python3.12",
+        Architectures: ["arm64"],
+        VpcConfig: Match.objectLike({
+          SubnetIds: Match.anyValue(),
+          SecurityGroupIds: Match.anyValue(),
+        }),
+        Environment: {
+          Variables: Match.objectLike({
+            ONTOLOGY_ENGINE_ENDPOINT: Match.stringLikeRegexp(
+              "^http://ontology-engine\\..+:8001$",
+            ),
+          }),
+        },
+      });
+    });
   });
 
   describe("KG Build Observability", () => {
@@ -2757,6 +2780,56 @@ describe("SourcesStack", () => {
       const definitions = JSON.stringify(stateMachines);
       expect(definitions).toContain("RESCAN_REVIEW_NEEDED");
       expect(definitions).toContain("$.discoveryResult.Payload.reviewNeeded");
+    });
+  });
+
+  describe("Domain ABox rebuild request (Step Functions)", () => {
+    // The request is the last state of both document pipelines. The ASL is embedded
+    // as an escaped JSON string inside a Fn::Join, so strip the backslash escaping
+    // before matching the rendered States Language.
+    const definitionOf = (nameSuffix: string): string => {
+      const machine = Object.values(
+        template.findResources("AWS::StepFunctions::StateMachine"),
+      ).find((m: any) =>
+        String(m.Properties?.StateMachineName ?? "").endsWith(nameSuffix),
+      );
+      expect(machine).toBeDefined();
+      return JSON.stringify(machine).replace(/\\/g, "");
+    };
+
+    it("ends the ingestion pipeline with a non-fatal ABox request", () => {
+      const definition = definitionOf("sources-doc-ingestion-pipeline");
+      expect(definition).toContain('"SourcesDocAboxRequest":');
+      expect(definition).not.toContain("SourcesDocDeletionAboxRequest");
+      // Maps exactly onto the handler's event keys (namespace, docSourceId, reason).
+      expect(definition).toContain('"namespace.$":"$.namespace_id"');
+      expect(definition).toContain('"docSourceId.$":"$.doc_source_id"');
+      expect(definition).toContain('"reason":"documents ingested"');
+      // The pipeline already succeeded: a failed request lands in a Pass, not the error chain.
+      expect(definition).toContain('"SourcesDocAboxRequestSkipped":');
+      expect(definition).toContain('"Next":"SourcesDocAboxRequestSkipped"');
+      expect(definition).toContain('"ResultPath":"$.aboxRequestError"');
+      // It runs after the document is marked COMPLETED.
+      expect(definition).toContain(
+        '"DocUpdateStatusCompleted":{"Next":"SourcesDocAboxRequest"',
+      );
+    });
+
+    it("ends the deletion pipeline with a non-fatal ABox request", () => {
+      const definition = definitionOf("sources-doc-deletion-pipeline");
+      expect(definition).toContain('"SourcesDocDeletionAboxRequest":');
+      expect(definition).toContain('"namespace.$":"$.namespace_id"');
+      expect(definition).toContain('"docSourceId.$":"$.doc_source_id"');
+      expect(definition).toContain('"reason":"document source deleted"');
+      expect(definition).toContain('"SourcesDocDeletionAboxRequestSkipped":');
+      expect(definition).toContain(
+        '"Next":"SourcesDocDeletionAboxRequestSkipped"',
+      );
+      expect(definition).toContain('"ResultPath":"$.aboxRequestError"');
+      // It runs after the DynamoDB record is deleted.
+      expect(definition).toContain(
+        '"SourcesDocDeleteDdbRecord":{"Next":"SourcesDocDeletionAboxRequest"',
+      );
     });
   });
 

@@ -171,35 +171,66 @@ aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN \
 ## Image Reloads and the Scheduled Sweep
 
 VKG runs **one ECS service per namespace** (`<prefix>-vkg-<namespace>`). No static
-"default" service exists — a namespace's service is created the first time its
-ontology is published. The `<prefix>-vkg-reload` Lambda owns provisioning and
-image refresh; the latest image URI is published to SSM
-(`/<prefix>/vkg/container-image`) on every CDK deploy.
+"default" service exists: a namespace's service is created the first time one of
+its ontology versions is deployed. The `<prefix>-vkg-reload` Lambda owns
+provisioning, scale-to-zero and image refresh; the latest image URI is published
+to SSM (`/<prefix>/vkg/container-image`) on every CDK deploy.
 
 ### Two ways the reload Lambda runs
 
 | Trigger | Event | Scope |
 |---------|-------|-------|
-| `ontology.published` (EventBridge) | `{"detail": {"namespace": "...", "version": "..."}}` | The one namespace that was published |
+| `ontology.deployed` (EventBridge) | `{"detail": {"namespace": "...", "version": "v3"}}` (`version` is `null` after a delete) | The one namespace whose served ontology changed |
 | Scheduled sweep (EventBridge, weekly) | `{"sweep": true}` | **Every** `<prefix>-vkg-*` service in the cluster |
 
-On each run the Lambda resolves the latest image from SSM and, per service,
-registers a new task-definition revision when the image differs (else forces a
-new deployment), always with the ECS circuit breaker + rollback.
+The ontology engine emits `ontology.deployed` once a deployment (or rollback) has
+copied a version's VKG files to `ontologies/<namespace>/latest/`, and with
+`version: null` once deleting the namespace's domain ontology has removed them.
+For one release the rule also matches the pre-versioning `ontology.published`
+event, so an older engine task still triggers a reload.
+
+### `latest/` decides what a run does
+
+The event's `version` is only logged: events are asynchronous and retried, so a
+delete's and a deploy's can arrive in either order. The Lambda reads `latest/`
+instead, with the same test as `entrypoint.sh`: a depth-1 `*.ttl`/`*.owl`
+ontology **and** a `*.obda`/`*.r2rml` mappings file. `schema.sql` is not part of
+this check, but Ontop still needs its DDL for every mapped table: one without it
+fails the whole namespace's load. A publish therefore fails when a mapped table is
+missing from the source catalog; its error lists the remedies.
+
+- **Loadable files: reload.** Register a new task-definition revision when the SSM
+  image differs, else force a new deployment, always with the ECS circuit breaker
+  + rollback. A service at zero is scaled back to one (autoscaling MinCapacity
+  first); a missing service is provisioned.
+- **No loadable files: scale to zero.** This happens when the domain ontology
+  is deleted (`latest/` is cleared), and also when the deployed version has no
+  mappings (deploying it removes `mappings.r2rml` from `latest/`). Lower the
+  autoscaling MinCapacity to 0, then set the desired count to 0. A redeploy
+  would start a degraded task (`/health` 503) that fails its health check and
+  rolls back, leaving the old task serving what was there before. A missing,
+  `INACTIVE` or `DRAINING` service is left alone and never created.
+
+After each action the Lambda reads `latest/` again and acts again, up to 4 times,
+until what it read matches what it did, so the invocation that writes last also
+reads last. If `latest/` keeps changing it emits `ReloadFailed` and fails, and the
+asynchronous retry reads it again later.
 
 ### Why the scheduled sweep exists
 
-The `ontology.published` trigger only refreshes a namespace **when its ontology
-is re-accepted**. A long-lived namespace that is never republished keeps its
-provision-time image indefinitely, so base-image digest bumps (Renovate, or a
-Dockerfile pin change) never reach a running task and stale, Inspector-flagged
-VKG images accumulate. A CDK deploy does **not** fix this either — it only
-updates the shared template task def and the SSM image parameter, not the
-existing per-namespace services.
+`ontology.deployed` only refreshes a namespace **when one of its versions is
+deployed** (or its domain ontology is deleted). A long-lived namespace that is
+never redeployed keeps its provision-time image indefinitely, so base-image digest
+bumps (Renovate, or a Dockerfile pin change) never reach a running task and stale,
+Inspector-flagged VKG images accumulate. A CDK deploy does **not** fix this either:
+it only updates the shared template task def and the SSM image parameter, not
+the existing per-namespace services.
 
 The weekly sweep (EventBridge `rate(7 days)` → reload Lambda with
-`{"sweep": true}`) closes the gap: it reconciles every VKG service to the latest
-SSM image. It is a no-op per namespace when the image already matches, and a
+`{"sweep": true}`) closes the gap by reconciling every VKG service against both
+`latest/` and the SSM image: loadable files and running: forced redeploy (a new
+task definition when the image changed); loadable files and at zero: scaled back
+up; no files and running: scaled to zero; no files and at zero: skipped. A
 single namespace's failure is isolated so the rest are still patched.
 
 ### Manual sweep (on demand)

@@ -196,6 +196,12 @@ export function proposalBlocksNewInduction(status: string): boolean {
 
 export function proposalStatusIndicator(status: string, t?: AppTranslate) {
   switch (status) {
+    case "inducing":
+      return (
+        <StatusIndicator type="in-progress">
+          {t?.("Inducing…") ?? "Inducing…"}
+        </StatusIndicator>
+      );
     case "pending":
       return (
         <StatusIndicator type="pending">
@@ -232,6 +238,12 @@ export function proposalStatusIndicator(status: string, t?: AppTranslate) {
       return (
         <StatusIndicator type="error">
           {t?.("Rejected") ?? "Rejected"}
+        </StatusIndicator>
+      );
+    case "failed":
+      return (
+        <StatusIndicator type="error">
+          {t?.("Failed") ?? "Failed"}
         </StatusIndicator>
       );
     case "cancelled":

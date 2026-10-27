@@ -278,6 +278,22 @@ describe("formatStepDetail", () => {
       expect(result).toBe("Ontop could not translate SPARQL to SQL.");
     });
 
+    it("names both versions when serve refuses a translation for another ontology version", () => {
+      // The VKG translated the query, but against the mapping of the version it still serves.
+      const detail = {
+        error: "vkg_version_skew",
+        reason: "The VKG still serves v1; the ontology is v2.",
+        vkgVersion: "v1",
+        ontologyVersion: "v2",
+      };
+      expect(formatStepDetail("t2.vkg.compile", detail)).toBe(
+        "The VKG still serves v1; the ontology is v2.",
+      );
+      expect(formatStepDetail("t2.vkg.compile", detail, jaTranslate)).toBe(
+        "VKG はまだ v1 を提供しています。オントロジーは v2 です。",
+      );
+    });
+
     it("keeps a meaningful error code on vkg compile failure", () => {
       const result = formatStepDetail("t2.vkg.compile", {
         error: "vkg_translation_error",

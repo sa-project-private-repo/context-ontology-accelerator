@@ -114,12 +114,65 @@ here, so this table cannot silently drift out of sync with the service again.
 | `/namespaces/{namespaceId}/ontology/foundational` | GET | `viewNamespace` | Ontology |
 | `/namespaces/{namespaceId}/ontology/foundational/{key}/load` | POST | `manageOntology` | Ontology |
 | `/namespaces/{namespaceId}/proposals/{proposalId}/repair-datatypes` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/graph` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/term` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/terms` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/history` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/accept-preview` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/changes` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/undo` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/redo` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/rebase` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/messages` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/events` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/preview` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/apply` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/discard` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/checks` | GET | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/queries` | POST | `viewNamespace` | OntologyProposal |
+| `/namespaces/{namespaceId}/proposals/{proposalId}/studio/questions/{questionId}/check` | POST | `manageOntology` | OntologyProposal |
+| `/namespaces/{namespaceId}/studio/questions` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/studio/questions/{questionId}` | PUT, DELETE | `manageOntology` | Ontology |
+| `/namespaces/{namespaceId}/sparql` | POST | `query` | Namespace |
 | `/namespaces/{namespaceId}/graph/traverse` | POST | `traverseGraph` | Namespace |
 | `/namespaces/{namespaceId}/graph/ontology-overview` | GET | `viewNamespace` | Ontology |
 | `/namespaces/{namespaceId}/graph/search` | GET | `viewNamespace` | Ontology |
 | `/namespaces/{namespaceId}/graph/class` | GET | `viewNamespace` | Ontology |
 | `/namespaces/{namespaceId}/graph/object-property` | GET | `viewNamespace` | Ontology |
 | `/namespaces/{namespaceId}/graph/datatype-property` | GET | `viewNamespace` | Ontology |
+
+### Ontology versions and the domain ABox
+
+Reading versions, deployments, ABox instances and mappings is a read. Deploying a
+version, editing a mapping and queueing a rebuild change what the namespace serves,
+so they are `manageOntology`, like accepting a proposal.
+
+| API Endpoint | Method | Cedar Action | Resource Type |
+|---|---|---|---|
+| `/namespaces/{namespaceId}/ontology/versions` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/ontology/versions/{version}` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/ontology/versions/{version}/deploy` | POST | `manageOntology` | Ontology |
+| `/namespaces/{namespaceId}/ontology/deployments/{deploymentId}` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/abox` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/abox/instances` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/abox/instance` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/abox/mappings` | GET | `viewNamespace` | Ontology |
+| `/namespaces/{namespaceId}/abox/mappings/{mappingId}` | PUT, DELETE | `manageOntology` | Ontology |
+| `/namespaces/{namespaceId}/abox/rebuild` | POST | `manageOntology` | Ontology |
+
+### Data-layer query routes
+
+These `DataLayerService` routes sit on the same API and behind the same authorizer.
+
+| API Endpoint | Method | Cedar Action | Resource Type |
+|---|---|---|---|
+| `/namespaces/{namespaceId}/query` | POST | `query` | Namespace |
+| `/namespaces/{namespaceId}/sparql` | POST | `query` | Namespace |
+| `/namespaces/{namespaceId}/translate` | POST | `translateQuery` | Namespace |
+| `/namespaces/{namespaceId}/kb/search` | POST | `searchDocuments` | Namespace |
 
 Two judgement calls worth surfacing:
 
@@ -150,18 +203,18 @@ same basis `GET /namespaces` and `GET /roles` stand on), rather than to a new
 platform-only gate.
 
 !!! note "`query` and `searchDocuments`"
-    The `query` and `searchDocuments` Cedar actions are **not** invoked by the
-    control-plane API authorizer — no `ControlPlaneService` route maps to them.
-    They are evaluated on the serve / context-manager path (the Playground/agent
-    runtime), which uses its own JWT authorizer. They remain in the schema and
-    seed policies because that path shares the same role model.
+    This authorizer evaluates `query` and `searchDocuments` for the data-layer
+    routes above (`/query`, `/sparql`, `/kb/search`). The serve / context-manager
+    runtime (the Playground and agent path, behind its own JWT authorizer)
+    evaluates them again.
 
     On that path, `query` is evaluated by the **namespace admission gate** at the
     top of the runtime entrypoint — before any dispatch, and for every
     namespace-scoped surface (the Tier-1/2/3 query path plus the isolated
-    `translate` / `kbSearch` / `graphTraverse` operations) — and again at SQL
-    execution time for Tier 1/2 statements. The admission gate is what covers the
-    paths that generate no SQL (Tier-3 retrieval and synthesis). See the
+    `translate` / `kbSearch` / `graphTraverse` / `sparqlQuery` operations) — and
+    again at SQL execution time for Tier 1/2 statements and VKG SPARQL. The
+    admission gate is what covers the paths that generate no SQL (Tier-3
+    retrieval and synthesis). See the
     [context-manager README](../../context-manager/README.md#cedar-authorization).
 
 ## Role × Action Access Matrix

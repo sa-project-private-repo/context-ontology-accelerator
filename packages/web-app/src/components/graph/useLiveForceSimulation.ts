@@ -57,6 +57,192 @@ const MOVE_EPSILON = 0.4;
 const HOME_STRENGTH_REST = 0.06;
 const HOME_STRENGTH_DRAG = 0.004;
 
+/** Top-left corner and size, in flow coordinates, of a set of nodes. */
+export interface Bounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Simulation nodes at their fly-in start, each pulled toward its packed
+ * position (``position`` is a node's top-left; the simulation works on centres).
+ */
+function simulationNodes(
+  initialNodes: readonly Node[],
+  edges: readonly LayoutEdge[],
+  half: number,
+): SimNode[] {
+  const ids = initialNodes.map((n) => n.id);
+  const home = new Map(
+    initialNodes.map((n) => [
+      n.id,
+      { x: n.position.x + half, y: n.position.y + half },
+    ]),
+  );
+
+  // Start each cluster compressed toward its own centroid so nodes visibly
+  // spring out to their places, without flying through other clusters.
+  const start = new Map<string, { x: number; y: number }>();
+  for (const component of connectedComponents(ids, edges)) {
+    let cx = 0;
+    let cy = 0;
+    for (const id of component) {
+      const h = home.get(id);
+      if (h) {
+        cx += h.x;
+        cy += h.y;
+      }
+    }
+    cx /= component.length;
+    cy /= component.length;
+    for (const id of component) {
+      const h = home.get(id);
+      if (h) {
+        start.set(id, {
+          x: cx + (h.x - cx) * START_COMPRESSION,
+          y: cy + (h.y - cy) * START_COMPRESSION,
+        });
+      }
+    }
+  }
+
+  return ids.map((id) => {
+    const h = home.get(id) ?? { x: 0, y: 0 };
+    const s = start.get(id) ?? h;
+    return { id, x: s.x, y: s.y, homeX: h.x, homeY: h.y };
+  });
+}
+
+function simulationLinks(
+  simNodes: readonly SimNode[],
+  edges: readonly LayoutEdge[],
+): SimLink[] {
+  const idSet = new Set(simNodes.map((n) => n.id));
+  return edges
+    .filter((e) => idSet.has(e.source) && idSet.has(e.target))
+    .map((e) => ({ source: e.source, target: e.target }));
+}
+
+/**
+ * Per-connected-component spacing scale: a subgraph with a popular hub gets its
+ * own larger linkDistance; a 3-node side cluster stays at the baseline. Shared
+ * helper so static homes (layout.ts) and this live link force never disagree
+ * about preferred edge length.
+ */
+function linkScales(
+  simNodes: readonly SimNode[],
+  edges: readonly LayoutEdge[],
+): Map<string, number> {
+  const linkScaleByNode = new Map<string, number>();
+  for (const component of connectedComponents(
+    simNodes.map((n) => n.id),
+    edges,
+  )) {
+    const compSet = new Set(component);
+    const degree = new Map<string, number>();
+    for (const e of edges) {
+      if (!compSet.has(e.source) || !compSet.has(e.target)) continue;
+      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+    let compMaxDeg = 0;
+    for (const d of degree.values()) if (d > compMaxDeg) compMaxDeg = d;
+    const scale = componentScale(compMaxDeg);
+    for (const id of component) linkScaleByNode.set(id, scale);
+  }
+  return linkScaleByNode;
+}
+
+function createSimulation(
+  simNodes: SimNode[],
+  edges: readonly LayoutEdge[],
+  half: number,
+  linkDistance: number,
+  nodeRadius?: (id: string) => number,
+): Simulation<SimNode, SimLink> {
+  const linkScaleByNode = linkScales(simNodes, edges);
+  return (
+    forceSimulation<SimNode>(simNodes)
+      .force(
+        "link",
+        forceLink<SimNode, SimLink>(simulationLinks(simNodes, edges))
+          .id((n) => n.id)
+          .distance((link) => {
+            const src = link.source;
+            // forceLink's SimLink generic narrows link.source to SimNode when
+            // it's an object; the string/number cases (pre-resolution) coerce.
+            const sId = typeof src === "object" ? src.id : String(src);
+            return linkDistance * (linkScaleByNode.get(sId) ?? 1);
+          })
+          .strength(0.6),
+      )
+      // distanceMax keeps repulsion local so clusters don't push each other
+      // across the canvas; the home forces hold the packed arrangement.
+      .force(
+        "charge",
+        forceManyBody()
+          .strength(-linkDistance * 4)
+          .distanceMax(linkDistance * 2.5),
+      )
+      .force(
+        "collide",
+        forceCollide<SimNode>(
+          (n) => (nodeRadius?.(n.id) ?? half) + 16,
+        ).iterations(2),
+      )
+      .force("x", forceX<SimNode>((n) => n.homeX).strength(HOME_STRENGTH_REST))
+      .force("y", forceY<SimNode>((n) => n.homeY).strength(HOME_STRENGTH_REST))
+      .alpha(1)
+      .alphaDecay(0.035)
+      .velocityDecay(0.4)
+  );
+}
+
+/**
+ * Where the live simulation comes to rest for these nodes, absent any drag.
+ *
+ * The home forces are weak, so a dense cluster settles well outside its packed
+ * layout; a viewport fitted to the packed positions then cuts nodes off. This
+ * runs the same (deterministic) simulation to the tick it stops at, so the
+ * caller can frame the graph where it will end up.
+ */
+export function settledBounds(
+  initialNodes: readonly Node[],
+  edges: readonly LayoutEdge[],
+  { nodeSize, linkDistance }: Pick<Options, "nodeSize" | "linkDistance">,
+): Bounds | null {
+  if (initialNodes.length === 0) return null;
+  const half = nodeSize / 2;
+  const simNodes = simulationNodes(initialNodes, edges, half);
+  // No hover is in effect when a node set first renders: base radii only.
+  const simulation = createSimulation(
+    simNodes,
+    edges,
+    half,
+    linkDistance,
+  ).stop();
+  // A running simulation stops once alpha falls below alphaMin, decaying by
+  // alphaDecay each tick from 1: this is that tick count.
+  simulation.tick(
+    Math.ceil(
+      Math.log(simulation.alphaMin()) / Math.log(1 - simulation.alphaDecay()),
+    ),
+  );
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const n of simNodes) {
+    minX = Math.min(minX, (n.x ?? 0) - half);
+    minY = Math.min(minY, (n.y ?? 0) - half);
+    maxX = Math.max(maxX, (n.x ?? 0) + half);
+    maxY = Math.max(maxY, (n.y ?? 0) + half);
+  }
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
 export function useLiveForceSimulation<T extends Node>(
   initialNodes: readonly T[],
   edges: readonly LayoutEdge[],
@@ -70,71 +256,10 @@ export function useLiveForceSimulation<T extends Node>(
   useEffect(() => {
     if (!enabled || initialNodes.length === 0) return;
 
-    const ids = initialNodes.map((n) => n.id);
-    const home = new Map(
-      initialNodes.map((n) => [
-        n.id,
-        { x: n.position.x + half, y: n.position.y + half },
-      ]),
-    );
-
-    // Start each cluster compressed toward its own centroid so nodes visibly
-    // spring out to their places, without flying through other clusters.
-    const start = new Map<string, { x: number; y: number }>();
-    for (const component of connectedComponents(ids, edges)) {
-      let cx = 0;
-      let cy = 0;
-      for (const id of component) {
-        const h = home.get(id);
-        if (h) {
-          cx += h.x;
-          cy += h.y;
-        }
-      }
-      cx /= component.length;
-      cy /= component.length;
-      for (const id of component) {
-        const h = home.get(id);
-        if (h) {
-          start.set(id, {
-            x: cx + (h.x - cx) * START_COMPRESSION,
-            y: cy + (h.y - cy) * START_COMPRESSION,
-          });
-        }
-      }
-    }
-
-    const simNodes: SimNode[] = ids.map((id) => {
-      const h = home.get(id) ?? { x: 0, y: 0 };
-      const s = start.get(id) ?? h;
-      return { id, x: s.x, y: s.y, homeX: h.x, homeY: h.y };
-    });
-    const idSet = new Set(ids);
-    const links: SimLink[] = edges
-      .filter((e) => idSet.has(e.source) && idSet.has(e.target))
-      .map((e) => ({ source: e.source, target: e.target }));
+    const simNodes = simulationNodes(initialNodes, edges, half);
 
     const byId = new Map(simNodes.map((n) => [n.id, n]));
     byIdRef.current = byId;
-
-    // Per-connected-component spacing scale: a subgraph with a popular hub
-    // gets its own larger linkDistance; a 3-node side cluster stays at the
-    // baseline. Shared helper so static homes (layout.ts) and this live link
-    // force never disagree about preferred edge length.
-    const linkScaleByNode = new Map<string, number>();
-    for (const component of connectedComponents(ids, edges)) {
-      const compSet = new Set(component);
-      const degree = new Map<string, number>();
-      for (const e of edges) {
-        if (!compSet.has(e.source) || !compSet.has(e.target)) continue;
-        degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
-        degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
-      }
-      let compMaxDeg = 0;
-      for (const d of degree.values()) if (d > compMaxDeg) compMaxDeg = d;
-      const scale = componentScale(compMaxDeg);
-      for (const id of component) linkScaleByNode.set(id, scale);
-    }
 
     // Push positions into React state — but only for nodes that actually
     // moved. Re-creating all node objects every tick makes React Flow re-render
@@ -161,40 +286,13 @@ export function useLiveForceSimulation<T extends Node>(
       });
     };
 
-    const simulation = forceSimulation<SimNode>(simNodes)
-      .force(
-        "link",
-        forceLink<SimNode, SimLink>(links)
-          .id((n) => n.id)
-          .distance((link) => {
-            const src = link.source;
-            // forceLink's SimLink generic narrows link.source to SimNode when
-            // it's an object; the string/number cases (pre-resolution) coerce.
-            const sId = typeof src === "object" ? src.id : String(src);
-            return linkDistance * (linkScaleByNode.get(sId) ?? 1);
-          })
-          .strength(0.6),
-      )
-      // distanceMax keeps repulsion local so clusters don't push each other
-      // across the canvas; the home forces hold the packed arrangement.
-      .force(
-        "charge",
-        forceManyBody()
-          .strength(-linkDistance * 4)
-          .distanceMax(linkDistance * 2.5),
-      )
-      .force(
-        "collide",
-        forceCollide<SimNode>(
-          (n) => (nodeRadius?.(n.id) ?? half) + 16,
-        ).iterations(2),
-      )
-      .force("x", forceX<SimNode>((n) => n.homeX).strength(0.06))
-      .force("y", forceY<SimNode>((n) => n.homeY).strength(0.06))
-      .alpha(1)
-      .alphaDecay(0.035)
-      .velocityDecay(0.4)
-      .on("tick", applyPositions);
+    const simulation = createSimulation(
+      simNodes,
+      edges,
+      half,
+      linkDistance,
+      nodeRadius,
+    ).on("tick", applyPositions);
 
     simRef.current = simulation;
     applyPositions(); // show the compressed start before the first tick

@@ -27,10 +27,38 @@ export class ApiError extends Error {
     public readonly status: number,
     public readonly code: string,
     message: string,
+    /** Parsed JSON error body, when the response had one. Lets callers read
+     *  structured fields such as a 409's `detail.breakingMetrics`. */
+    public readonly body?: unknown,
   ) {
     super(message);
     this.name = "ApiError";
   }
+}
+
+/** `value[key]` when `value` is an object holding a string there. */
+function stringField(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== "object" || !(key in value)) return undefined;
+  const field: unknown = Reflect.get(value, key);
+  return typeof field === "string" ? field : undefined;
+}
+
+/**
+ * `code` / `message` from a parsed JSON error body. Top-level fields win; else
+ * they come from FastAPI's HTTPException `detail` (e.g. ontology-engine), which
+ * is `"<message>"` or `{"message": ..., "code"?: ...}`.
+ */
+function errorFields(parsed: unknown): { code?: string; message?: string } {
+  const detail: unknown =
+    parsed && typeof parsed === "object" && "detail" in parsed
+      ? Reflect.get(parsed, "detail")
+      : undefined;
+  return {
+    code: stringField(parsed, "code") ?? stringField(detail, "code"),
+    message:
+      stringField(parsed, "message") ??
+      (typeof detail === "string" ? detail : stringField(detail, "message")),
+  };
 }
 
 const ApiClientContext = createContext<ApiClient | undefined>(undefined);
@@ -80,20 +108,22 @@ export const ApiClientProvider: React.FC<PropsWithChildren> = ({
         // string at the user instead of the authorization sentence.
         let code: string | undefined;
         let message: string | undefined;
+        let errorBody: unknown;
 
         try {
           const parsed = JSON.parse(text);
-          code = parsed.code ?? code;
+          errorBody = parsed;
           // Smithy-modeled errors carry `message`; a FastAPI `HTTPException`
           // uses `detail` instead, and most ontology-engine 4xx responses are
           // the latter. Reading only `message` left those falling through to
           // the raw fallback, so a caller that surfaced `error.message` showed
           // the user `API POST … failed (409): {"detail":"…"}` with the real
-          // sentence buried in JSON. A non-string `detail` (some routes send an
-          // object) keeps the fallback rather than rendering "[object Object]".
-          const detail =
-            typeof parsed.detail === "string" ? parsed.detail : undefined;
-          message = parsed.message ?? detail;
+          // sentence buried in JSON. An object `detail` contributes only its
+          // string `message` and `code` (see `errorFields`), so nothing renders
+          // as "[object Object]".
+          const fields = errorFields(parsed);
+          code = fields.code;
+          message = fields.message;
           // Some endpoints return a structured `errors` array with the
           // specific reasons (e.g. OSI import parse errors). Fold the string
           // entries into the message so the UI surfaces actionable detail
@@ -116,6 +146,7 @@ export const ApiClientProvider: React.FC<PropsWithChildren> = ({
             403,
             code ?? "FORBIDDEN",
             message ?? "You are not authorized to perform this action.",
+            errorBody,
           );
         }
 
@@ -123,6 +154,7 @@ export const ApiClientProvider: React.FC<PropsWithChildren> = ({
           res.status,
           code ?? "UNKNOWN_ERROR",
           message ?? rawFallback,
+          errorBody,
         );
       }
       if (res.status === 204 || res.headers.get("content-length") === "0") {
@@ -146,17 +178,18 @@ export const ApiClientProvider: React.FC<PropsWithChildren> = ({
           const text = await res.text().catch(() => "");
           let code = "UNKNOWN_ERROR";
           let message = `API GET ${path} failed (${res.status}): ${text}`;
+          let errorBody: unknown;
           try {
             const parsed = JSON.parse(text);
-            code = parsed.code ?? code;
+            errorBody = parsed;
             // Same two envelopes as `request`; see the comment there.
-            const detail =
-              typeof parsed.detail === "string" ? parsed.detail : undefined;
-            message = parsed.message ?? detail ?? message;
+            const fields = errorFields(parsed);
+            code = fields.code ?? code;
+            message = fields.message ?? message;
           } catch {
             // not JSON, use defaults
           }
-          throw new ApiError(res.status, code, message);
+          throw new ApiError(res.status, code, message, errorBody);
         }
         return res.text();
       },

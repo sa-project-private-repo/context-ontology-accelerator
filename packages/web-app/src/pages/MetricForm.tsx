@@ -524,7 +524,7 @@ export const MetricForm: React.FC = () => {
                       };
                       setDialects(updated);
                     }}
-                    placeholder={t("SUM(orders.total_amount)")}
+                    placeholder={t("SELECT SUM(total_amount) FROM orders")}
                     rows={2}
                   />
                 ),

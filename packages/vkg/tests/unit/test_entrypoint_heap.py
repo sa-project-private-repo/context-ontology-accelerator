@@ -3,7 +3,7 @@
 
 """Unit tests for the ONTOP_JAVA_ARGS heap fallback in entrypoint.sh.
 
-Line 113 of entrypoint.sh sets the Ontop heap via ONTOP_JAVA_ARGS (the variable
+entrypoint.sh sets the Ontop heap via ONTOP_JAVA_ARGS (the variable
 the launcher actually reads; JAVA_OPTS was a silent no-op that caused #149 cause
 C). These tests execute the REAL expansion line pulled from the script — not a
 re-implementation — so a future edit that breaks the fallback or reverts to

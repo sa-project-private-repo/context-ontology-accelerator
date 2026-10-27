@@ -99,3 +99,36 @@ describe("ConstraintPanel — Export SHACL", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("ConstraintPanel: the caller's role", () => {
+  const DENIED = "Your role on this namespace does not allow this.";
+
+  /** Off: disabled, or aria-disabled where the button says why. */
+  function isOff(button: HTMLElement): boolean {
+    return (
+      (button as HTMLButtonElement).disabled ||
+      button.getAttribute("aria-disabled") === "true"
+    );
+  }
+
+  it("turns off Validate and Infer constraints for a role that cannot change the ontology, and says why", () => {
+    const onValidate = vi.fn();
+    renderPanel({ deniedReason: DENIED, isReadOnly: true, onValidate });
+    for (const name of ["Validate", "Infer constraints"]) {
+      const button = screen.getByRole("button", { name });
+      expect(isOff(button)).toBe(true);
+      expect(button).toHaveAccessibleDescription(DENIED);
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Validate" }));
+    expect(onValidate).not.toHaveBeenCalled();
+  });
+
+  it("keeps Validate on a read-only proposal for a role that can validate", () => {
+    const onValidate = vi.fn();
+    renderPanel({ isReadOnly: true, onValidate });
+    const validate = screen.getByRole("button", { name: "Validate" });
+    expect(isOff(validate)).toBe(false);
+    fireEvent.click(validate);
+    expect(onValidate).toHaveBeenCalledWith(CONFIG, "");
+  });
+});

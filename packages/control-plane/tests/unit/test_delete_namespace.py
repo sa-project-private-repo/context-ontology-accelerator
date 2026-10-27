@@ -382,7 +382,8 @@ class TestCheckActiveInductionJobs:
             result = _check_active_induction_jobs("11111111-1111-4111-8111-111111111111")
 
         assert len(result) == 1
-        assert "3 ontology induction/ingest job(s) or proposal accept(s) in progress" in result[0]
+        assert result[0].startswith("3 ontology job(s) in progress:")
+        assert "Ontology designer assistant turn" in result[0]
 
     def test_endpoint_not_configured_skips_check(self, monkeypatch):
         monkeypatch.delenv("ONTOLOGY_ENGINE_ENDPOINT", raising=False)
@@ -432,7 +433,8 @@ class TestCheckActiveInductionJobs:
             result = _check_active_induction_jobs("11111111-1111-4111-8111-111111111111")
 
         assert len(result) == 1
-        assert "2 ontology induction/ingest job(s) or proposal accept(s) in progress" in result[0]
+        assert result[0].startswith("2 ontology job(s) in progress:")
+        assert "Ontology designer assistant turn" in result[0]
 
 
 @pytest.mark.unit

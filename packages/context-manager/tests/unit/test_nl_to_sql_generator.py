@@ -130,6 +130,57 @@ class TestSQLGeneratorGenerate:
         assert retrieve_step["mapped_gate"] is False
         assert retrieve_step["mapped_count"] == 0
 
+    @staticmethod
+    def _versions(*versions, error=None):
+        reader = AsyncMock()
+        if error:
+            reader.versions.side_effect = error
+        else:
+            reader.versions.return_value = frozenset(versions)
+        return reader
+
+    @pytest.mark.asyncio
+    async def test_a_namespace_with_a_published_version_keeps_the_mapped_gate(self, mock_llm, mock_vector):
+        """Deploy stamps data_source_id with every version, so a versioned namespace
+        with none has no mapped class left (say, the designer deleted them all). Its
+        unmapped classes have no table and must not reach the SQL writer as tables."""
+        mock_vector.count_documents.return_value = 0
+        mock_vector.search.return_value = []  # the gated search finds no mapped class
+        reader = self._versions("v3")
+        generator = SQLGenerator(llm_client=mock_llm, vector_client=mock_vector, served_versions=reader)
+
+        result = await generator.generate("How many premium customers?", namespace="designer-ns")
+
+        assert result.error == "no_tables_retrieved"
+        assert mock_vector.search.call_args.kwargs["require_mapped"] is True
+        reader.versions.assert_awaited_once_with("designer-ns")
+        mock_llm.converse.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reader_kwargs", [{}, {"error": TimeoutError()}])
+    async def test_without_a_readable_published_version_the_legacy_fallback_stays(
+        self, mock_llm, mock_vector, reader_kwargs
+    ):
+        """A namespace from before versions, or one whose version cannot be read, keeps today's behavior."""
+        mock_vector.count_documents.return_value = 0
+        generator = SQLGenerator(
+            llm_client=mock_llm, vector_client=mock_vector, served_versions=self._versions(**reader_kwargs)
+        )
+
+        result = await generator.generate("How many orders?", namespace="legacy-ns")
+
+        assert result.error is None
+        assert mock_vector.search.call_args.kwargs["require_mapped"] is False
+
+    @pytest.mark.asyncio
+    async def test_the_version_is_read_only_when_no_class_is_mapped(self, mock_llm, mock_vector):
+        reader = self._versions("v3")
+        generator = SQLGenerator(llm_client=mock_llm, vector_client=mock_vector, served_versions=reader)
+
+        await generator.generate("How many orders?", namespace="demo")
+
+        reader.versions.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_no_classes_retrieved_yields_no_tables(self, generator, mock_vector):
         """If the (gated) search returns nothing, NL->SQL returns no_tables_retrieved

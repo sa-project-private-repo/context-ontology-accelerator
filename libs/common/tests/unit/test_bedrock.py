@@ -275,6 +275,36 @@ class TestBedrockClient:
         assert call_kwargs["inferenceConfig"] == {"maxTokens": 8192}
 
     @patch("coa_common.bedrock.boto3")
+    def test_invoke_passes_temperature_when_given(self, mock_boto3):
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+        mock_client.converse.return_value = {
+            "output": {"message": {"content": [{"text": '{"ok": true}'}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 1},
+        }
+
+        client = BedrockClient(region="us-east-1", model_id="m")
+        client.invoke("sys", "user", max_tokens=10, temperature=0.0)
+
+        assert mock_client.converse.call_args.kwargs["inferenceConfig"] == {"maxTokens": 10, "temperature": 0.0}
+
+    @patch("coa_common.bedrock.boto3")
+    def test_invoke_omits_temperature_by_default(self, mock_boto3):
+        mock_client = MagicMock()
+        mock_boto3.client.return_value = mock_client
+        mock_client.converse.return_value = {
+            "output": {"message": {"content": [{"text": "{}"}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 1},
+        }
+
+        client = BedrockClient(region="us-east-1", model_id="m")
+        client.invoke("sys", "user", max_tokens=10)
+
+        assert mock_client.converse.call_args.kwargs["inferenceConfig"] == {"maxTokens": 10}
+
+    @patch("coa_common.bedrock.boto3")
     def test_invoke_rejects_oversized_input(self, mock_boto3):
         """Prompts exceeding max_input_chars are rejected before any Bedrock call."""
         mock_client = MagicMock()

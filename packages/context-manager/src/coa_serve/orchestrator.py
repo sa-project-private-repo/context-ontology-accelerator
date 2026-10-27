@@ -186,6 +186,10 @@ class Orchestrator:
             raise ValueError("tier1_metric_timeout_s must be in the range 1..300")
         self._tier1_metric_timeout_s = tier1_metric_timeout_s
 
+    def set_agentic_retriever(self, agentic_retriever: AgenticRetriever | None) -> None:
+        """Set the deep-reasoning retriever, which ``main`` builds for the query path after the rest of serve."""
+        self._agentic_retriever = agentic_retriever
+
     async def resolve(
         self,
         request: InvokeRequest,
@@ -382,6 +386,14 @@ class Orchestrator:
         keeps its own firewall.evaluate() gate; this runs upstream of dispatch.
         """
         return self._firewall.authorize_namespace(namespace, profile)
+
+    def can_view_namespace(self, namespace: str, profile: dict) -> bool:
+        """Whether the principal holds ``viewNamespace`` on ``namespace``; False on error.
+
+        The gate on the generated SQL/SPARQL, shared with the query console's
+        executed SQL so both answer from the same policy source.
+        """
+        return self._firewall.can_view_namespace(namespace, profile)
 
     def _resolve_include_debug_info(self, options: dict | None, namespace: str, profile: dict | None) -> bool:
         """Effective includeDebugInfo = caller opt-in AND viewNamespace right (#1166).
@@ -703,7 +715,13 @@ class Orchestrator:
             declined_metric=declined_metric,
         )
 
-        result = await self._structured_query_tier.resolve(query, namespace, context, option=strategy_selection)
+        result = await self._structured_query_tier.resolve(
+            query,
+            namespace,
+            context,
+            option=strategy_selection,
+            tier3_follows=self._should_run_tier3(tier_override),
+        )
 
         if result is not None:
             max_rows = capped_max_rows(options)

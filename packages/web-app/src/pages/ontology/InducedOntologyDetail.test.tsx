@@ -93,6 +93,12 @@ vi.mock("@components/ApiClientProvider", () => ({
   useApiClient: () => ({ get: vi.fn(), getText: vi.fn() }),
 }));
 
+// The caller's role: true for one that can change the ontology (a data steward).
+const access = vi.hoisted(() => ({ canManage: true }));
+vi.mock("@api-hooks/use-can-manage-ontology", () => ({
+  useCanManageOntology: () => access.canManage,
+}));
+
 function renderAt(search: string) {
   return render(
     <MemoryRouter initialEntries={[`/namespaces/ns/ontology/induced${search}`]}>
@@ -129,6 +135,7 @@ const search = "?ontology_id=http%3A%2F%2Fex.org%2Fo%23";
 describe("InducedOntologyDetailPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    access.canManage = true;
     resetRegistry();
     resetOverview();
     downloadOntology.mockResolvedValue("@prefix ex: <http://ex.org/o#> .");
@@ -255,11 +262,51 @@ describe("InducedOntologyDetailPage", () => {
     );
   });
 
+  it("keeps Delete enabled after a delete failed, so it can be retried", () => {
+    registryRows[0].status = "deleting";
+    registryRows[0].deleteError =
+      "Delete worker did not complete; retry the delete.";
+    const { container } = renderAt(search);
+    expect(findDeleteButton(container)?.getAttribute("aria-disabled")).not.toBe(
+      "true",
+    );
+    expect(container.textContent).not.toContain("Delete in progress");
+    // The header indicator itself, not the alert's "Delete failed — retry…" header.
+    expect(within(container).getByText("Delete failed")).toBeInTheDocument();
+  });
+
   it("surfaces deleteError so a stuck delete is distinguishable from an in-flight one", () => {
     registryRows[0].status = "deleting";
     registryRows[0].deleteError = "Neptune DROP timed out";
     const { container } = renderAt(search);
     expect(container.textContent).toContain("Delete failed");
     expect(container.textContent).toContain("Neptune DROP timed out");
+  });
+
+  describe("by role", () => {
+    it("offers a role that only reads no delete, and says why", async () => {
+      access.canManage = false;
+      const { container } = renderAt(search);
+      const button = findDeleteButton(container);
+      expect(button?.getAttribute("aria-disabled")).toBe("true");
+      expect(button).toHaveAccessibleDescription(
+        "Your role on this namespace does not allow this.",
+      );
+      await userEvent.click(button!);
+      expect(screen.queryByPlaceholderText("delete")).toBeNull();
+      // Reading stays offered.
+      expect(
+        screen.getByRole("button", { name: "Download .ttl" }),
+      ).toBeEnabled();
+    });
+
+    it("offers the delete to a role that can change the ontology", () => {
+      const { container } = renderAt(search);
+      const button = findDeleteButton(container);
+      expect(button?.getAttribute("aria-disabled")).not.toBe("true");
+      expect(button).not.toHaveAccessibleDescription(
+        "Your role on this namespace does not allow this.",
+      );
+    });
   });
 });

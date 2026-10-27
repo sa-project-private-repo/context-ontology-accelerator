@@ -59,6 +59,19 @@ class VKGTranslationError(Exception):
     """Raised when VKG Service returns an error or unexpected response."""
 
 
+class VKGUnavailableError(VKGTranslationError):
+    """The VKG Service could not be reached, or answered that it is not ready: the query never got to Ontop.
+
+    A namespace whose VKG is scaled to zero has no address to connect to, and a VKG still loading
+    its mapping answers 503. The VKG answers 500 when Ontop cannot translate a query, so a 500
+    stays a translation error.
+    """
+
+
+# Gateway-style answers: the VKG did not take the query. 500 is not among them (see above).
+_UNAVAILABLE_STATUSES = frozenset({502, 503, 504})
+
+
 class VKGClient:
     """Async HTTP client for VKG Service SPARQL-to-SQL translation."""
 
@@ -112,6 +125,9 @@ class VKGClient:
             retry_timeouts=True,
             retry_rate_limited=False,
             server_error_codes=(503,),
+            # Raise the last attempt's httpx error, which translate() classifies, rather than
+            # tenacity's RetryError, which it would not.
+            reraise=True,
         )
         async def _do_post() -> httpx.Response:
             client = await self._get_http()
@@ -133,7 +149,8 @@ class VKGClient:
             VKGResult with translated SQL, dialect, and metadata.
 
         Raises:
-            VKGTranslationError: On non-retryable errors or exhausted retries.
+            VKGUnavailableError: When the VKG cannot be reached or is not ready, after the retries.
+            VKGTranslationError: On other non-retryable errors.
         """
         url = "/sparql/translate"
         payload = {"sparql": sparql, "namespace": namespace, "targetDialect": "trino"}
@@ -142,9 +159,10 @@ class VKGClient:
             resp = await self._post_with_retry(url, payload)
         except httpx.HTTPStatusError as e:
             detail = e.response.text.replace("\n", " ")
-            raise VKGTranslationError(f"VKG returned {e.response.status_code}: {detail}") from e
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
-            raise VKGTranslationError(
+            error = VKGUnavailableError if e.response.status_code in _UNAVAILABLE_STATUSES else VKGTranslationError
+            raise error(f"VKG returned {e.response.status_code}: {detail}") from e
+        except httpx.TransportError as e:  # connection, timeout and protocol failures
+            raise VKGUnavailableError(
                 f"VKG request failed after {self._max_retries} attempts: {type(e).__name__}"
             ) from e
         except httpx.HTTPError as e:

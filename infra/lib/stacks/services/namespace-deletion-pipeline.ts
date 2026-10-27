@@ -140,6 +140,11 @@ export class NamespaceDeletionPipeline extends Construct {
         ...(props.opensearchEndpoint && {
           OSS_ENDPOINT: props.opensearchEndpoint,
         }),
+        // Stops the domain ABox builds before the first source delete: each
+        // document source delete ends by requesting one.
+        ...(props.ontologyEngineEndpoint && {
+          ONTOLOGY_ENGINE_ENDPOINT: props.ontologyEngineEndpoint,
+        }),
       },
     });
     deleteSourcesFn.addToRolePolicy(
@@ -219,9 +224,10 @@ export class NamespaceDeletionPipeline extends Construct {
       functionName: props.prefixed("ns-deletion-ontology"),
       handler:
         "coa_control_plane.namespace.deletion_pipeline.delete_ontology.handler",
-      // ontology-engine's own HTTP call has a 120s client timeout; give the
-      // Lambda enough headroom above that plus the S3 sweep.
-      timeout: cdk.Duration.minutes(4),
+      // ontology-engine's own HTTP call has a 300s client timeout (the engine
+      // may first wait out a domain ABox build it stopped); give the Lambda
+      // enough headroom above that plus the S3 sweep.
+      timeout: cdk.Duration.minutes(8),
       environment: {
         ...(props.ontologyBucketName && {
           ONTOLOGY_BUCKET: props.ontologyBucketName,

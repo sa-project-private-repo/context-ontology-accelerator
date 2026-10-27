@@ -91,6 +91,11 @@ export const Paths = {
     "packages/sources/src/coa_sources/documents/deletion",
   ),
 
+  /** packages/sources/src/coa_sources/documents/abox_request: domain ABox rebuild request Lambda source. */
+  sourcesDocumentsAboxRequest: fromRoot(
+    "packages/sources/src/coa_sources/documents/abox_request",
+  ),
+
   /** packages/sources/src/coa_sources/documents/trigger — document ingestion trigger Lambda source. */
   sourcesDocumentsTrigger: fromRoot(
     "packages/sources/src/coa_sources/documents/trigger",

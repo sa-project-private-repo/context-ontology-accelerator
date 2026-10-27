@@ -265,6 +265,7 @@ class SourceDBQueryExecutor:
             row_count=len(capped_rows),
             truncated=truncated,
             duration_ms=duration_ms,
+            sql=limited_sql,
         )
 
     async def health_check(self) -> dict[str, Any]:

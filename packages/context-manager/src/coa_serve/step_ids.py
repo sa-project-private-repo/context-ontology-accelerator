@@ -55,6 +55,7 @@ class StepId(StrEnum):
     T3_SYNTHESIZE = "t3.synthesize"
     T3_GUARDRAIL = "t3.guardrail"
     LEXICAL_BASELINE_RETRIEVE = "lexical_baseline_retrieve"
+    DOMAIN_ABOX = "domain_abox"
 
     # Response
     RESPONSE_ASSEMBLE = "response.assemble"

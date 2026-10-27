@@ -37,9 +37,19 @@ ind:Customer  rdfs:label "customers" .
   they relate. "A `Customer` has a `customerId` of type string."
 - **A-Box** — the instance data: "customer #17 has `customerId` `'C-17'`."
 
-COA's ontology engine produces a **T-Box only**. The A-Box is never
-materialized — it stays in the source SQL tables and is reached at query time
-through the virtual knowledge graph (see *R2RML* below).
+For database sources COA's ontology engine produces a **T-Box only**. Their
+A-Box is never materialized: it stays in the source SQL tables and is reached
+at query time through the virtual knowledge graph (see *R2RML* below).
+
+The one materialized A-Box is the **document A-Box** (the domain ABox):
+instances, relations and attributes read from ingested documents and typed by
+the deployed ontology version. `src/coa_ontology/abox/` builds it into the
+named graph `{base}/_abox/{ns}`, outside the `{base}/{ns}/` prefix that T-Box
+readers scan. Each statement is asserted directly, and its supporting document
+chunks hang off `coa:Evidence` nodes (`coa:about`, `coa:predicate`,
+`coa:object`, `coa:chunkId`). Those nodes are a deliberate exception to the
+no-reification rule (2.1): provenance here is per statement and per chunk,
+which a subject-level annotation cannot express.
 
 ### Blank node
 
@@ -140,7 +150,9 @@ nearly everywhere.
 
 There is no reification, no `rdf:Statement`, no singleton properties, and no
 RDF-star anywhere in the package (verified by search across
-`src/coa_ontology/`). The T-Box is asserted plainly, in
+`src/coa_ontology/`), apart from the document A-Box's evidence nodes (see
+*T-Box vs A-Box*), which annotate instance statements, never the schema. The
+T-Box is asserted plainly, in
 `table_to_ontology.py:_build_proposal_ontology`:
 
 | Source | Emitted |
@@ -173,8 +185,8 @@ Two deliberate omissions:
 
 The engine's own vocabulary lives at
 `http://coa.amazon.com/vocab/coa#` — `groundedTo`, `fkProvenance`,
-`subClassProvenance`, `suggestedSubClassOf`, `isMapped`, `distinctValues`,
-`datasourceId`, `sourceSchema`, `matchConfidence`.
+`subClassProvenance`, `suggestedSubClassOf`, `isMapped`, `physicalName`,
+`distinctValues`, `datasourceId`, `sourceSchema`, `matchConfidence`.
 
 ### 2.2 Statement-level metadata is attached to the subject
 
@@ -189,9 +201,10 @@ attached to that axiom's **subject** instead:
 
 This is unambiguous **only because there is at most one such axiom per subject
 per induction run** — `_build_proposal_ontology` reads one grounding match per
-`(table, "")` and one per `(table, column)`. It is not a general guarantee: the
-proposal-accept path calls `ingest_ontology(allow_append=True)`, which merges
-into an existing named graph, so a class IRI re-grounded by a later run
+`(table, "")` and one per `(table, column)`. It is not a general guarantee: an
+accept publishes a version that merges the proposal onto the previous version
+as a set union (`versions.snapshot.merge_ontology`), and deploying that version
+puts the merged graph in Neptune, so a class IRI re-grounded by a later run
 accumulates multiple `matchConfidence` literals on one subject with no way to
 say which belongs to which match axiom.
 
@@ -320,8 +333,8 @@ traversal to reconstruct a table's description at query time.
 
 | Location | Contents | Read by |
 |---|---|---|
-| Ontology named graph (Neptune) | The T-Box: axioms plus `rdfs:label`/`comment`, `skos:altLabel`, `coa:matchConfidence`, `coa:fkProvenance`, `coa:distinctValues`, `coa:isMapped`, and a `definedBy` back-pointer in the workbench vocab (`https://ontology-workbench.local/vocab#`, see `neptune_db_graph.py:WB`) | serve T-Box context; graph browser (`GET /graph/class`) |
-| R2RML Turtle in S3 — **never loaded into the graph** | `rr:tableName`, subject templates, join conditions, `coa:datasourceId` / `coa:sourceSchema` | Ontop at VKG load; scanned once at ingest to derive `isMapped` |
+| Ontology named graph (Neptune) | The T-Box: axioms plus `rdfs:label`/`comment`, `skos:altLabel`, `coa:matchConfidence`, `coa:fkProvenance`, `coa:distinctValues`, `coa:isMapped`, `coa:physicalName`, and a `definedBy` back-pointer in the workbench vocab (`https://ontology-workbench.local/vocab#`, see `neptune_db_graph.py:WB`) | serve T-Box context; serve NL-to-SQL foreign-key walk; graph browser (`GET /graph/class`) |
+| R2RML Turtle in S3 (**never loaded into the graph**) | `rr:tableName`, subject templates, join conditions, `coa:datasourceId` / `coa:sourceSchema` | Ontop at VKG load; read at ingest and at deploy for the `isMapped` and `physicalName` markers and the AOSS documents' table and column names |
 | DynamoDB registry row | class/property/axiom/embedding counts, lifecycle status, `source_proposals`, parse status | ontologies list UI; accept flow |
 | AOSS vector doc, one per class and property | embedding vector plus two pre-rendered strings and `data_source_id` | serve retrieval; NL→SQL prompt |
 
@@ -345,16 +358,76 @@ So a class's entire description — columns, types, relationships, enum values �
 is flattened into a string at accept time. Serve reads one document instead of
 walking `rdfs:domain` edges.
 
+For a mapped class, `embed_text` and `context_text` follow the R2RML
+(`ingest.py:_physical_names_from_r2rml`). They list only the properties a
+TriplesMap of the class maps, also one whose domain is another class (a parent
+the Ontology designer moved it up to: the column is still in this class's
+table), and name a relationship's target by the class its join
+(`rr:parentTriplesMap`) reaches, else by its range when that class is mapped. A class read from exactly one table gets the physical table
+and column names, so editing a label never renames them for the SQL writer: a
+label that differs goes under `Synonyms` (the table) or into the column's
+`[label: ...]` hint. Its document keeps the `Table: <table>` head even when it
+lists no property (every attribute deleted, say), because NL-to-SQL reads the
+table name from that head. A class read from several tables keeps its labels.
+The mapping is the only record of what a table holds, so this also leaves
+out a property the inducer declared but could not map: a column whose name
+holds a double quote, which R2RML cannot read, or a foreign key to such a
+column or to a table the inducer skipped. An unedited induction therefore
+keeps its documents byte for byte unless its inducer left such a property
+unmapped (it logs `r2rml_column_skipped_embedded_quote` or
+`r2rml_relationship_left_unmapped`).
+
 **`coa:isMapped` is a derived marker, not stored input.** It is computed
 server-side from R2RML `rr:class` membership
 (`ingest.py:_class_datasource_map_from_r2rml`) and any caller-supplied
-`coa:isMapped` triple is **stripped** at ingest (`_strip_ismapped_triples`) —
+`coa:isMapped` triple is **stripped** at ingest (`_strip_derived_markers`):
 it is a trust boundary, since forging it would force an unbacked class into the
 structured-query prompt. Note the deliberate decoupling: **membership** decides
 `isMapped` (Ontop can answer a mapped class even with no datasource id), while
 the **id value** feeds AOSS `data_source_id` for NL→SQL routing. A mapped class
 with no id is still `isMapped` but is dropped by the NL→SQL presence filter.
-Only `"true"` is ever emitted — absent means unmapped.
+A class only ever gets `"true"`; on a class, absent means unmapped.
+
+An attribute or relationship (`owl:DatatypeProperty` or `owl:ObjectProperty`,
+the property kinds serve offers) gets the marker only as `"false"`, when no
+`rr:predicateObjectMap` maps it (`ingest.py:_mapped_predicates_from_r2rml`)
+although one of its `rdfs:domain` classes is mapped or, for a relationship, one
+of its `rdfs:range` classes: an attribute or relationship added to a mapped class in
+the Ontology designer, a relationship added from another class into one, or one
+the inducer could not map (above), with no column or join behind it. The range
+counts because serve's NL-to-SQL foreign-key walk follows a relationship from
+both ends. Serve leaves such a property out of the Tier 2 prompts and the walk.
+A property without the triple is served as before, so namespaces deployed
+before this marker are unchanged.
+
+**`coa:physicalName` is derived the same way.** Deploy (and the legacy ingest)
+writes `<class> coa:physicalName "<table>"`, a plain literal, on a mapped class
+read from exactly one table, and `<property> coa:physicalName "<column>"` on a
+mapped datatype property all of whose predicate-object maps read that one
+column, named as the AOSS documents name them: the unquoted last segment of
+`rr:tableName` and the unquoted `rr:column` (`ingest.py:PhysicalNames`). A
+class read from several tables, and a property read from several columns or
+from none, get nothing. Serve's NL-to-SQL
+foreign-key walk (`tier2/tools/graph_tools.py`) names a table or column by it
+and keeps a label that differs as a `(label: ...)` or `[label: ...]` hint, so a
+label edited in the Ontology designer never renames what the SQL writer is
+told to use; without the triple it names them by their label, as before. Like
+`coa:isMapped`, a caller-supplied `coa:physicalName` is stripped at ingest and
+snapshots never keep one.
+
+**`coa:mappedDomain` and `coa:mappedRange` say where the mapping puts a
+property.** The Ontology designer allows moving a mapped property's domain or
+range up to a parent of its mapped class, which is sound for SPARQL through the
+VKG, but the parent's table (if it has one) holds neither the column nor the
+join. So deploy (and the legacy ingest) writes `<p> coa:mappedDomain <C>` for
+each class `C` whose TriplesMaps map an attribute or relationship `p` when `p`'s
+`rdfs:domain` classes are not exactly those, and `<p> coa:mappedRange <C>` for
+each class whose TriplesMap a join of the relationship reaches
+(`rr:parentTriplesMap`) when its `rdfs:range` classes are not exactly those
+(`ingest.py:projection_specs`). An IRI-template object map names no target, so
+it gets no `coa:mappedRange`. An unedited induction gets neither. Serve's
+NL-to-SQL foreign-key walk places a property by them when they are present.
+They are stripped and re-derived like the other markers.
 
 ### 2.6 The four internal representations
 
@@ -367,7 +440,7 @@ two rdflib.Graph objects         proposal T-Box  +  R2RML mapping
         ▼
 Turtle in S3 + DynamoDB row      versioned proposal artifacts, review workflow
         │
-        ▼ (on accept)
+        ▼ (accept publishes a version; deploy materializes it)
 Neptune named graph (NDB)        quads, one graph per ontology
    or property graph (NA)   +    AOSS vector docs
 ```

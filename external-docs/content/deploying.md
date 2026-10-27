@@ -767,6 +767,7 @@ write):
 - `POST /namespaces/{namespaceId}/proposals/{proposalId}/validate`
 - `POST /namespaces/{namespaceId}/proposals/{proposalId}/compile-constraints`
 - `POST /namespaces/{namespaceId}/proposals/{proposalId}/accept`
+- `POST /namespaces/{namespaceId}/ontology/versions/{version}/deploy`: ontology version deploy or rollback
 
 **Overriding the limits.** The values are construct props with defaults in
 `infra/lib/constants.ts`, not environment variables.

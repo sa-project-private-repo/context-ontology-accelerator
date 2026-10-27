@@ -168,6 +168,17 @@ class TestNLtoSPARQLTranslation:
         ctx_steps = [s for s in result.trace_steps if s["step"] == PipelineStep.CONTEXT_ASSEMBLY]
         assert ctx_steps and "reused" in ctx_steps[0]["detail"]
 
+    def test_the_tbox_builder_asks_the_served_version_reader_it_is_given(self):
+        from coa_serve.served_version import ServedVersionReader
+
+        graph_client = AsyncMock()
+        reader = ServedVersionReader(graph_client)
+        translator = NLtoSPARQL(
+            graph_client=graph_client, llm_client=_make_llm_client(_VALID_SPARQL_RESPONSE), served_versions=reader
+        )
+
+        assert translator._tbox_builder._served_versions is reader
+
     async def test_validator_inherits_the_tbox_graphs(self):
         """The validator's checks are the only graph queries re-paid per attempt.
 
@@ -197,7 +208,8 @@ class TestNLtoSPARQLTranslation:
         )
 
         assert result.valid is True
-        existence_query = graph_client.query.call_args[0][0]
+        # The validator also reads the namespace's unmapped properties (once a minute, over its prefix).
+        existence_query = next(c[0][0] for c in graph_client.query.call_args_list if "COUNT(DISTINCT ?s)" in c[0][0])
         assert f"GRAPH <{graph_iri}>" in existence_query
         assert "STRSTARTS" not in existence_query
 

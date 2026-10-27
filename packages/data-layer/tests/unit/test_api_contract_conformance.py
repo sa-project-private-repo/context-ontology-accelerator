@@ -56,7 +56,7 @@ _OPENAPI = (
 # ``direction`` and ``relationshipFilter`` are read (and so pass here) but not yet
 # applied by the Context Manager; the model's member docs say so, rather than this
 # list hiding them.
-_CHECKED_OPERATIONS = ("Query", "TranslateSPARQL", "KBSearch", "GraphTraverse", "DescribeSchema")
+_CHECKED_OPERATIONS = ("Query", "TranslateSPARQL", "RunSparqlQuery", "KBSearch", "GraphTraverse", "DescribeSchema")
 _SKIPPED_OPERATIONS: set[str] = set()
 
 # Known gaps: (operationId, member) -> why it is acceptable for now. Keep empty
@@ -79,11 +79,11 @@ def _spec() -> dict:
 
 
 def _operations(spec: dict) -> dict[str, tuple[str, str, dict]]:
-    """``operationId -> (METHOD, path, operation)`` for every operation in the spec."""
+    """``operationId -> (METHOD, path, operation)`` for every operation in the spec, CORS preflights aside."""
     ops: dict[str, tuple[str, str, dict]] = {}
     for path, item in spec["paths"].items():
         for method, op in item.items():
-            if isinstance(op, dict) and "operationId" in op:
+            if isinstance(op, dict) and "operationId" in op and method != "options":
                 ops[op["operationId"]] = (method.upper(), path, op)
     return ops
 

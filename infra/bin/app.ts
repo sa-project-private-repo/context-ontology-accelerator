@@ -371,9 +371,44 @@ async function deploy(): Promise<void> {
       "/namespaces/{namespaceId}/proposals/{proposalId}/upload-url": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/proposals/update": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/proposals/reject": `/${prefix}/ontology-engine/api-fn-arn`,
+      // Ontology designer
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/graph": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/term": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/terms": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changes": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/undo": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/redo": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/history": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/rebase": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/accept-preview": `/${prefix}/ontology-engine/api-fn-arn`,
+      // Ontology designer: the assistant chat and its change sets
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/messages": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/events": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/preview": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/apply": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/discard": `/${prefix}/ontology-engine/api-fn-arn`,
+      // Ontology designer checks, the query console and competency questions
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/checks": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/queries": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/proposals/{proposalId}/studio/questions/{questionId}/check": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/studio/questions": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/studio/questions/{questionId}": `/${prefix}/ontology-engine/api-fn-arn`,
       // ── Ontology engine — graph, ontologies, embeddings, validation ─
       "/namespaces/{namespaceId}/ontology/foundational": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/ontology/foundational/{key}/load": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/ontology/versions": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/ontology/versions/{version}": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/ontology/versions/{version}/deploy": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/ontology/deployments/{deploymentId}": `/${prefix}/ontology-engine/api-fn-arn`,
+      // Domain ABox: domain data extracted from documents
+      "/namespaces/{namespaceId}/abox": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/abox/instances": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/abox/instance": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/abox/mappings": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/abox/mappings/{mappingId}": `/${prefix}/ontology-engine/api-fn-arn`,
+      "/namespaces/{namespaceId}/abox/rebuild": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/graph/search": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/graph/ontology-overview": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/graph/class": `/${prefix}/ontology-engine/api-fn-arn`,
@@ -399,6 +434,8 @@ async function deploy(): Promise<void> {
       // ── Data Layer (Serve) — runtime query/retrieval ───────────────
       "/namespaces/{namespaceId}/query": `/${prefix}/data-layer/api-fn-arn`,
       "/namespaces/{namespaceId}/translate": `/${prefix}/data-layer/api-fn-arn`,
+      // RunSparqlQuery: the Ontology designer query console over the VKG.
+      "/namespaces/{namespaceId}/sparql": `/${prefix}/data-layer/api-fn-arn`,
       "/namespaces/{namespaceId}/kb/search": `/${prefix}/data-layer/api-fn-arn`,
       "/namespaces/{namespaceId}/graph/traverse": `/${prefix}/data-layer/api-fn-arn`,
       // DescribeSchema — data-layer proxies to the ontology-engine api-fn.

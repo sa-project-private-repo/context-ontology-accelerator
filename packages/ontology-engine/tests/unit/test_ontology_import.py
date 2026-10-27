@@ -19,17 +19,6 @@ from fastapi.testclient import TestClient
 pytestmark = pytest.mark.unit
 
 
-@pytest.fixture(autouse=True)
-def _no_accept_backoff():
-    """Zero the accept-step retry backoff: no unit test should sleep on it.
-
-    Autouse so a future retry-path test in this module cannot silently add
-    seconds to the suite by forgetting to patch it.
-    """
-    with patch("coa_ontology.proposals._ACCEPT_STEP_BACKOFF_SECONDS", 0):
-        yield
-
-
 TURTLE = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix ex:   <https://example.com/onto#> .
@@ -316,10 +305,6 @@ def import_client(monkeypatch, tmp_path, fake_dynamo):
     mock_graph.store_property = MagicMock(return_value={})
     mock_graph.update_ontology = MagicMock(return_value={})
     mock_graph.delete_ontology = MagicMock(return_value=True)
-    # Reconcile step (_reconcile_counts) queries Neptune for deduped counts.
-    # Return None so reconcile is a no-op and the registry retains the
-    # ingest-derived class_count this test asserts on.
-    mock_graph.count_classes_and_properties = MagicMock(return_value=None)
     mock_graph.load_turtle = MagicMock(
         return_value={
             "status": "ok",
@@ -381,12 +366,6 @@ def import_client(monkeypatch, tmp_path, fake_dynamo):
         patch("coa_ontology.stores.build_stores", return_value=(mock_graph, mock_vec)),
         patch("coa_ontology.bedrock_embeddings.BedrockEmbeddingClient", return_value=mock_bedrock),
         patch("coa_ontology.proposals.Thread", _InlineThread),
-        # S3 persist (#467) builds its own boto3 client + reads Neptune, and now
-        # RAISES on failure (a retried accept step) instead of swallowing — so
-        # without a stub it would make real network calls and fail these accepts.
-        # These tests don't exercise persistence (see test_s3_persistence.py); the
-        # persist-failure accept path is covered in test_proposal_turtle_ingest.py.
-        patch("coa_ontology.proposals._persist_induced_to_s3", return_value=None),
     ):
         from coa_ontology.main import app
 
@@ -596,7 +575,7 @@ class TestUploadEndpoint:
         assert listing == {"ontologies": []}
 
 
-# ── Multi-proposal merge into a single ontology ─────────────────────────
+# ── One induced ontology per namespace ──────────────────────────────────
 
 
 PROPOSAL_A_TURTLE = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
@@ -611,22 +590,6 @@ ex:Patient a owl:Class ; rdfs:label "Patient" .
 ex:hasAge a owl:DatatypeProperty ;
     rdfs:label "hasAge" ;
     rdfs:domain ex:Patient .
-"""
-
-PROPOSAL_B_TURTLE = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
-@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
-@prefix ex:   <https://example.com/onto#> .
-
-<https://example.com/onto> a owl:Ontology ;
-    rdfs:label "Proposal B Source" .
-
-ex:Doctor a owl:Class ; rdfs:label "Doctor" .
-ex:Patient a owl:Class ; rdfs:label "Patient" .
-
-ex:treats a owl:ObjectProperty ;
-    rdfs:label "treats" ;
-    rdfs:domain ex:Doctor ;
-    rdfs:range  ex:Patient .
 """
 
 
@@ -652,126 +615,6 @@ def _proposal_status(ddb, proposal_id: str, namespace: str = "default") -> dict:
     return ddb.get_item(Key={"PK": f"{namespace}#PROPOSAL#{proposal_id}", "SK": "META"})["Item"]
 
 
-class TestProposalMergeIntoOneOntology:
-    """Multiple proposals → same target ontology URI → merged triples + one registry row.
-
-    The accept route returns 202; the inline-thread fixture means the
-    worker has already run by the time the test continues. Result shape
-    is observable on the ``NAMESPACE#default / ONTOLOGY#…`` registry row,
-    not on the response body.
-    """
-
-    def test_first_accept_creates_registry_row(self, import_client):
-        http, mock_graph, mock_vec, mock_bedrock, ddb = import_client
-        _seed_proposal(
-            ddb,
-            proposal_id="p-A",
-            ontology_id="https://example.com/onto",
-            turtle=PROPOSAL_A_TURTLE,
-        )
-        r = http.post(
-            "/ontology/proposals/p-A/accept",
-            json={"ontology_id": "https://target.example/master"},
-        )
-        assert r.status_code == 202, r.text
-        assert r.json() == {"proposal_id": "p-A", "status": "accepting"}
-
-        # Worker ran inline → proposal flipped to ``accepted``.
-        assert _proposal_status(ddb, "p-A")["status"] == "accepted"
-
-        # Graph store wrote to the TARGET ontology, not the proposal's.
-        mock_graph.create_ontology.assert_called_once()
-        created = mock_graph.create_ontology.call_args.args[0]
-        assert created["uri"] == "https://target.example/master"
-
-        mock_graph.load_turtle.assert_called_once()
-        kw = mock_graph.load_turtle.call_args.kwargs
-        assert kw["ontology_uri"] == "https://target.example/master"
-
-        # Registry row under NAMESPACE#default / ONTOLOGY#<target>
-        row = ddb.get_item(Key={"PK": "NAMESPACE#default", "SK": "ONTOLOGY#https://target.example/master"})["Item"]
-        assert row["uri"] == "https://target.example/master"
-        assert row["source_proposals"] == ["p-A"]
-        assert row["class_count"] == 1
-        assert row["property_count"] == 1
-        assert row["embedding_count"] == 2  # 1 class + 1 property
-
-    def test_second_accept_appends_to_same_ontology(self, import_client):
-        http, mock_graph, mock_vec, mock_bedrock, ddb = import_client
-        _seed_proposal(
-            ddb,
-            proposal_id="p-A",
-            ontology_id="https://example.com/onto",
-            turtle=PROPOSAL_A_TURTLE,
-        )
-        _seed_proposal(
-            ddb,
-            proposal_id="p-B",
-            ontology_id="https://example.com/onto",
-            turtle=PROPOSAL_B_TURTLE,
-        )
-
-        target = "https://target.example/master"
-        r1 = http.post("/ontology/proposals/p-A/accept", json={"ontology_id": target})
-        assert r1.status_code == 202
-        assert _proposal_status(ddb, "p-A")["status"] == "accepted"
-
-        r2 = http.post("/ontology/proposals/p-B/accept", json={"ontology_id": target})
-        assert r2.status_code == 202, r2.text
-        assert _proposal_status(ddb, "p-B")["status"] == "accepted"
-
-        # create_ontology only ran for the first proposal; the second
-        # skipped it to avoid stomping dct:created.
-        assert mock_graph.create_ontology.call_count == 1
-
-        # But load_turtle ran twice — once per proposal, both targeting
-        # the same graph URI, so triples merge in the named graph.
-        assert mock_graph.load_turtle.call_count == 2
-        loaded_uris = {c.kwargs["ontology_uri"] for c in mock_graph.load_turtle.call_args_list}
-        assert loaded_uris == {target}
-
-        # Classes/properties are projected via the batched path: one
-        # store_classes_batch per accept (2 accepts), together carrying
-        # 1 (A) + 2 (B) = 3 classes and 1 + 1 = 2 properties, all targeting the
-        # same ontology_uri (the target).
-        class_calls = mock_graph.store_classes_batch.call_args_list
-        prop_calls = mock_graph.store_properties_batch.call_args_list
-        assert len(class_calls) == 2  # one batch per accept
-        assert sum(len(c.kwargs["classes"]) for c in class_calls) == 3
-        assert sum(len(c.kwargs["properties"]) for c in prop_calls) == 2
-        for c in class_calls:
-            assert c.kwargs["ontology_uri"] == target
-        for c in prop_calls:
-            assert c.kwargs["ontology_uri"] == target
-
-        # Registry reflects the accumulation.
-        row = ddb.get_item(Key={"PK": "NAMESPACE#default", "SK": f"ONTOLOGY#{target}"})["Item"]
-        assert row["source_proposals"] == ["p-A", "p-B"]
-        # Counts are cumulative (not dedup'd): A(1) + B(2) = 3 classes
-        assert row["class_count"] == 3
-        assert row["property_count"] == 2
-        assert row["embedding_count"] == 5  # 2 + 3
-
-    def test_accept_without_target_defaults_to_proposal_ontology_id(self, import_client):
-        """No body → uses the proposal's own ontology_id, preserving the
-        old one-proposal-per-ontology behaviour for callers that don't
-        care about merging."""
-        _, mock_graph, _, _, ddb = import_client
-        http, *_ = import_client
-        _seed_proposal(
-            ddb=ddb,
-            proposal_id="p-A",
-            ontology_id="https://example.com/onto",
-            turtle=PROPOSAL_A_TURTLE,
-        )
-        r = http.post("/ontology/proposals/p-A/accept")
-        assert r.status_code == 202
-        assert _proposal_status(ddb, "p-A")["status"] == "accepted"
-        # Graph store target was the proposal's own ontology_id.
-        loaded = mock_graph.load_turtle.call_args.kwargs["ontology_uri"]
-        assert loaded == "https://example.com/onto"
-
-
 class TestOneOntologyPerNamespaceGuard:
     """Accept enforces one induced ontology per namespace.
 
@@ -793,7 +636,16 @@ class TestOneOntologyPerNamespaceGuard:
             {"uri": ontology_id, "title": "Existing", "ontology_type": ontology_type},
         )
 
-    def test_second_ontology_distinct_id_rejected_409(self, import_client):
+    @pytest.fixture
+    def publish_worker(self):
+        """The guard is a route concern; the publish worker itself is covered elsewhere."""
+        with (
+            patch("coa_ontology.proposals._run_publish_proposal") as worker,
+            patch("coa_ontology.proposals.version_registry.head_version", return_value=None),
+        ):
+            yield worker
+
+    def test_second_ontology_distinct_id_rejected_409(self, import_client, publish_worker):
         http, _mock_graph, _mv, _mb, ddb = import_client
         # An ontology already exists in the namespace (a prior accept).
         self._seed_registry(ddb, "default", "http://coa/namespace/default/ontology/induced#")
@@ -810,7 +662,7 @@ class TestOneOntologyPerNamespaceGuard:
         # Proposal not consumed — still pending, no overwrite happened.
         assert _proposal_status(ddb, "p-X")["status"] == "pending"
 
-    def test_same_id_as_existing_allowed(self, import_client):
+    def test_same_id_as_existing_allowed(self, import_client, publish_worker):
         http, _mock_graph, _mv, _mb, ddb = import_client
         oid = "http://coa/namespace/default/ontology/induced#"
         self._seed_registry(ddb, "default", oid)
@@ -818,9 +670,9 @@ class TestOneOntologyPerNamespaceGuard:
         _seed_proposal(ddb, proposal_id="p-Y", ontology_id=oid, turtle=PROPOSAL_A_TURTLE)
         r = http.post("/ontology/proposals/p-Y/accept")
         assert r.status_code == 202, r.text
-        assert _proposal_status(ddb, "p-Y")["status"] == "accepted"
+        publish_worker.assert_called_once()
 
-    def test_first_ontology_in_empty_namespace_allowed(self, import_client):
+    def test_first_ontology_in_empty_namespace_allowed(self, import_client, publish_worker):
         http, _mock_graph, _mv, _mb, ddb = import_client
         # No existing ontology in the namespace → any id is fine.
         _seed_proposal(
@@ -831,9 +683,9 @@ class TestOneOntologyPerNamespaceGuard:
         )
         r = http.post("/ontology/proposals/p-Z/accept")
         assert r.status_code == 202, r.text
-        assert _proposal_status(ddb, "p-Z")["status"] == "accepted"
+        publish_worker.assert_called_once()
 
-    def test_foundational_ontology_does_not_block_first_induced_accept(self, import_client):
+    def test_foundational_ontology_does_not_block_first_induced_accept(self, import_client, publish_worker):
         """Regression: a foundational (grounding) ontology present in the namespace
         must NOT trip the guard on the FIRST induced accept.
 
@@ -855,9 +707,9 @@ class TestOneOntologyPerNamespaceGuard:
         )
         r = http.post("/ontology/proposals/p-F/accept")  # no override
         assert r.status_code == 202, f"foundational ontology wrongly blocked first induced accept: {r.text}"
-        assert _proposal_status(ddb, "p-F")["status"] == "accepted"
+        publish_worker.assert_called_once()
 
-    def test_explicit_override_bypasses_guard(self, import_client):
+    def test_explicit_override_bypasses_guard(self, import_client, publish_worker):
         http, _mock_graph, _mv, _mb, ddb = import_client
         # Existing ontology present, proposal under a distinct id, BUT caller
         # explicitly names a target → deliberate merge, guard does not fire.
@@ -870,51 +722,10 @@ class TestOneOntologyPerNamespaceGuard:
         )
         r = http.post(
             "/ontology/proposals/p-W/accept",
-            json={"ontology_id": "https://target.example/master"},
+            json={"ontology_id": "https://target.example/primary"},
         )
         assert r.status_code == 202, r.text
-        assert _proposal_status(ddb, "p-W")["status"] == "accepted"
-
-    def test_load_turtle_failure_on_append_preserves_prior_state(self, import_client):
-        """If the merge-into-existing load fails (after its retries), we must NOT
-        delete the already-loaded ontology, and proposal B lands in the terminal
-        ``accept_failed`` state with ``accept_error`` set."""
-        http, mock_graph, mock_vec, mock_bedrock, ddb = import_client
-        _seed_proposal(
-            ddb,
-            proposal_id="p-A",
-            ontology_id="https://example.com/onto",
-            turtle=PROPOSAL_A_TURTLE,
-        )
-        _seed_proposal(
-            ddb,
-            proposal_id="p-B",
-            ontology_id="https://example.com/onto",
-            turtle=PROPOSAL_B_TURTLE,
-        )
-        target = "https://target.example/master"
-
-        # First accept succeeds.
-        r1 = http.post("/ontology/proposals/p-A/accept", json={"ontology_id": target})
-        assert r1.status_code == 202
-        assert _proposal_status(ddb, "p-A")["status"] == "accepted"
-
-        # Second accept: load_turtle fails inside the worker (all retries).
-        # The retry backoff is zeroed for this module by ``_no_accept_backoff``.
-        mock_graph.delete_ontology.reset_mock()
-        mock_graph.load_turtle.side_effect = RuntimeError("GSP 503")
-        r2 = http.post("/ontology/proposals/p-B/accept", json={"ontology_id": target})
-        assert r2.status_code == 202
-
-        b_final = _proposal_status(ddb, "p-B")
-        assert b_final["status"] == "accept_failed"
-        assert "GSP 503" in b_final["accept_error"]
-
-        # Critical: prior state must NOT be wiped.
-        mock_graph.delete_ontology.assert_not_called()
-        # The registry row still carries proposal A.
-        row = ddb.get_item(Key={"PK": "NAMESPACE#default", "SK": f"ONTOLOGY#{target}"})["Item"]
-        assert row["source_proposals"] == ["p-A"]
+        publish_worker.assert_called_once()
 
 
 # ── Property type coverage ─────────────────────────────────────────────

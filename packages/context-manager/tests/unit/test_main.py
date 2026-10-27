@@ -1420,6 +1420,51 @@ class TestTier2QualifierWiring:
 
 
 @pytest.mark.unit
+class TestServedVersionWiring:
+    """Every reader of the ontology version Neptune serves gets the one reader ``main`` builds.
+
+    ``served_versions`` is optional wherever it is taken, and its absence is silent:
+    without it the VKG skew guard compares nothing (stale-mapping Ontop answers after a
+    deploy come back), NL-to-SQL keeps the legacy bridge for a versioned namespace with
+    no mapped class, and the deep-reasoning ontology lookup falls back to a cache of its
+    own, which switches to a new version at another moment. Asserted statically, like
+    the sources-registry wiring above.
+    """
+
+    @pytest.mark.parametrize("callee", ["VKGTranslator", "SQLGenerator", "build_agentic_retriever"])
+    def test_every_consumer_is_given_the_reader(self, callee):
+        calls = TestTier2QualifierWiring._kwargs_per_call(callee)
+        assert calls, f"{callee} is no longer called in coa_serve.main; move this wiring assertion with it."
+        for kwargs in calls:
+            assert "served_versions" in kwargs, (
+                f"{callee}(...) in coa_serve.main omits served_versions. Got kwargs={sorted(kwargs)}."
+            )
+
+    def test_one_reader_is_built(self):
+        assert len(TestTier2QualifierWiring._kwargs_per_call("ServedVersionReader")) == 1
+
+
+@pytest.mark.unit
+class TestUnmappedTermsWiring:
+    """Both Tier 2 writers get the one reader of the terms no table maps that ``main`` builds.
+
+    ``unmapped_terms`` is optional on both and its absence is silent: that writer is
+    told nothing and answers a question about such a term with a stand-in, as before.
+    Asserted statically, like the sources-registry wiring above.
+    """
+
+    @pytest.mark.parametrize("callee", ["NLtoSPARQL", "SQLGenerator"])
+    def test_both_writers_are_given_the_reader(self, callee):
+        calls = TestTier2QualifierWiring._kwargs_per_call(callee)
+        assert calls, f"{callee} is no longer called in coa_serve.main; move this wiring assertion with it."
+        for kwargs in calls:
+            assert "unmapped_terms" in kwargs, f"{callee}(...) in coa_serve.main omits unmapped_terms: {sorted(kwargs)}"
+
+    def test_one_reader_is_built(self):
+        assert len(TestTier2QualifierWiring._kwargs_per_call("UnmappedTermsReader")) == 1
+
+
+@pytest.mark.unit
 class TestHandleGraphTraverseOptions:
     """GraphTraverse members are validated against the contract (the MCP server calls
     this action directly, so the REST edge is not the only way in)."""

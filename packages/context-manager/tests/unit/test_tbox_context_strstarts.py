@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from coa_common.constants import GRAPH_BASE_URI
 from coa_serve.tier2.ontop.types import VectorHit
+from rdflib import URIRef
 
 
 def _hit(uri: str, hit_type: str = "ontology_class", score: float = 0.9) -> VectorHit:
@@ -470,6 +471,47 @@ class TestTBoxContextDatatypePropertyGate:
         assert "?property a owl:DatatypeProperty" in sparql
 
 
+_PROPERTY_GATE = f"FILTER NOT EXISTS {{ ?property <{_IS_MAPPED_IRI}> false }}"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestTBoxContextPropertyGate:
+    """Every query that offers a property excludes one deploy marked ``coa:isMapped false``.
+
+    That is an attribute or relationship added to a mapped class (in the Ontology
+    designer) that no column or join maps. The behaviour against a real graph is in
+    test_tbox_context_designer_edits.py; these pin that no fetch path lost the filter.
+    """
+
+    async def test_full_fetch_property_query_carries_the_gate(self, tbox_builder, graph_client):
+        graph_client.query = AsyncMock(side_effect=[[{"cnt": "3"}], [{"class": "c", "label": "C"}], []])
+        await tbox_builder._try_full_namespace_context("ns-x")
+        assert _PROPERTY_GATE in graph_client.query.call_args_list[2][0][0]
+
+    async def test_both_vector_hit_branches_carry_the_gate(self, tbox_builder, graph_client):
+        hits = [
+            _hit("https://example.org/o#Employee"),
+            _hit("https://example.org/o#salary", hit_type="ontology_property"),
+        ]
+        await tbox_builder._fetch_ontology_context(hits, "ns-x")
+        sparql = graph_client.query.call_args[0][0]
+        # Once in the class branch's column OPTIONAL, once in the property-seeded branch.
+        assert sparql.count(_PROPERTY_GATE) == 2
+
+    async def test_entity_fallback_property_query_carries_the_gate(self, tbox_builder, graph_client):
+        graph_client.query = AsyncMock(side_effect=[[{"class": "https://example.org/o#Emp", "label": "Emp"}], []])
+        await tbox_builder._fetch_by_entities("how many employees", "ns-x")
+        assert _PROPERTY_GATE in graph_client.query.call_args_list[1][0][0]
+
+    @pytest.mark.parametrize("mapped", [True, False])
+    async def test_join_path_query_carries_the_gate_with_or_without_the_class_gate(
+        self, tbox_builder, graph_client, mapped
+    ):
+        await tbox_builder._fetch_object_properties("ns-x", mapped=mapped)
+        assert f"FILTER NOT EXISTS {{ ?op <{_IS_MAPPED_IRI}> false }}" in graph_client.query.call_args[0][0]
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestTBoxGlossaryMappedGate:
@@ -657,6 +699,98 @@ class TestIsMappedLegacyBridge:
         await tbox_builder.build([_hit("https://example.org/o#Emp")], "ns-x", query="employees")
         classes_sparql = graph_client.query.call_args_list[2][0][0]
         assert f"<{self._IS_MAPPED_IRI}> true" in classes_sparql  # gate present despite probe failure
+
+    # A namespace with a published version was deployed by the version registry, which
+    # writes the markers with every version: no marker there means no class is mapped
+    # (a designer accept that deleted every mapped class), not a pre-marker namespace.
+
+    @staticmethod
+    def _query_sequence() -> list[list[dict]]:
+        return [
+            [],  # named-graph resolution finds none, so the prefix filter is used
+            [{"cnt": "2"}],  # count
+            [{"class": "https://example.org/o#Emp", "label": "Emp", "parentClass": None}],
+            [],  # props
+            [],  # aiContext
+        ]
+
+    async def test_a_namespace_with_a_published_version_keeps_the_gate_without_markers(
+        self, tbox_builder, graph_client
+    ):
+        graph_client.ask = AsyncMock(side_effect=[False, True])  # no marker, but a published version
+        graph_client.query = AsyncMock(side_effect=self._query_sequence())
+        await tbox_builder.build([_hit("https://example.org/o#Emp")], "ns-x", query="employees")
+        classes_sparql = graph_client.query.call_args_list[2][0][0]
+        assert f"<{self._IS_MAPPED_IRI}> true" in classes_sparql
+
+    async def test_the_version_probe_asks_for_a_published_version_of_the_induced_graph(
+        self, tbox_builder, graph_client
+    ):
+        graph_client.ask = AsyncMock(return_value=True)
+        assert await tbox_builder._namespace_has_published_version("ns-x") is True
+        sparql = graph_client.ask.call_args[0][0]
+        assert sparql.lstrip().startswith("ASK")
+        assert "<http://www.w3.org/2002/07/owl#versionInfo> ?v" in sparql
+        assert '<https://ontology-workbench.local/vocab#ontology_type> "induced"' in sparql
+        assert 'REGEX(?v, "^v[0-9]+$")' in sparql
+        assert 'STRSTARTS(STR(?g), "https://ontology-workbench.local/ns-x/")' in sparql
+
+    async def test_the_version_probe_asks_the_served_version_reader_serve_shares(self, graph_client):
+        """With the reader NL-to-SQL also asks, a probe reuses its read for a minute instead of asking Neptune."""
+        from coa_serve.served_version import ServedVersionReader
+        from coa_serve.tier2.ontop.tbox_context import TBoxContextBuilder
+
+        template = "https://ontology-workbench.local/{namespace}"
+        reader = ServedVersionReader(graph_client, graph_uri_template=template)
+        builder = TBoxContextBuilder(graph_client, template, served_versions=reader)
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(return_value=[{"v": "v3"}])
+
+        assert await builder._namespace_has_published_version("ns-x") is True
+        assert await builder._namespace_has_published_version("ns-x") is True
+
+        graph_client.ask.assert_not_called()
+        assert graph_client.query.await_count == 1  # one read, kept by the reader
+        graph_client.query = AsyncMock(side_effect=RuntimeError("neptune down"))
+        assert await builder._namespace_has_published_version("ns-y") is False  # unread: the legacy fallback
+
+    async def test_the_version_probe_runs_only_when_there_is_no_marker(self, tbox_builder, graph_client):
+        graph_client.ask = AsyncMock(return_value=True)
+        graph_client.query = AsyncMock(side_effect=self._query_sequence())
+        await tbox_builder.build([_hit("https://example.org/o#Emp")], "ns-x", query="employees")
+        assert graph_client.ask.await_count == 1
+
+    async def test_a_failed_version_probe_keeps_the_legacy_fallback(self, tbox_builder, graph_client):
+        """The probe only narrows the fallback on evidence: unread, the namespace keeps today's behavior."""
+        graph_client.ask = AsyncMock(side_effect=[False, RuntimeError("neptune down")])
+        graph_client.query = AsyncMock(side_effect=self._query_sequence())
+        await tbox_builder.build([_hit("https://example.org/o#Emp")], "ns-x", query="employees")
+        classes_sparql = graph_client.query.call_args_list[2][0][0]
+        assert f"<{self._IS_MAPPED_IRI}> true" not in classes_sparql
+
+    @pytest.mark.parametrize(("version", "exposed"), [("v3", False), (None, True)])
+    async def test_a_deployed_namespace_with_no_mapped_class_left_against_the_real_graph(self, version, exposed):
+        """Through the real Neptune client: every mapped class deleted in the designer and deployed as v3."""
+        from coa_serve.served_version import ServedVersionReader
+        from coa_serve.tier2.ontop.tbox_context import TBoxContextBuilder
+
+        from .deployed_graph import GRAPH, IS_MAPPED, NS, TEMPLATE, designer_v2_dataset, neptune_over
+
+        ds = designer_v2_dataset(version=version)
+        ds.graph(URIRef(GRAPH)).remove((None, IS_MAPPED, None))
+        client = neptune_over(ds)
+        reader = ServedVersionReader(client, graph_uri_template=TEMPLATE)
+        for builder in (
+            TBoxContextBuilder(client, TEMPLATE),
+            TBoxContextBuilder(client, TEMPLATE, served_versions=reader),
+        ):
+            context = await builder.build([], NS, query="how many premium customers")
+
+            labels = {c["label"] for c in context.classes}
+            # A versioned namespace stays gated, so its unmapped classes stay out; one from
+            # before versions takes the legacy fallback and exposes them, as it always has.
+            assert ("Premium customer" in labels) is exposed
+            assert (labels == set()) is not exposed
 
 
 @pytest.mark.unit

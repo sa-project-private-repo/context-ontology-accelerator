@@ -37,6 +37,15 @@ vi.mock("@api-hooks/use-namespace", () => ({
   }),
 }));
 
+// `useCanManageOntology` reads the caller's grants (ListPrincipalGrants, a
+// control-plane query) to stop offering the ontology changes a read-only role
+// cannot make. Page tests run as a role that can make them, as before; the
+// hook's rule is covered in use-can-manage-ontology.test.ts, which opts out of
+// this mock, and the read-only pages by tests that mock it to false.
+vi.mock("@api-hooks/use-can-manage-ontology", () => ({
+  useCanManageOntology: () => true,
+}));
+
 // Unmount any component rendered by a test after it finishes. Without this,
 // happy-dom accumulates every test's DOM in one document, so a test that
 // asserts the ABSENCE of text (e.g. `queryByText(...).toBeNull()`) can match a

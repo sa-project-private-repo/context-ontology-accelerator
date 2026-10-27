@@ -239,6 +239,27 @@ class TestOntologySourceSelection:
         tool = registry.get(ONTOLOGY_TOOL)
         assert isinstance(tool._source, OntologyFileSource)
 
+    def test_the_graph_source_cache_follows_the_served_version(self):
+        """The graph source reads the deployed ontology, so a deploy must invalidate its cache."""
+        from coa_serve.served_version import ServedVersionReader
+
+        registry = build_tool_registry(make_config(deep_reasoning_ontology_source="graph"), make_clients())
+        assert isinstance(registry.get(ONTOLOGY_TOOL)._served_versions, ServedVersionReader)
+
+    def test_the_graph_source_uses_the_reader_serve_shares(self):
+        """One reader for every consumer, so they all see a deploy at the same moment."""
+        reader = object()
+        registry = build_tool_registry(
+            make_config(deep_reasoning_ontology_source="graph"), make_clients(), served_versions=reader
+        )
+        assert registry.get(ONTOLOGY_TOOL)._served_versions is reader
+
+    def test_the_file_source_cache_does_not(self):
+        config = make_config(deep_reasoning_ontology_source="file", deep_reasoning_ontology_file="/tmp/onto.ttl")
+        for reader in (None, object()):
+            registry = build_tool_registry(config, make_clients(), served_versions=reader)
+            assert registry.get(ONTOLOGY_TOOL)._served_versions is None
+
     def test_graph_source_selected_when_configured(self):
         """``deep_reasoning_ontology_source="graph"`` → OntologyGraphSource over the graph client."""
         config = make_config(deep_reasoning_ontology_source="graph")
@@ -314,6 +335,15 @@ class TestBuildAgenticRetriever:
         current["gid"] = "gr-new"
         assert retriever._synthesizer._effective_guardrail_id() == "gr-new"
         assert retriever._decomposer._effective_guardrail_id() == "gr-new"
+
+    def test_threads_the_served_version_reader_into_the_ontology_lookup(self, monkeypatch):
+        monkeypatch.setenv("ENVIRONMENT", "local")
+        config = make_config(neptune_endpoint="", opensearch_endpoint="", deep_reasoning_ontology_source="graph")
+        reader = object()
+
+        retriever = build_agentic_retriever(config, make_clients(), FakeStepPlanner(), served_versions=reader)
+
+        assert retriever._registry.get(ONTOLOGY_TOOL)._served_versions is reader
 
 
 # ── lazy-import invariant (Req 12.3) ───────────────────────────────

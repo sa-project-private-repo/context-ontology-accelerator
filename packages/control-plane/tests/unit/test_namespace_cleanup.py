@@ -241,6 +241,30 @@ class TestDeleteAllOntologies:
         with pytest.raises(URLError):
             cleanup.delete_all_ontologies("ns-123")
 
+    def test_the_teardown_call_carries_no_principal_header(self, monkeypatch):
+        """The engine allows a namespace-wide delete only without ``X-Coa-Principal``.
+
+        The API proxy sets that header on every public call; this internal call must not.
+        """
+        from coa_control_plane.namespace import cleanup
+
+        monkeypatch.setenv("ONTOLOGY_ENGINE_ENDPOINT", "http://ontology.internal")
+        sent = []
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"{}"
+
+        def _capture(req, **_k):
+            sent.append(req)
+            return response
+
+        monkeypatch.setattr(cleanup.urllib_request, "urlopen", _capture)
+
+        cleanup.delete_all_ontologies("ns-123")
+
+        (req,) = sent
+        assert req.get_method() == "DELETE" and req.full_url == "http://ontology.internal/ontologies/?namespace=ns-123"
+        assert "x-coa-principal" not in {name.lower() for name, _ in req.header_items()}
+
     def test_unconfigured_endpoint_is_still_a_noop(self, monkeypatch):
         """No endpoint configured is a deployment shape, not a teardown failure."""
         from coa_control_plane.namespace import cleanup
@@ -248,6 +272,73 @@ class TestDeleteAllOntologies:
         monkeypatch.delenv("ONTOLOGY_ENGINE_ENDPOINT", raising=False)
 
         cleanup.delete_all_ontologies("ns-123")  # must not raise
+
+    def test_the_teardown_call_outlasts_the_wait_for_a_stopped_abox_build(self, monkeypatch):
+        """The engine waits for a domain ABox build it stopped (up to its 150 s MOVE wait) before the
+        teardown's own work, which the earlier 120 s timeout was sized for."""
+        from coa_control_plane.namespace import cleanup
+
+        monkeypatch.setenv("ONTOLOGY_ENGINE_ENDPOINT", "http://ontology.internal")
+        timeouts = []
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"{}"
+
+        def _capture(req, timeout=None):
+            timeouts.append(timeout)
+            return response
+
+        monkeypatch.setattr(cleanup.urllib_request, "urlopen", _capture)
+
+        cleanup.delete_all_ontologies("ns-123")
+
+        assert timeouts[0] >= 150 + 120
+
+
+@pytest.mark.unit
+class TestStopDomainAboxBuilds:
+    """Stopping the ABox builds first is best-effort: DeleteOntology stops them again and waits."""
+
+    def test_posts_the_namespace_to_the_internal_teardown(self, monkeypatch):
+        from coa_control_plane.namespace import cleanup
+
+        monkeypatch.setenv("ONTOLOGY_ENGINE_ENDPOINT", "http://ontology.internal")
+        sent = []
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"stopped": true}'
+
+        def _capture(req, **_k):
+            sent.append(req)
+            return response
+
+        monkeypatch.setattr(cleanup.urllib_request, "urlopen", _capture)
+
+        cleanup.stop_domain_abox_builds("ns-123")
+
+        (req,) = sent
+        assert req.get_method() == "POST" and req.full_url == "http://ontology.internal/internal/abox/teardown"
+        assert json.loads(req.data) == {"namespace": "ns-123"}
+        assert "x-coa-principal" not in {name.lower() for name, _ in req.header_items()}
+
+    def test_a_failure_is_logged_not_raised(self, monkeypatch):
+        from urllib.error import URLError
+
+        from coa_control_plane.namespace import cleanup
+
+        monkeypatch.setenv("ONTOLOGY_ENGINE_ENDPOINT", "http://ontology.internal")
+
+        def _raise(*_a, **_k):
+            raise URLError("unreachable")
+
+        monkeypatch.setattr(cleanup.urllib_request, "urlopen", _raise)
+
+        cleanup.stop_domain_abox_builds("ns-123")  # must not raise
+
+    def test_unconfigured_endpoint_is_a_noop(self, monkeypatch):
+        from coa_control_plane.namespace import cleanup
+
+        monkeypatch.delenv("ONTOLOGY_ENGINE_ENDPOINT", raising=False)
+
+        cleanup.stop_domain_abox_builds("ns-123")  # must not raise
 
 
 @pytest.mark.unit
@@ -372,3 +463,24 @@ class TestDeleteSourcesStepDropsGraphragIndexes:
         assert order == ["delete_source", "drop_indexes"], "indexes must drop AFTER sources"
         assert result["sourcesDeleted"] == 1
         assert result["graphragIndexesDeleted"] == ["chunk_x"]
+
+    def test_abox_builds_are_stopped_before_the_first_source_delete(self, monkeypatch):
+        """Each document source delete starts a deletion pipeline that ends by requesting a domain ABox
+        build; stopped first, none of those starts a build on the namespace being torn down."""
+        from coa_control_plane.namespace.deletion_pipeline import delete_sources
+
+        order: list[str] = []
+
+        def _fake_invoke(event):
+            if event["httpMethod"] == "GET":
+                return {"statusCode": 200, "body": json.dumps({"items": [{"sourceId": "s-1"}]})}
+            order.append("delete_source")
+            return {"statusCode": 202}
+
+        monkeypatch.setattr(delete_sources, "_invoke_sources_api", _fake_invoke)
+        monkeypatch.setattr(delete_sources, "stop_domain_abox_builds", lambda ns: order.append(f"stop_abox {ns}"))
+        monkeypatch.setattr(delete_sources, "delete_graphrag_indexes", lambda ns: [])
+
+        delete_sources.handler({"namespaceId": "ns-1"}, None)
+
+        assert order == ["stop_abox ns-1", "delete_source"]

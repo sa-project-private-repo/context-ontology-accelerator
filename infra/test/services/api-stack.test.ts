@@ -180,6 +180,61 @@ describe("ApiStack WAF WebACL", () => {
     expect(size).toBeLessThan(900 * 1024);
   });
 
+  it("inlines the spec without modelled examples or operation and schema descriptions", () => {
+    // Examples and the operation and schema descriptions are left out to keep
+    // the template under its size budget; API Gateway uses none of them for
+    // routing or validation, and the generated openapi.json (the API
+    // reference) keeps them all.
+    const body = Object.values(
+      mkApi().findResources("AWS::ApiGateway::RestApi"),
+    )[0].Properties.Body;
+    const operations = Object.values<Record<string, Record<string, unknown>>>(
+      body.paths,
+    ).flatMap((methods) => Object.values(methods));
+    const parameters = operations.flatMap(
+      (op) => (op.parameters as Record<string, unknown>[] | undefined) ?? [],
+    );
+    const mediaTypes = operations.flatMap((op) => {
+      const contents = [
+        (
+          op.requestBody as
+            | { content?: Record<string, Record<string, unknown>> }
+            | undefined
+        )?.content,
+        ...Object.values(
+          (op.responses as
+            | Record<
+                string,
+                { content?: Record<string, Record<string, unknown>> }
+              >
+            | undefined) ?? {},
+        ).map((r) => r.content),
+      ];
+      return contents.flatMap((c) =>
+        Object.values<Record<string, unknown>>(c ?? {}),
+      );
+    });
+    expect(parameters.length).toBeGreaterThan(0);
+    expect(mediaTypes.length).toBeGreaterThan(0);
+    for (const holder of [...parameters, ...mediaTypes]) {
+      expect("examples" in holder || "example" in holder).toBe(false);
+    }
+    expect(operations.some((op) => "description" in op)).toBe(false);
+    const schemas = Object.values<Record<string, unknown>>(
+      body.components.schemas,
+    );
+    expect(schemas.length).toBeGreaterThan(0);
+    expect(schemas.some((schema) => "description" in schema)).toBe(false);
+    // The API reference keeps them.
+    const reference = readOpenApiSpec(Paths.controlPlaneOpenApiSpec, {});
+    const referenced = Object.values<Record<string, Record<string, unknown>>>(
+      reference.paths,
+    ).flatMap((methods) => Object.values(methods));
+    expect(referenced.some((op) => typeof op.description === "string")).toBe(
+      true,
+    );
+  });
+
   it("auto-creates a REGIONAL WebACL with the Common Rule Set when no ARN is given", () => {
     const template = mkApi();
     template.hasResourceProperties("AWS::WAFv2::WebACL", {
@@ -625,6 +680,19 @@ describe("Data-layer API authentication", () => {
     }
     expect(unsecured).toEqual(["GET /health"]);
     expect(operations).toBeGreaterThan(50);
+  });
+
+  it("answers a CORS preflight on every path, the data layer's too", () => {
+    // The Ontology designer's Query tab calls POST /namespaces/{namespaceId}/sparql
+    // from the browser; without OPTIONS the preflight got API Gateway's 403.
+    const paths = deployed().paths as Record<string, any>;
+    const missing = Object.keys(paths).filter((p) => !paths[p].options);
+    expect(missing).toEqual([]);
+    expect(
+      paths["/namespaces/{namespaceId}/sparql"].options[
+        "x-amazon-apigateway-integration"
+      ].type,
+    ).toBe("mock");
   });
 });
 

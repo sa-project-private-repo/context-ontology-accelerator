@@ -114,14 +114,17 @@ class TestBedrockLLMClient:
     async def test_health_check_returns_error_on_failure(self):
         from coa_serve.clients.bedrock import BedrockLLMClient
 
-        mock_client = MagicMock()
-        mock_client.invoke_model.side_effect = RuntimeError("network error")
-
         client = BedrockLLMClient(region="us-east-1")
-        client._client = mock_client
+        # health_check() probes via embed(), i.e. the shared BedrockEmbedder (its
+        # own boto client), so fail THAT boundary: mocking client._client leaves
+        # a real Bedrock call that returns "ok" wherever credentials are valid.
+        client._embedder = MagicMock()
+        client._embedder.embed_query.side_effect = RuntimeError("network error")
+
         result = await client.health_check()
         assert result["status"] == "error"
         assert result["detail"] == "Health check failed"
+        client._embedder.embed_query.assert_called_once_with("health")
 
     async def test_close_cleans_up_client(self):
         from coa_serve.clients.bedrock import BedrockLLMClient

@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import json
+import re
 from unittest.mock import MagicMock, patch
 from urllib.error import URLError
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import pytest
 
@@ -385,6 +387,14 @@ class TestHandler:
 class TestSystemHealth:
     """Test /system-health endpoint security — no infrastructure details leak on error."""
 
+    @pytest.fixture(autouse=True)
+    def _engine_unreachable(self):
+        """Keep the ontology-engine /readiness probe off the network (tests may override)."""
+        from urllib.error import URLError
+
+        with patch("urllib.request.urlopen", side_effect=URLError("unreachable")):
+            yield
+
     @patch("boto3.client")
     @patch("coa_ontology.api_proxy_handler.resolve_region", return_value="us-east-1")
     def test_dynamodb_error_returns_opaque_message(self, mock_region, mock_boto_client, mod, monkeypatch):
@@ -563,7 +573,12 @@ class TestCorsHeaders:
 
     def test_cors_header_in_system_health_response(self, mod):
         """Test that system-health endpoint also uses configured CORS headers."""
-        with patch("boto3.client") as mock_boto:
+        from urllib.error import URLError
+
+        with (
+            patch("boto3.client") as mock_boto,
+            patch("urllib.request.urlopen", side_effect=URLError("unreachable")),
+        ):
             mock_ddb = MagicMock()
             mock_ddb.describe_table.return_value = {"Table": {"TableStatus": "ACTIVE"}}
             mock_boto.return_value = mock_ddb
@@ -634,3 +649,386 @@ class TestNamespaceIdValidation:
         }
         assert mod.handler(event, None)["statusCode"] == 400
         mock_urlopen.assert_not_called()
+
+
+_VERSIONS_NS = "44444444-4444-4444-8444-444444444444"
+
+
+class TestVersionRoutes:
+    @pytest.mark.parametrize(
+        ("resource", "backend"),
+        [
+            ("/namespaces/{namespaceId}/ontology/versions", "/ontology/versions"),
+            ("/namespaces/{namespaceId}/ontology/versions/{version}", "/ontology/versions/{version}"),
+            ("/namespaces/{namespaceId}/ontology/versions/{version}/deploy", "/ontology/versions/{version}/deploy"),
+            ("/namespaces/{namespaceId}/ontology/deployments/{deploymentId}", "/ontology/deployments/{deploymentId}"),
+        ],
+    )
+    def test_version_paths_are_mapped(self, mod, resource, backend):
+        assert mod._PATH_MAP[resource] == backend
+
+    @staticmethod
+    def _deploy_event(**overrides) -> dict:
+        event = {
+            "httpMethod": "POST",
+            "resource": "/namespaces/{namespaceId}/ontology/versions/{version}/deploy",
+            "pathParameters": {"namespaceId": _VERSIONS_NS, "version": "3"},
+            "queryStringParameters": {},
+            "requestContext": {"authorizer": {"principalId": "alice@example.com"}},
+            "body": "{}",
+        }
+        event.update(overrides)
+        return event
+
+    @staticmethod
+    def _stub_urlopen(mock_urlopen) -> None:
+        resp = MagicMock(status=202)
+        resp.read.return_value = b'{"deploymentId": "d"}'
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = resp
+
+    @patch("urllib.request.urlopen")
+    def test_forwards_the_authorizer_principal(self, mock_urlopen, mod):
+        self._stub_urlopen(mock_urlopen)
+        mod.handler(self._deploy_event(), None)
+        req = mock_urlopen.call_args[0][0]
+        assert "/ontology/versions/3/deploy" in req.full_url
+        assert req.get_header("X-coa-principal") == "alice@example.com"
+
+    @patch("urllib.request.urlopen")
+    def test_client_supplied_principal_header_is_overwritten(self, mock_urlopen, mod):
+        self._stub_urlopen(mock_urlopen)
+        event = self._deploy_event(
+            headers={"X-Coa-Principal": "mallory@example.com", "x-coa-principal": "mallory@example.com"},
+            multiValueHeaders={"X-Coa-Principal": ["mallory@example.com"]},
+        )
+        mod.handler(event, None)
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("X-coa-principal") == "alice@example.com"
+        assert "mallory@example.com" not in str(req.header_items())
+
+    @patch("urllib.request.urlopen")
+    def test_client_supplied_principal_header_is_dropped_without_authorizer(self, mock_urlopen, mod):
+        self._stub_urlopen(mock_urlopen)
+        event = self._deploy_event(
+            headers={"X-Coa-Principal": "mallory@example.com"},
+            requestContext={},
+        )
+        mod.handler(event, None)
+        req = mock_urlopen.call_args[0][0]
+        assert not req.has_header("X-coa-principal")
+        assert "mallory@example.com" not in str(req.header_items())
+
+    @pytest.mark.parametrize(
+        ("principal", "encoded"),
+        [
+            ("alice@example.com", "alice@example.com"),
+            ("홍길동@example.com", "%ED%99%8D%EA%B8%B8%EB%8F%99@example.com"),
+            ("alice\r\nX-Evil: 1", "alice%0D%0AX-Evil%3A%201"),
+            ("alice\r\n folded", "alice%0D%0A%20folded"),
+            ("alice\x00bob", "alice%00bob"),
+            ("100%", "100%25"),
+        ],
+    )
+    @patch("urllib.request.urlopen")
+    def test_principal_is_percent_encoded_to_ascii(self, mock_urlopen, mod, principal, encoded):
+        self._stub_urlopen(mock_urlopen)
+        event = self._deploy_event(requestContext={"authorizer": {"principalId": principal}})
+        assert mod.handler(event, None)["statusCode"] == 202
+        value = mock_urlopen.call_args[0][0].get_header("X-coa-principal")
+        assert value == encoded
+        assert value.isascii() and not set(value) & {"\r", "\n", "\x00"}
+        value.encode("latin-1")  # what http.client does when it writes the header
+
+    @pytest.mark.parametrize(
+        "request_context",
+        [
+            {"authorizer": {"principalId": ""}},
+            {"authorizer": {"principalId": "   "}},
+            {"authorizer": {"principalId": "\r\n\t"}},
+            {"authorizer": {"principalId": None}},
+            {"authorizer": {}},
+            {"authorizer": None},
+            {},
+            None,
+        ],
+    )
+    @patch("urllib.request.urlopen")
+    def test_no_header_without_a_usable_principal(self, mock_urlopen, mod, request_context):
+        self._stub_urlopen(mock_urlopen)
+        assert mod.handler(self._deploy_event(requestContext=request_context), None)["statusCode"] == 202
+        assert not mock_urlopen.call_args[0][0].has_header("X-coa-principal")
+
+    @pytest.mark.parametrize(
+        ("resource", "path_params", "path"),
+        [
+            ("/namespaces/{namespaceId}/ontology/versions", {}, "/ontology/versions"),
+            ("/namespaces/{namespaceId}/ontology/versions/{version}", {"version": "3"}, "/ontology/versions/3"),
+            (
+                "/namespaces/{namespaceId}/ontology/versions/{version}/deploy",
+                {"version": "3"},
+                "/ontology/versions/3/deploy",
+            ),
+            (
+                "/namespaces/{namespaceId}/ontology/deployments/{deploymentId}",
+                {"deploymentId": "d-9"},
+                "/ontology/deployments/d-9",
+            ),
+        ],
+    )
+    @patch("urllib.request.urlopen")
+    def test_version_routes_are_forwarded_with_the_namespace(self, mock_urlopen, mod, resource, path_params, path):
+        self._stub_urlopen(mock_urlopen)
+        event = self._deploy_event(resource=resource, pathParameters={"namespaceId": _VERSIONS_NS, **path_params})
+        mod.handler(event, None)
+        assert mock_urlopen.call_args[0][0].full_url == f"{mod.ENDPOINT}{path}?namespace={_VERSIONS_NS}"
+
+    @pytest.mark.parametrize(
+        ("resource", "param", "value", "path"),
+        [
+            (
+                "/namespaces/{namespaceId}/ontology/deployments/{deploymentId}",
+                "deploymentId",
+                "x?namespace=victim&y=",
+                "/ontology/deployments/x%3Fnamespace%3Dvictim%26y%3D",
+            ),
+            (
+                "/namespaces/{namespaceId}/ontology/versions/{version}/deploy",
+                "version",
+                "3/../../graph/schema?namespace=victim#",
+                "/ontology/versions/3%2F..%2F..%2Fgraph%2Fschema%3Fnamespace%3Dvictim%23/deploy",
+            ),
+            (
+                "/namespaces/{namespaceId}/ontology/versions/{version}",
+                "version",
+                "{deploymentId}",
+                "/ontology/versions/%7BdeploymentId%7D",
+            ),
+            (
+                "/namespaces/{namespaceId}/abox/mappings/{mappingId}",
+                "mappingId",
+                "class.0123456789abcdef0123456789abcdef?namespace=victim&",
+                "/abox/mappings/class.0123456789abcdef0123456789abcdef%3Fnamespace%3Dvictim%26",
+            ),
+        ],
+    )
+    @patch("urllib.request.urlopen")
+    def test_version_path_params_cannot_inject_a_query_or_a_path(self, mock_urlopen, mod, resource, param, value, path):
+        self._stub_urlopen(mock_urlopen)
+        event = self._deploy_event(resource=resource, pathParameters={"namespaceId": _VERSIONS_NS, param: value})
+        mod.handler(event, None)
+        url = mock_urlopen.call_args[0][0].full_url
+        assert url == f"{mod.ENDPOINT}{path}?namespace={_VERSIONS_NS}"
+        assert parse_qs(urlsplit(url).query) == {"namespace": [_VERSIONS_NS]}
+
+    @patch("urllib.request.urlopen")
+    def test_other_path_params_keep_slash_and_colon_literal(self, mock_urlopen, mod):
+        self._stub_urlopen(mock_urlopen)
+        event = self._deploy_event(
+            resource="/namespaces/{namespaceId}/proposals/{proposalId}",
+            pathParameters={"namespaceId": _VERSIONS_NS, "proposalId": "p:1"},
+        )
+        mod.handler(event, None)
+        assert (
+            mock_urlopen.call_args[0][0].full_url == f"{mod.ENDPOINT}/ontology/proposals/p:1?namespace={_VERSIONS_NS}"
+        )
+
+    @patch("urllib.request.urlopen")
+    def test_a_korean_principal_round_trips_to_the_deploy_route(self, mock_urlopen, mod):
+        from coa_ontology.versions import deploy, router
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        principal = "홍길동@example.com"
+        self._stub_urlopen(mock_urlopen)
+        mod.handler(self._deploy_event(requestContext={"authorizer": {"principalId": principal}}), None)
+        sent = mock_urlopen.call_args[0][0].get_header("X-coa-principal")
+
+        app = FastAPI()
+        app.include_router(router.router, prefix="/ontology")
+        with patch.object(deploy, "start_deployment", return_value="d-9") as start:
+            r = TestClient(app).post(
+                "/ontology/versions/3/deploy", params={"namespace": "ns-1"}, headers={"X-Coa-Principal": sent}
+            )
+        assert r.status_code == 202
+        start.assert_called_once_with("ns-1", 3, requested_by=principal, acknowledged_breaking_metrics=[])
+
+    @patch("urllib.request.urlopen")
+    def test_no_principal_header_when_event_has_no_request_context(self, mock_urlopen, mod):
+        self._stub_urlopen(mock_urlopen)
+        event = self._deploy_event()
+        del event["requestContext"]
+        mod.handler(event, None)
+        assert not mock_urlopen.call_args[0][0].has_header("X-coa-principal")
+
+
+class TestPathParamEncoding:
+    """Every path param reaches the engine as one value, never as query or fragment syntax.
+
+    REST API Gateway hands ``pathParameters`` to a Lambda proxy still
+    percent-encoded, as they appeared in the request URL, and uvicorn decodes
+    the backend path exactly once before routing. So a raw value must survive
+    with a single net decode (IRIs included), and a value that arrives already
+    decoded must not add a query param, cut ``?namespace=`` off behind a ``#``,
+    or re-enter the substitution loop. ``/`` and ``:`` stay literal so an IRI
+    round-trips, except in ``_QUOTED_PATH_PARAMS``, which are encoded whole.
+    """
+
+    _PARAMS = (
+        "proposalId",
+        "jobId",
+        "ontologyId",
+        "entityUri",
+        "key",
+        "version",
+        "deploymentId",
+        "mappingId",
+        "changeSetId",
+        "questionId",
+    )
+
+    @staticmethod
+    def _forward(mod, resource: str, path_params: dict, method: str = "GET") -> str:
+        with patch("urllib.request.urlopen") as urlopen:
+            resp = MagicMock(status=200)
+            resp.read.return_value = b"{}"
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            urlopen.return_value = resp
+            mod.handler(
+                {
+                    "httpMethod": method,
+                    "resource": resource,
+                    "pathParameters": {"namespaceId": _VERSIONS_NS, **path_params},
+                    "queryStringParameters": {},
+                    "body": "",
+                },
+                None,
+            )
+        return urlopen.call_args[0][0].full_url
+
+    def _assert_forwarded_once_decoded(self, mod, param: str, sent: str, expected: str) -> None:
+        """For every route carrying ``param``: the engine binds ``expected`` and only our namespace."""
+        routes = [(r, b) for r, b in mod._PATH_MAP.items() if f"{{{param}}}" in r]
+        assert routes, param
+        for resource, backend in routes:
+            sent_params = {name: "v-1" for name in re.findall(r"\{(\w+)\}", resource) if name != "namespaceId"}
+            decoded = {**sent_params, param: expected}
+            sent_params[param] = sent
+            parts = urlsplit(self._forward(mod, resource, sent_params))
+            assert parse_qs(parts.query) == {"namespace": [_VERSIONS_NS]}, resource
+            assert parts.fragment == "", resource
+            # uvicorn's own decode: ``unquote`` of the raw path, once.
+            assert unquote(parts.path) == backend.format_map(decoded), resource
+
+    @pytest.mark.parametrize("param", _PARAMS)
+    def test_slash_and_colon_stay_literal_outside_the_quoted_params(self, mod, param):
+        routes = [r for r in mod._PATH_MAP if f"{{{param}}}" in r]
+        for resource in routes:
+            sent = {name: "v-1" for name in re.findall(r"\{(\w+)\}", resource) if name != "namespaceId"}
+            sent[param] = quote("urn:a/b", safe="")
+            path = urlsplit(self._forward(mod, resource, sent)).path
+            literal = param not in mod._QUOTED_PATH_PARAMS
+            assert ("urn:a/b" in path) is literal, resource
+            assert ("urn%3Aa%2Fb" in path) is not literal, resource
+
+    def test_every_mapped_path_param_is_covered(self, mod):
+        names = {name for resource in mod._PATH_MAP for name in re.findall(r"\{(\w+)\}", resource)}
+        assert names == {"namespaceId", *self._PARAMS}
+
+    @pytest.mark.parametrize("param", _PARAMS)
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "x?namespace=victim&y=",
+            "x#",
+            "x/../../graph/schema?namespace=victim#",
+            "{namespaceId}{jobId}",
+        ],
+    )
+    def test_a_decoded_value_cannot_inject_url_syntax(self, mod, param, value):
+        self._assert_forwarded_once_decoded(mod, param, sent=value, expected=value)
+
+    @pytest.mark.parametrize("param", _PARAMS)
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "x?namespace=victim&y=",
+            "http://example.org/onto#Class",
+            "urn:a+b;c=d@e:50%",
+            "https://例え.jp/オントロジー",
+            "already%2Fencoded",
+        ],
+    )
+    def test_a_raw_value_is_decoded_exactly_once(self, mod, param, value):
+        self._assert_forwarded_once_decoded(mod, param, sent=quote(value, safe=""), expected=value)
+
+    @pytest.mark.parametrize(
+        "iri",
+        [
+            "http://example.org/onto#Class",
+            "urn:ontology:upload-1a2b3c4d",
+            "https://example.org/a b/c?namespace=victim&x=1",
+            "https://例え.jp/オントロジー#クラス",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("method", "resource", "bound"),
+        [
+            ("GET", "/namespaces/{namespaceId}/ontologies/{ontologyId}", {"ontology_id": "ontologyId"}),
+            ("GET", "/namespaces/{namespaceId}/ontologies/{ontologyId}/download", {"ontology_id": "ontologyId"}),
+            ("POST", "/namespaces/{namespaceId}/ontologies/{ontologyId}/fetch", {"ontology_id": "ontologyId"}),
+            (
+                "POST",
+                "/namespaces/{namespaceId}/ontologies/{ontologyId}/ingest-from-s3",
+                {"ontology_id": "ontologyId"},
+            ),
+            (
+                "GET",
+                "/namespaces/{namespaceId}/ontologies/{ontologyId}/ingest-status/{jobId}",
+                {"ontology_id": "ontologyId", "job_id": "jobId"},
+            ),
+            ("GET", "/namespaces/{namespaceId}/embeddings/by-entity/{entityUri}", {"entity_uri": "entityUri"}),
+            ("GET", "/namespaces/{namespaceId}/embeddings/by-ontology/{ontologyId}", {"ontology_id": "ontologyId"}),
+        ],
+    )
+    def test_an_iri_round_trips_to_the_engine_route(self, mod, monkeypatch, method, resource, bound, iri):
+        # Keeps ``dynamo_store`` from asking STS for the account at import.
+        monkeypatch.setenv("ONTOLOGY_ARTIFACTS_BUCKET", "unit-test")
+        from coa_ontology.catalog.routers import embeddings, ontologies
+        from fastapi import FastAPI
+        from fastapi.responses import JSONResponse
+        from fastapi.testclient import TestClient
+
+        async def echo(request):
+            return JSONResponse({"path": request.path_params, "query": dict(request.query_params)})
+
+        # The engine's real route table, in registration order, with echo endpoints.
+        app = FastAPI()
+        for prefix, router in (("/ontologies", ontologies.router), ("/embeddings", embeddings.router)):
+            for route in router.routes:
+                app.add_route(prefix + route.path, echo, methods=list(route.methods))
+
+        # The web app sends ``encodeURIComponent(iri)``; API Gateway passes it on raw.
+        sent = {"ontologyId": quote(iri, safe=""), "entityUri": quote(iri, safe=""), "jobId": "j-1"}
+        parts = urlsplit(self._forward(mod, resource, sent, method=method))
+        r = TestClient(app).request(method, f"{parts.path}?{parts.query}")
+
+        assert r.json() == {
+            "path": {name: unquote(sent[param]) for name, param in bound.items()},
+            "query": {"namespace": _VERSIONS_NS},
+        }
+
+
+class TestAboxRoutes:
+    def test_abox_routes_are_mapped(self, mod):
+        assert mod._PATH_MAP["/namespaces/{namespaceId}/abox"] == "/abox"
+        assert mod._PATH_MAP["/namespaces/{namespaceId}/abox/instances"] == "/abox/instances"
+        assert mod._PATH_MAP["/namespaces/{namespaceId}/abox/instance"] == "/abox/instance"
+        assert mod._PATH_MAP["/namespaces/{namespaceId}/abox/mappings"] == "/abox/mappings"
+        assert mod._PATH_MAP["/namespaces/{namespaceId}/abox/mappings/{mappingId}"] == "/abox/mappings/{mappingId}"
+        assert mod._PATH_MAP["/namespaces/{namespaceId}/abox/rebuild"] == "/abox/rebuild"
+
+    def test_the_vpc_only_internal_route_is_not_exposed(self, mod):
+        assert not any("/internal/" in v for v in mod._PATH_MAP.values())

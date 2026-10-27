@@ -231,6 +231,17 @@ const stepFormatters: Record<string, Formatter> = {
     // Ontop SPARQL→SQL translation. On failure this is what triggers the retry.
     // Suppress a bare exception class name (no user value); the base message
     // already explains the failure.
+    // Serve refused a translation made against the mapping of another ontology
+    // version (the VKG reloads after a deploy): not a translation failure.
+    if (d.error === "vkg_version_skew") {
+      return t(
+        "The VKG still serves {vkgVersion}; the ontology is {ontologyVersion}.",
+        {
+          vkgVersion: String(d.vkgVersion ?? ""),
+          ontologyVersion: String(d.ontologyVersion ?? ""),
+        },
+      );
+    }
     if (d.error) {
       return isRawExceptionName(d.error)
         ? t("Ontop could not translate SPARQL to SQL.")

@@ -11,6 +11,7 @@ client is stubbed — no network calls.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from unittest.mock import MagicMock
 
@@ -229,6 +230,21 @@ class TestStateMachine:
         # The executor tags the result so the serve trace can report the engine.
         assert result.engine == "redshift"
 
+    async def test_the_result_names_the_statement_redshift_ran(self):
+        """The console showed the SQL from before the executor capped and rewrote it."""
+        client = MagicMock()
+        client.execute_statement.return_value = {"Id": "stmt-1"}
+        client.describe_statement.return_value = {"Status": "FINISHED"}
+        client.get_statement_result.return_value = {"ColumnMetadata": [{"label": "id"}], "Records": []}
+        ex = _make_executor(client)
+        ex._resolve_workgroup_and_database = _AsyncReturn(("my-wg", "insurance_lake"))
+
+        result = await ex.execute(
+            "SELECT id FROM claims", namespace="ns", data_source_id="src", max_rows=1001, timeout_seconds=5
+        )
+        sent = client.execute_statement.call_args.kwargs["Sql"]
+        assert result.sql == sent and "LIMIT 1001" in sent and "awsdatacatalog" in sent
+
     async def test_failed_statement_raises_query_error(self):
         client = MagicMock()
         client.execute_statement.return_value = {"Id": "stmt-2"}
@@ -249,6 +265,50 @@ class TestStateMachine:
 
         with pytest.raises(RedshiftTimeoutError):
             await ex.execute("SELECT id FROM claims", namespace="ns", data_source_id="src", timeout_seconds=1)
+
+    async def test_timeout_cancels_the_statement(self):
+        client = MagicMock()
+        client.execute_statement.return_value = {"Id": "stmt-4"}
+        client.describe_statement.return_value = {"Status": "STARTED"}
+        ex = _make_executor(client)
+        ex._resolve_workgroup_and_database = _AsyncReturn(("my-wg", "insurance_lake"))
+
+        with pytest.raises(RedshiftTimeoutError):
+            await ex.execute("SELECT id FROM claims", namespace="ns", data_source_id="src", timeout_seconds=1)
+
+        await _until(lambda: client.cancel_statement.called)
+        client.cancel_statement.assert_called_once_with(Id="stmt-4")
+
+    async def test_a_caller_that_stops_waiting_cancels_the_statement(self):
+        client = MagicMock()
+        client.execute_statement.return_value = {"Id": "stmt-5"}
+        client.describe_statement.return_value = {"Status": "STARTED"}
+        ex = _make_executor(client)
+        ex._resolve_workgroup_and_database = _AsyncReturn(("my-wg", "insurance_lake"))
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                ex.execute("SELECT id FROM claims", namespace="ns", data_source_id="src", timeout_seconds=30),
+                timeout=0.5,
+            )
+
+        await _until(lambda: client.cancel_statement.called)
+        client.cancel_statement.assert_called_once_with(Id="stmt-5")
+
+    async def test_a_finished_statement_is_not_cancelled(self):
+        client = MagicMock()
+        client.execute_statement.return_value = {"Id": "stmt-6"}
+        client.describe_statement.return_value = {"Status": "FINISHED"}
+        client.get_statement_result.return_value = {
+            "ColumnMetadata": [{"label": "id"}],
+            "Records": [[{"longValue": 1}]],
+        }
+        ex = _make_executor(client)
+        ex._resolve_workgroup_and_database = _AsyncReturn(("my-wg", "insurance_lake"))
+
+        await ex.execute("SELECT id FROM claims", namespace="ns", data_source_id="src", timeout_seconds=5)
+
+        client.cancel_statement.assert_not_called()
 
     async def test_missing_workgroup_raises_value_error(self):
         client = MagicMock()
@@ -286,3 +346,11 @@ class _AsyncReturn:
 
     async def __call__(self, *args, **kwargs):
         return self._value
+
+
+async def _until(predicate, timeout: float = 2.0) -> None:
+    """Wait for a background executor call to land (the cancel is submitted, not awaited)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate() and loop.time() < deadline:
+        await asyncio.sleep(0.02)

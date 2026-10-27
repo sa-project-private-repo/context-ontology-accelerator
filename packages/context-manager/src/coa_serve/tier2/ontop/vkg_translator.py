@@ -22,6 +22,7 @@ per-source catalog/schema lookup (athena.py ``_resolve_catalog_and_database``).
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -30,12 +31,38 @@ from typing import Any
 import structlog
 
 from ...clients.base import QueryExecutor, QueryResult
-from ...clients.vkg import SparqlProjection, VKGClient, VKGResult
+from ...clients.vkg import SparqlProjection, VKGClient, VKGResult, VKGUnavailableError
 from ...identity import display_principal
+from ...served_version import VERSION_RE, ServedVersionReader
 from ..sql_firewall import FirewallResult, SQLFirewall, tables_visible_to
 from ..table_qualifier import SourceLookup, distinct_datasources, prepare_execution_sql
 
 logger = structlog.get_logger(__name__)
+
+#: ``Tier2Result.error`` when the VKG compiled against another ontology version than
+#: the one Neptune serves (a reload still in progress, or one that failed).
+VKG_VERSION_SKEW = "vkg_version_skew"
+
+#: ``Tier2Result.error`` when the translation reads no table (:func:`reads_no_table`) and the
+#: caller asked ``resolve`` to refuse it.
+VKG_NO_MAPPING = "vkg_no_mapping"
+
+_EMPTY_PLAN = re.compile(r"^EMPTY \[", re.MULTILINE)
+
+
+def reads_no_table(vkg_result: VKGResult) -> bool:
+    """Whether the VKG answered what Ontop returns for a query that no table mapping matches.
+
+    Ontop proves such a query empty from the mappings alone. It returns its empty plan (``ans1(x)``
+    then ``EMPTY [x]``), which holds no SQL, so the VKG passes it on as it is; for an aggregate it
+    returns the one-row placeholder ``SELECT 1 AS uselessVariable FROM (SELECT 1) AS tdummy`` instead,
+    the aggregate's value a constant in its plan (both measured on Ontop 5.5.0). Neither reads a
+    table. An ``ASK`` over a mapped class also selects ``uselessVariable``, from that class's table.
+    """
+    if vkg_result.source_table_refs:
+        return False
+    sql = vkg_result.sql
+    return bool(_EMPTY_PLAN.search(sql)) or ("uselessVariable" in sql and "tdummy" in sql)
 
 
 class Tier2Step(StrEnum):
@@ -78,9 +105,10 @@ class Tier2Result:
     firewall_result: FirewallResult | None = None
     trace_steps: list[TraceStep] = field(default_factory=list)
     error: str | None = None
-    #: The statement actually handed to the executor — i.e. ``vkg_result.sql`` after
-    #: the firewall's rewrite AND cross-source qualification. Distinct from
-    #: ``vkg_result.sql``, which is Ontop's raw translate output. Reporting the raw
+    #: The statement that ran: the executor's own when it reports one (with the row cap,
+    #: dialect and table names it applied), else the one handed to it — i.e.
+    #: ``vkg_result.sql`` after the firewall's rewrite AND cross-source qualification.
+    #: Distinct from ``vkg_result.sql``, which is Ontop's raw translate output. Reporting the raw
     #: form as ``queryUsed`` is actively misleading after the cross-source fix: a cross-source
     #: statement's bare table names cannot resolve under any single
     #: ``QueryExecutionContext``, so the SQL shown to an operator is one that
@@ -102,6 +130,7 @@ class VKGTranslator:
         firewall: SQLFirewall,
         query_executor: QueryExecutor,
         sources_registry: SourceLookup | None = None,
+        served_versions: ServedVersionReader | None = None,
     ):
         """Configure the VKG endpoint, firewall, and query executor.
 
@@ -117,11 +146,15 @@ class VKGTranslator:
                 than left bare, so a wiring mistake in ``dependencies.py`` fails
                 type-check instead of surfacing as a runtime AttributeError on
                 the first cross-source query.
+            served_versions: Optional reader of the ontology version Neptune serves.
+                When wired, a translation compiled against another version is
+                refused (see :meth:`_version_skew`); without it nothing is compared.
         """
         self._vkg_endpoint = vkg_endpoint
         self._firewall = firewall
         self._executor = query_executor
         self._sources = sources_registry
+        self._served_versions = served_versions
         self._clients: dict[str, VKGClient] = {}
 
     _MAX_CACHED_CLIENTS = 64
@@ -157,6 +190,8 @@ class VKGTranslator:
         profile: dict[str, Any] | None = None,
         max_rows: int = 1000,
         timeout_seconds: int = 60,
+        trace_steps: list[TraceStep] | None = None,
+        refuse_without_table: bool = False,
     ) -> Tier2Result:
         """Run the full Tier 2 pipeline: translate -> firewall -> execute.
 
@@ -167,14 +202,23 @@ class VKGTranslator:
             profile: Caller's authorization profile for firewall evaluation.
             max_rows: Maximum result rows.
             timeout_seconds: Query execution timeout.
+            trace_steps: A list the steps are appended to as each one finishes, so that a caller
+                that stops waiting can tell how far the query got. A new one by default.
+            refuse_without_table: Stop with ``vkg_no_mapping`` when the translation reads no
+                table (:func:`reads_no_table`), before the firewall and the executor. The query
+                console asks for it; the Tier 2 strategies keep handling both answers themselves.
 
         Returns:
-            Tier2Result with query results or error information.
+            Tier2Result with query results or error information; ``error`` is ``vkg_unavailable``
+            when the VKG could not be reached or was not ready, ``vkg_translation_error`` when
+            it could not translate the query, ``vkg_version_skew`` when it translated
+            against another ontology version than the one Neptune serves, and ``vkg_no_mapping``
+            as ``refuse_without_table`` says.
         """
         from ...query_utils import validate_namespace
 
         validate_namespace(namespace)
-        trace: list[TraceStep] = []
+        trace: list[TraceStep] = [] if trace_steps is None else trace_steps
 
         # Step 1: VKG Translation (SPARQL -> SQL)
         start = time.perf_counter()
@@ -183,6 +227,7 @@ class VKGTranslator:
         try:
             vkg_client = self._resolve_client(namespace)
             vkg_result = await vkg_client.translate(sparql, namespace=namespace)
+            compile_ms = int((time.perf_counter() - start) * 1000)
             routing = vkg_result.datasource_routing or {}
             routing_sources = sorted({v.get("datasourceId", "") for v in routing.values()} - {""})
             # No SQL text: the compiled SQL carries query-time literal values
@@ -193,15 +238,17 @@ class VKGTranslator:
                 routing_tables=len(vkg_result.datasource_routing),
                 routing_sources=routing_sources,
             )
+            skew = await self._version_skew(namespace, vkg_result.ontology_version)
             trace.append(
                 TraceStep(
                     step=Tier2Step.VKG_COMPILE,
-                    status=Tier2Status.OK,
-                    duration_ms=int((time.perf_counter() - start) * 1000),
+                    status=Tier2Status.ERROR if skew else Tier2Status.OK,
+                    duration_ms=compile_ms,
                     # Recorded before the firewall runs, and replayed into the
                     # client-visible trace on non-deny error paths too, so list
                     # only the tables the grant's ``tableAllowlist`` permits.
-                    detail={
+                    detail=skew
+                    or {
                         "dialect": vkg_result.dialect,
                         "tables": tables_visible_to(vkg_result.source_table_refs, profile),
                     },
@@ -216,7 +263,17 @@ class VKGTranslator:
                     detail={"error": type(e).__name__},
                 )
             )
-            return Tier2Result(query_result=None, trace_steps=trace, error="vkg_translation_error")
+            error = "vkg_unavailable" if isinstance(e, VKGUnavailableError) else "vkg_translation_error"
+            return Tier2Result(query_result=None, trace_steps=trace, error=error)
+
+        if skew:
+            # Not a SPARQL problem, so not worth a retry: the SQL was compiled against
+            # another mapping and runs nowhere, and Ontop's next answer is the same.
+            return Tier2Result(query_result=None, vkg_result=vkg_result, trace_steps=trace, error=VKG_VERSION_SKEW)
+
+        if refuse_without_table and reads_no_table(vkg_result):
+            # Ontop answered from the mappings alone: there is no SQL to authorize or run.
+            return Tier2Result(query_result=None, vkg_result=vkg_result, trace_steps=trace, error=VKG_NO_MAPPING)
 
         if vkg_result.ontology_version == "unknown":
             logger.warning(
@@ -325,6 +382,8 @@ class VKGTranslator:
             # guard is observable from the trace on the ontop path too — the
             # nl_to_sql path already records it.
             executed_engine = getattr(query_result, "engine", "") or "unknown"
+            # The engine's own statement, captured before projection for the same reason.
+            executed_sql = getattr(query_result, "sql", "") or authorized_sql
             # Project raw SQL result to SPARQL solution (if projection metadata available)
             if vkg_result.projection:
                 query_result = self._project_to_sparql(query_result, vkg_result.projection)
@@ -355,7 +414,9 @@ class VKGTranslator:
                 vkg_result=vkg_result,
                 firewall_result=fw_result,
                 trace_steps=trace,
-                error="query_execution_error",
+                # The executors' own deadlines raise TimeoutError subclasses; keeping
+                # them apart lets the caller answer "too slow" rather than "failed".
+                error="query_timeout" if isinstance(e, TimeoutError) else "query_execution_error",
             )
 
         return Tier2Result(
@@ -363,8 +424,42 @@ class VKGTranslator:
             vkg_result=vkg_result,
             firewall_result=fw_result,
             trace_steps=trace,
-            executed_sql=authorized_sql,
+            executed_sql=executed_sql,
         )
+
+    async def _version_skew(self, namespace: str, vkg_version: str) -> dict[str, str] | None:
+        """Return the trace detail of a version skew, or ``None`` when there is none to report.
+
+        After a deploy the VKG task reloads on its own while Neptune already serves
+        the new version, and after a failed reload the old task keeps serving. The
+        VKG reports the ``owl:versionInfo`` of the ontology it loaded.
+        Compared only when both sides name one published version (``vN``): the VKG
+        may report ``unknown``, ``none`` or ``latest``, a namespace accepted before
+        versions has none, and a failed read of Neptune decides nothing. A mismatch
+        with the kept read is confirmed on a fresh one, since the VKG can finish
+        reloading before a read from before the deploy expires. Never raises.
+        """
+        if self._served_versions is None or not VERSION_RE.match(vkg_version or ""):
+            return None
+        try:
+            served = await self._served_versions.versions(namespace)
+            if len(served) == 1 and vkg_version not in served:
+                served = await self._served_versions.versions(namespace, fresh=True)
+        except Exception as e:  # noqa: BLE001 - an unreadable version must not fail the query
+            logger.warning("vkg_version_check_skipped", namespace=namespace, error=type(e).__name__)
+            return None
+        if len(served) != 1 or vkg_version in served:
+            return None
+        (ontology_version,) = served
+        logger.warning(
+            "vkg_version_skew", namespace=namespace, vkg_version=vkg_version, ontology_version=ontology_version
+        )
+        return {
+            "error": VKG_VERSION_SKEW,
+            "reason": f"The VKG still serves {vkg_version}; the ontology is {ontology_version}.",
+            "vkgVersion": vkg_version,
+            "ontologyVersion": ontology_version,
+        }
 
     def _resolve_data_source(self, explicit_id: str, vkg_result: VKGResult) -> str:
         """Determine which data source to execute against.

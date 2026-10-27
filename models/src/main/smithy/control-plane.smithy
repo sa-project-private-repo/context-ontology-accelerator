@@ -11,6 +11,13 @@ use aws.protocols#restJson1
 use com.amazon.semanticcontext.common#InternalServerError
 use com.amazon.semanticcontext.common#ServiceUnavailableError
 use com.amazon.semanticcontext.common#ValidationError
+use com.amazon.semanticcontext.domainabox#GetDomainAbox
+use com.amazon.semanticcontext.domainabox#GetDomainInstance
+use com.amazon.semanticcontext.domainabox#ListAboxMappings
+use com.amazon.semanticcontext.domainabox#ListDomainInstances
+use com.amazon.semanticcontext.domainabox#RebuildDomainAbox
+use com.amazon.semanticcontext.domainabox#ResetAboxMapping
+use com.amazon.semanticcontext.domainabox#UpdateAboxMapping
 use com.amazon.semanticcontext.grant#CreateGrant
 use com.amazon.semanticcontext.grant#CreatePlatformGrant
 use com.amazon.semanticcontext.grant#DeleteGrant
@@ -18,6 +25,29 @@ use com.amazon.semanticcontext.grant#DeletePlatformGrant
 use com.amazon.semanticcontext.grant#ListNamespaceGrants
 use com.amazon.semanticcontext.grant#ListPlatformGrants
 use com.amazon.semanticcontext.grant#ListPrincipalGrants
+use com.amazon.semanticcontext.graphstudio#ApplyStudioChangeSet
+use com.amazon.semanticcontext.graphstudio#ApplyStudioChanges
+use com.amazon.semanticcontext.graphstudio#CheckStudioQuestion
+use com.amazon.semanticcontext.graphstudio#DeleteStudioQuestion
+use com.amazon.semanticcontext.graphstudio#DiscardStudioChangeSet
+use com.amazon.semanticcontext.graphstudio#GetStudioAcceptPreview
+use com.amazon.semanticcontext.graphstudio#GetStudioChecks
+use com.amazon.semanticcontext.graphstudio#GetStudioDraft
+use com.amazon.semanticcontext.graphstudio#GetStudioGraph
+use com.amazon.semanticcontext.graphstudio#GetStudioTerm
+use com.amazon.semanticcontext.graphstudio#ListStudioChangeSets
+use com.amazon.semanticcontext.graphstudio#ListStudioEvents
+use com.amazon.semanticcontext.graphstudio#ListStudioHistory
+use com.amazon.semanticcontext.graphstudio#ListStudioQuestions
+use com.amazon.semanticcontext.graphstudio#OpenStudioDraft
+use com.amazon.semanticcontext.graphstudio#PreviewStudioChangeSet
+use com.amazon.semanticcontext.graphstudio#PutStudioQuestion
+use com.amazon.semanticcontext.graphstudio#RebaseStudioDraft
+use com.amazon.semanticcontext.graphstudio#RedoStudioChange
+use com.amazon.semanticcontext.graphstudio#RunStudioQuery
+use com.amazon.semanticcontext.graphstudio#SearchStudioTerms
+use com.amazon.semanticcontext.graphstudio#SendStudioMessage
+use com.amazon.semanticcontext.graphstudio#UndoStudioChange
 use com.amazon.semanticcontext.metric#BulkDeleteMetrics
 use com.amazon.semanticcontext.metric#CreateMetric
 use com.amazon.semanticcontext.metric#DeleteMetric
@@ -36,6 +66,7 @@ use com.amazon.semanticcontext.namespace#ListNamespaces
 use com.amazon.semanticcontext.namespace#UpdateNamespace
 use com.amazon.semanticcontext.namespace#UpdateNamespaceStatus
 use com.amazon.semanticcontext.ontologygraph#DeleteOntology
+use com.amazon.semanticcontext.ontologygraph#DeployOntologyVersion
 use com.amazon.semanticcontext.ontologygraph#DownloadOntology
 use com.amazon.semanticcontext.ontologygraph#FetchOntology
 use com.amazon.semanticcontext.ontologygraph#GetGraphClass
@@ -43,11 +74,14 @@ use com.amazon.semanticcontext.ontologygraph#GetGraphDatatypeProperty
 use com.amazon.semanticcontext.ontologygraph#GetGraphObjectProperty
 use com.amazon.semanticcontext.ontologygraph#GetIngestStatus
 use com.amazon.semanticcontext.ontologygraph#GetOntology
+use com.amazon.semanticcontext.ontologygraph#GetOntologyDeployment
 use com.amazon.semanticcontext.ontologygraph#GetOntologyOverview
 use com.amazon.semanticcontext.ontologygraph#GetOntologyUploadUrl
+use com.amazon.semanticcontext.ontologygraph#GetOntologyVersion
 use com.amazon.semanticcontext.ontologygraph#GraphSearch
 use com.amazon.semanticcontext.ontologygraph#IngestOntologyFromS3
 use com.amazon.semanticcontext.ontologygraph#ListOntologies
+use com.amazon.semanticcontext.ontologygraph#ListOntologyVersions
 use com.amazon.semanticcontext.ontologygraph#UploadOntology
 use com.amazon.semanticcontext.ontologyinduction#AcceptProposal
 use com.amazon.semanticcontext.ontologyinduction#CancelProposal
@@ -220,6 +254,45 @@ service ControlPlaneService {
         GetGraphObjectProperty
         GetGraphDatatypeProperty
         GetOntologyOverview
+        // ── Ontology versions ───────────────────────────────────────────
+        ListOntologyVersions
+        GetOntologyVersion
+        DeployOntologyVersion
+        GetOntologyDeployment
+        // ── Domain ABox ─────────────────────────────────────────────────
+        GetDomainAbox
+        ListDomainInstances
+        GetDomainInstance
+        ListAboxMappings
+        UpdateAboxMapping
+        ResetAboxMapping
+        RebuildDomainAbox
+        // ── Ontology designer ──────────────────────────────────────
+        OpenStudioDraft
+        GetStudioDraft
+        GetStudioGraph
+        GetStudioTerm
+        SearchStudioTerms
+        ApplyStudioChanges
+        UndoStudioChange
+        RedoStudioChange
+        ListStudioHistory
+        RebaseStudioDraft
+        GetStudioAcceptPreview
+        // ── Ontology designer assistant ────────────────────────────
+        SendStudioMessage
+        ListStudioEvents
+        ListStudioChangeSets
+        PreviewStudioChangeSet
+        ApplyStudioChangeSet
+        DiscardStudioChangeSet
+        // ── Ontology designer checks, queries and questions ────────
+        GetStudioChecks
+        RunStudioQuery
+        ListStudioQuestions
+        PutStudioQuestion
+        DeleteStudioQuestion
+        CheckStudioQuestion
     ]
     errors: [
         ValidationError

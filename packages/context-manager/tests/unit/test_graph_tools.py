@@ -15,6 +15,7 @@ import re
 from unittest.mock import MagicMock
 
 import pytest
+from coa_serve.query_utils import namespace_graph_prefix
 from coa_serve.tier2.tools import graph_tools
 from coa_serve.tier2.tools.graph_tools import (
     MAX_HOPS,
@@ -23,6 +24,9 @@ from coa_serve.tier2.tools.graph_tools import (
     _build_adjacency,
     _normalize_node_types,
 )
+from rdflib import OWL, RDF, RDFS, Literal, URIRef
+
+from . import deployed_graph
 
 NS = "11111111-1111-1111-1111-111111111111"
 TEMPLATE = "https://ontology-workbench.local/{namespace}"
@@ -409,3 +413,322 @@ class TestGraphScoping:
 
         for sparql in graph.calls:
             assert "INSERT" not in sparql
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestUnmappedPropertiesAreNotWalked:
+    """A relationship or column the designer added to a mapped class has no join or column.
+
+    Deploy marks it ``coa:isMapped false``; the walk must not hop it (it would hand the
+    SQL writer a class with no table as one) nor list it as a column. Run against the
+    deployed graph through the real Neptune client, not the dispatching mock above.
+    """
+
+    @staticmethod
+    def _walker(**dataset_kwargs) -> OntologyGraphTool:
+        graph = deployed_graph.neptune_over(deployed_graph.designer_v2_dataset(**dataset_kwargs))
+        return OntologyGraphTool(graph, None, namespace=deployed_graph.NS, graph_uri_template=deployed_graph.TEMPLATE)
+
+    async def test_a_relationship_marked_unmapped_is_not_hopped(self):
+        reached = await self._walker().expand_from([deployed_graph.CUSTOMERS])
+
+        # The foreign key still joins the orders; "in segment" reaches no table.
+        assert [t["iri"] for t in reached] == [deployed_graph.PURCHASE_ORDER]
+        assert "orders.customer_id" in reached[0]["via"]
+
+    async def test_without_property_markers_the_walk_is_today_s(self):
+        reached = await self._walker(property_markers=False).expand_from([deployed_graph.CUSTOMERS])
+
+        assert {t["iri"] for t in reached} == {
+            deployed_graph.PURCHASE_ORDER,
+            deployed_graph.CUSTOMER_SEGMENT,
+            deployed_graph.LOYALTY_PROGRAMME,
+        }
+
+    async def test_a_column_marked_unmapped_is_not_in_the_reached_schema(self):
+        reached = await self._walker().expand_from([deployed_graph.PURCHASE_ORDER])
+        unmarked = await self._walker(property_markers=False).expand_from([deployed_graph.PURCHASE_ORDER])
+
+        assert [t["iri"] for t in reached] == [deployed_graph.CUSTOMERS]
+        assert "loyalty tier" not in reached[0]["schema"]
+        assert "email" in reached[0]["schema"]
+        assert "loyalty tier" in unmarked[0]["schema"]
+
+    async def test_explore_graph_lists_neither(self):
+        result = await self._walker().explore_graph("client", hops=1)
+
+        assert {t["table"] for t in result["tables"]} == {"customers", "orders"}
+        assert "loyalty tier" not in {c["column"] for c in result["columns"]}
+
+    async def test_a_marked_relationship_into_a_mapped_class_is_not_hopped_back(self):
+        """A relationship from a designer class with no table to a mapped class, walked from its range.
+
+        The walk follows edges in both directions, so it would reach ``Loyalty
+        programme`` from ``Customers`` over ``member``. Deploy marks a relationship whose
+        range is a mapped class and that no join maps, as it marks one whose domain is,
+        so the walk drops the edge from this end too.
+        """
+        walker = self._walker()
+        unmarked = await self._walker(property_markers=False).expand_from([deployed_graph.CUSTOMERS])
+
+        reached = await walker.expand_from([deployed_graph.CUSTOMERS])
+        explored = await walker.explore_graph("client", hops=1)
+
+        assert deployed_graph.LOYALTY_PROGRAMME in {t["iri"] for t in unmarked}
+        assert [t["iri"] for t in reached] == [deployed_graph.PURCHASE_ORDER]
+        assert {t["table"] for t in explored["tables"]} == {"customers", "orders"}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestPhysicalNames:
+    """Deploy names a mapped table or column by the R2RML (``coa:physicalName``); the walk tells the writer that name.
+
+    The deployed graph's ``Customers`` is the table ``customers``, relabelled ``Client`` in
+    the Ontology designer. Run through the real Neptune client over that graph.
+    """
+
+    @staticmethod
+    def _walker(ds=None, **dataset_kwargs) -> OntologyGraphTool:
+        graph = deployed_graph.neptune_over(ds or deployed_graph.designer_v2_dataset(**dataset_kwargs))
+        return OntologyGraphTool(graph, None, namespace=deployed_graph.NS, graph_uri_template=deployed_graph.TEMPLATE)
+
+    async def test_a_relabelled_table_is_walked_by_its_table_name_with_the_label_as_a_hint(self):
+        reached = await self._walker().expand_from([deployed_graph.PURCHASE_ORDER])
+
+        assert reached == [
+            {
+                "iri": deployed_graph.CUSTOMERS,
+                "table": "customers",
+                "hop": 1,
+                "direction": "outgoing",
+                "via": "Foreign key: orders.customer_id references customers.id",
+                "schema": "Table: customers (label: Client) | Columns: id:integer, name:string, email:string",
+                "table_label": "Client",
+            }
+        ]
+
+    async def test_explore_graph_names_the_table_and_finds_a_seed_by_that_name(self):
+        result = await self._walker().explore_graph("customers", hops=1, node_types=["table"])
+
+        assert result["seed_matched_classes"] == 1
+        assert result["tables"] == [
+            {"table": "customers", "hop": 0, "direction": "seed", "via": "", "table_label": "Client"},
+            {
+                "table": "orders",
+                "hop": 1,
+                "direction": "incoming",
+                "via": "Foreign key: orders.customer_id references customers.id",
+            },
+        ]
+
+    async def test_a_seed_named_by_its_label_still_resolves(self):
+        result = await self._walker().explore_graph("Client", hops=1, node_types=["table"])
+
+        assert result["seed_matched_classes"] == 1
+        assert result["tables"][0]["table"] == "customers"
+
+    async def test_a_table_its_label_and_its_name_both_match_is_one_seed(self):
+        # orders is labelled by its table name, as every table nobody relabelled is.
+        result = await self._walker().explore_graph("orders", hops=1, node_types=["table"])
+
+        assert result["seed_matched_classes"] == 1
+
+    async def test_a_label_match_comes_before_a_class_only_its_table_name_matches(self):
+        """Neptune returns the rows in no set order, so the lookup orders them itself."""
+        ds = deployed_graph.designer_v2_dataset()
+        graph = ds.graph(URIRef(deployed_graph.GRAPH))
+        labelled = URIRef(deployed_graph.PREFIX + "CustomersArchive")  # labelled customers, named after no table
+        graph.add((labelled, RDF.type, OWL.Class))
+        graph.add((labelled, RDFS.label, Literal("customers")))
+        client = deployed_graph.neptune_over(ds)
+        real_query = client.query
+
+        async def name_matches_first(sparql, **kwargs):
+            return sorted(await real_query(sparql, **kwargs), key=lambda row: not row.get("byName"))
+
+        client.query = name_matches_first  # type: ignore[method-assign]
+        walker = OntologyGraphTool(
+            client, None, namespace=deployed_graph.NS, graph_uri_template=deployed_graph.TEMPLATE
+        )
+        prefix = namespace_graph_prefix(deployed_graph.TEMPLATE, deployed_graph.NS)
+
+        assert await walker._resolve_label_to_iris(prefix, "customers") == [str(labelled), deployed_graph.CUSTOMERS]
+
+    async def test_a_relabelled_column_keeps_its_column_name_with_the_label_as_a_hint(self):
+        ds = deployed_graph.designer_v2_dataset()
+        email = URIRef(deployed_graph.PREFIX + "customers_email")
+        ds.graph(URIRef(deployed_graph.GRAPH)).set((email, RDFS.label, Literal("E-mail address")))
+        walker = self._walker(ds)
+
+        reached = await walker.expand_from([deployed_graph.PURCHASE_ORDER])
+        explored = await walker.explore_graph("customers", hops=1, node_types=["column"])
+
+        assert reached[0]["schema"] == (
+            "Table: customers (label: Client) | Columns: id:integer, name:string, email:string [label: E-mail address]"
+        )
+        assert {"table": "customers", "column": "email", "type": "string", "column_label": "E-mail address"} in (
+            explored["columns"]
+        )
+
+    async def test_a_namespace_without_physical_names_is_walked_byte_for_byte_as_before(self):
+        """What the walk returned before deploy wrote ``coa:physicalName``, recorded from that build."""
+        walker = self._walker(physical_names=False)
+        fk = "Foreign key: orders.customer_id references customers.id"
+
+        assert await walker.expand_from([deployed_graph.PURCHASE_ORDER]) == [
+            {
+                "iri": deployed_graph.CUSTOMERS,
+                "table": "Client",
+                "hop": 1,
+                "direction": "outgoing",
+                "via": fk,
+                "schema": "Table: Client | Columns: id:integer, name:string, email:string",
+            }
+        ]
+        assert await walker.explore_graph("client", hops=1) == {
+            "seed": "client",
+            "seed_matched_classes": 1,
+            "hops": 1,
+            "node_types": ["table", "column"],
+            "tables": [
+                {"table": "Client", "hop": 0, "direction": "seed", "via": ""},
+                {"table": "orders", "hop": 1, "direction": "incoming", "via": fk},
+            ],
+            "columns": [
+                {"table": "Client", "column": "id", "type": "integer"},
+                {"table": "Client", "column": "name", "type": "string"},
+                {"table": "Client", "column": "email", "type": "string"},
+                {"table": "orders", "column": "id", "type": "integer"},
+                {"table": "orders", "column": "status", "type": "string"},
+                {"table": "orders", "column": "total_amount", "type": "double"},
+            ],
+            "total_nodes_found": 8,
+            "returned_nodes": 8,
+            "truncated": False,
+        }
+
+    async def test_the_table_names_come_with_the_edges(self):
+        """The walk reads each end's table name in its edge query, so naming a reached table costs no query."""
+        client = deployed_graph.neptune_over(deployed_graph.designer_v2_dataset())
+        sent: list[str] = []
+        real_query = client.query
+
+        async def query(sparql, **kwargs):
+            sent.append(sparql)
+            return await real_query(sparql, **kwargs)
+
+        client.query = query  # type: ignore[method-assign]
+        walker = OntologyGraphTool(
+            client, None, namespace=deployed_graph.NS, graph_uri_template=deployed_graph.TEMPLATE
+        )
+        await walker.explore_graph("customers", hops=1, node_types=["table"])
+        await walker.explore_graph("orders", hops=1, node_types=["table"])
+        reached = await walker.expand_from([deployed_graph.PURCHASE_ORDER])
+
+        assert reached[0]["table"] == "customers"
+        assert sum("SELECT ?class ?name" in q for q in sent) == 0
+        assert sum("?op a owl:ObjectProperty" in q for q in sent) == 1  # loaded once per request
+
+    async def test_a_table_name_that_cannot_be_read_keeps_the_label(self):
+        """A seed with no edge is named by a lookup of its own, which may fail without failing the walk."""
+        ds = deployed_graph.designer_v2_dataset()
+        graph = ds.graph(URIRef(deployed_graph.GRAPH))
+        lone = URIRef(deployed_graph.PREFIX + "Regions")  # a mapped table nothing joins
+        for triple in (
+            (lone, RDF.type, OWL.Class),
+            (lone, RDFS.label, Literal("Area")),
+            (lone, deployed_graph.IS_MAPPED, Literal(True)),
+            (lone, deployed_graph.PHYSICAL_NAME, Literal("regions")),
+        ):
+            graph.add(triple)
+        client = deployed_graph.neptune_over(ds)
+        walker = OntologyGraphTool(
+            client, None, namespace=deployed_graph.NS, graph_uri_template=deployed_graph.TEMPLATE
+        )
+        named = await walker.explore_graph("area", hops=1, node_types=["table"])
+        real_query = client.query
+
+        async def query(sparql, **kwargs):
+            if "SELECT ?class ?name" in sparql:
+                raise TimeoutError
+            return await real_query(sparql, **kwargs)
+
+        client.query = query  # type: ignore[method-assign]
+        unnamed = await OntologyGraphTool(
+            client, None, namespace=deployed_graph.NS, graph_uri_template=deployed_graph.TEMPLATE
+        ).explore_graph("area", hops=1, node_types=["table"])
+
+        assert named["tables"] == [{"table": "regions", "hop": 0, "direction": "seed", "via": ""}]
+        assert unnamed["tables"] == [{"table": "Regions", "hop": 0, "direction": "seed", "via": ""}]
+
+
+def _moved_up(*, party_table: str | None = None, ends: bool = True):
+    """The deployed graph after the designer moved two mapped properties up to a new parent of ``Customers``.
+
+    ``customers_email``'s domain and the foreign key's range become ``Party``, as the designer
+    allows with a warning; the mapping still reads email from ``customers`` and joins ``orders``
+    to it. ``party_table`` maps ``Party`` from a table of its own (which has no email column),
+    and ``ends`` is whether deploy recorded where the mapping puts the two
+    (``coa:mappedDomain`` / ``coa:mappedRange``), which a namespace deployed before them lacks.
+    """
+    ds = deployed_graph.designer_v2_dataset()
+    g = ds.graph(URIRef(deployed_graph.GRAPH))
+    party, customers = URIRef(deployed_graph.PREFIX + "Party"), URIRef(deployed_graph.CUSTOMERS)
+    email, fk = URIRef(deployed_graph.PREFIX + "customers_email"), URIRef(deployed_graph.PREFIX + "orders_customerId")
+    g.add((party, RDF.type, OWL.Class))
+    g.add((party, RDFS.label, Literal("Party")))
+    if party_table:
+        g.add((party, deployed_graph.IS_MAPPED, Literal(True)))
+        g.add((party, deployed_graph.PHYSICAL_NAME, Literal(party_table)))
+    g.add((customers, RDFS.subClassOf, party))
+    g.set((email, RDFS.domain, party))
+    g.set((fk, RDFS.range, party))
+    if ends:
+        g.add((email, deployed_graph.MAPPED_DOMAIN, customers))
+        g.add((fk, deployed_graph.MAPPED_RANGE, customers))
+    return ds
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestPlacedByTheMapping:
+    """A property's domain or range moved up to a parent leaves its column and join where the mapping reads them.
+
+    Ontop answers it on the parent, but NL-to-SQL writes SQL against tables: the walk places
+    such a property by the classes deploy recorded from the mapping. Run through the real
+    Neptune client over the deployed graph.
+    """
+
+    @staticmethod
+    def _walker(ds) -> OntologyGraphTool:
+        return OntologyGraphTool(
+            deployed_graph.neptune_over(ds),
+            None,
+            namespace=deployed_graph.NS,
+            graph_uri_template=deployed_graph.TEMPLATE,
+        )
+
+    async def test_the_walk_still_joins_the_table_its_mapping_joins(self):
+        before = await self._walker(deployed_graph.designer_v2_dataset()).expand_from([deployed_graph.PURCHASE_ORDER])
+        for party_table in (None, "parties"):  # the parent has no table, or a table of its own
+            after = await self._walker(_moved_up(party_table=party_table)).expand_from([deployed_graph.PURCHASE_ORDER])
+            assert after == before
+
+    async def test_a_column_moved_up_is_listed_on_its_table_and_not_on_the_parent_s(self):
+        walker = self._walker(_moved_up(party_table="parties"))
+
+        explored = await walker.explore_graph("parties", hops=1)
+
+        assert explored["tables"] == [{"table": "parties", "hop": 0, "direction": "seed", "via": ""}]
+        assert explored["columns"] == []
+        # Walked from the orders, email is a column of customers again.
+        reached = await walker.expand_from([deployed_graph.PURCHASE_ORDER])
+        assert "email:string" in reached[0]["schema"] and reached[0]["table"] == "customers"
+
+    async def test_a_namespace_deployed_before_the_recorded_classes_is_walked_by_domain_and_range(self):
+        """As before deploy recorded them: deploying the version again records them."""
+        reached = await self._walker(_moved_up(ends=False)).expand_from([deployed_graph.PURCHASE_ORDER])
+
+        assert [t["table"] for t in reached] == ["Party"]

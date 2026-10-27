@@ -402,8 +402,10 @@ function sectionKeyFor(stepId: string, setupTarget: string): string {
   // The graphrag lexical retriever (TIER3_STRATEGY=lexical-baseline) emits
   // "lexical_baseline_retrieve" without a "t3." prefix; it IS a Tier-3 step, so
   // classify it there — otherwise it lands in a stray "other" section and the
-  // Tier-3 execution plan looks incomplete.
-  if (stepId === "lexical_baseline_retrieve") return "t3";
+  // Tier-3 execution plan looks incomplete. The same path emits "domain_abox"
+  // (facts from the namespace's domain ABox), also without the prefix.
+  if (stepId === "lexical_baseline_retrieve" || stepId === "domain_abox")
+    return "t3";
   return "other";
 }
 

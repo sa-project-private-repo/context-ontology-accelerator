@@ -620,12 +620,69 @@ _PATH_MAPPING: dict[str, dict[str, tuple[str, str]]] = {
     "/namespaces/{namespaceId}/proposals/reject": {
         "POST": ("manageOntology", "OntologyProposal"),
     },
+    # ── Ontology designer ─────────────────────────────────────────
+    # Reading a draft is a read; opening one and every change to it edits the
+    # proposal, so they are manageOntology like the proposal edits above.
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio": {
+        "GET": ("viewNamespace", "OntologyProposal"),
+        "POST": ("manageOntology", "OntologyProposal"),
+    },
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/graph": {"GET": ("viewNamespace", "OntologyProposal")},
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/term": {"GET": ("viewNamespace", "OntologyProposal")},
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/terms": {"GET": ("viewNamespace", "OntologyProposal")},
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/history": {"GET": ("viewNamespace", "OntologyProposal")},
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/accept-preview": {
+        "GET": ("viewNamespace", "OntologyProposal"),
+    },
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changes": {"POST": ("manageOntology", "OntologyProposal")},
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/undo": {"POST": ("manageOntology", "OntologyProposal")},
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/redo": {"POST": ("manageOntology", "OntologyProposal")},
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/rebase": {"POST": ("manageOntology", "OntologyProposal")},
+    # ── Ontology designer assistant ─────────────────────────────────────
+    # Sending a message runs the assistant, and applying or discarding one of its
+    # change sets edits the proposal; reading the chat and previewing are reads.
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/messages": {
+        "POST": ("manageOntology", "OntologyProposal"),
+    },
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/events": {"GET": ("viewNamespace", "OntologyProposal")},
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets": {
+        "GET": ("viewNamespace", "OntologyProposal"),
+    },
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/preview": {
+        "GET": ("viewNamespace", "OntologyProposal"),
+    },
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/apply": {
+        "POST": ("manageOntology", "OntologyProposal"),
+    },
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/discard": {
+        "POST": ("manageOntology", "OntologyProposal"),
+    },
+    # ── Ontology designer checks, queries and questions ────────────────
+    # Checks and queries only read, so they are viewNamespace (a query is read-only);
+    # saving, deleting and checking a competency question are manageOntology.
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/checks": {"GET": ("viewNamespace", "OntologyProposal")},
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/queries": {
+        "POST": ("viewNamespace", "OntologyProposal"),
+    },
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/questions/{questionId}/check": {
+        "POST": ("manageOntology", "OntologyProposal"),
+    },
+    "/namespaces/{namespaceId}/studio/questions": {"GET": ("viewNamespace", "Ontology")},
+    "/namespaces/{namespaceId}/studio/questions/{questionId}": {
+        "PUT": ("manageOntology", "Ontology"),
+        "DELETE": ("manageOntology", "Ontology"),
+    },
     # ── Data Layer (Serve) — runtime query/retrieval ─────────────────────
     "/namespaces/{namespaceId}/query": {
         "POST": ("query", "Namespace"),
     },
     "/namespaces/{namespaceId}/translate": {
         "POST": ("translateQuery", "Namespace"),
+    },
+    # RunSparqlQuery (Ontology designer query console): the caller's SPARQL runs as SQL on the
+    # sources, so it is a query; serve's firewall still applies the caller's table grants.
+    "/namespaces/{namespaceId}/sparql": {
+        "POST": ("query", "Namespace"),
     },
     "/namespaces/{namespaceId}/kb/search": {
         "POST": ("searchDocuments", "Namespace"),
@@ -684,6 +741,34 @@ _PATH_MAPPING: dict[str, dict[str, tuple[str, str]]] = {
     "/namespaces/{namespaceId}/ontology/foundational/{key}/load": {
         "POST": ("manageOntology", "Ontology"),
     },
+    # ── Ontology versions ──────────────────────────────────────────────
+    # Listing, inspecting and polling are reads. Deploy/rollback changes what
+    # the namespace serves, so it is manageOntology like accept (data-steward
+    # and above), and the ARCHIVED-namespace forbid in default.cedar applies.
+    "/namespaces/{namespaceId}/ontology/versions": {
+        "GET": ("viewNamespace", "Ontology"),
+    },
+    "/namespaces/{namespaceId}/ontology/versions/{version}": {
+        "GET": ("viewNamespace", "Ontology"),
+    },
+    "/namespaces/{namespaceId}/ontology/versions/{version}/deploy": {
+        "POST": ("manageOntology", "Ontology"),
+    },
+    "/namespaces/{namespaceId}/ontology/deployments/{deploymentId}": {
+        "GET": ("viewNamespace", "Ontology"),
+    },
+    # ── Domain ABox ────────────────────────────────────────────────────
+    # Reading instances and mappings is a read. Editing a mapping or queueing a rebuild
+    # changes what the namespace serves, so it is manageOntology like deploy.
+    "/namespaces/{namespaceId}/abox": {"GET": ("viewNamespace", "Ontology")},
+    "/namespaces/{namespaceId}/abox/instances": {"GET": ("viewNamespace", "Ontology")},
+    "/namespaces/{namespaceId}/abox/instance": {"GET": ("viewNamespace", "Ontology")},
+    "/namespaces/{namespaceId}/abox/mappings": {"GET": ("viewNamespace", "Ontology")},
+    "/namespaces/{namespaceId}/abox/mappings/{mappingId}": {
+        "PUT": ("manageOntology", "Ontology"),
+        "DELETE": ("manageOntology", "Ontology"),
+    },
+    "/namespaces/{namespaceId}/abox/rebuild": {"POST": ("manageOntology", "Ontology")},
     "/namespaces/{namespaceId}/proposals/{proposalId}/repair-datatypes": {
         "POST": ("manageOntology", "OntologyProposal"),
     },
@@ -781,7 +866,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         return _build_policy("", "Deny", method_arn)
 
     principal_id = result.principal_id  # email
-    if not principal_id:
+    # Blank counts as missing: the API proxy forwards no X-Coa-Principal for it, and the
+    # ontology engine reads that header's absence as an internal call.
+    if not principal_id or not principal_id.strip():
         logger.warning("No principal in token")
         emit_authorizer_error(reason="no_principal")
         return _build_policy("", "Deny", method_arn)

@@ -11,6 +11,7 @@
 import React, { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useCanManageOntology } from "@api-hooks/use-can-manage-ontology";
 import { useNamespace } from "@api-hooks/use-namespace";
 import Alert from "@cloudscape-design/components/alert";
 import Tabs from "@cloudscape-design/components/tabs";
@@ -62,11 +63,13 @@ import {
   ontologyTypeGroup,
 } from "@utils/ontology-display";
 import { InductionStages } from "./ontology/induce/InductionStages";
+import { VersionsTab } from "./ontology/versions/VersionsTab";
+import { DomainDataTab } from "./ontology/abox/DomainDataTab";
 import Badge from "@cloudscape-design/components/badge";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import FileUpload from "@cloudscape-design/components/file-upload";
 import Input from "@cloudscape-design/components/input";
-import { useAppI18n } from "../i18n/LocaleProvider";
+import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
 /** Map a custom-uploaded ontology filename to the format string the
@@ -152,6 +155,11 @@ export function OntologyPage() {
     { text: t("Ontology") },
     { text: t("Induction") },
   ]);
+  // A role that only reads (a data analyst) is not offered an induction the API would refuse it.
+  const canChange = useCanManageOntology(namespaceId);
+  const denied = canChange
+    ? undefined
+    : t("Your role on this namespace does not allow this.");
 
   const [inducting, setInducting] = useState(false);
   const [inductionError, setInductionError] = useState<string | null>(null);
@@ -606,10 +614,13 @@ export function OntologyPage() {
               variant="primary"
               onClick={() => setShowInductionModal(true)}
               loading={inducting}
-              disabled={inductionLocked}
-              disabledReason={t(
-                "An induction is already in progress or a proposal is awaiting review. Finish reviewing it before starting a new one.",
-              )}
+              disabled={inductionLocked || !canChange}
+              disabledReason={
+                denied ??
+                t(
+                  "An induction is already in progress or a proposal is awaiting review. Finish reviewing it before starting a new one.",
+                )
+              }
             >
               {t("Start induction")}
             </Button>
@@ -737,13 +748,18 @@ export function OntologyPage() {
                 <Button
                   variant="primary"
                   onClick={startInduction}
-                  disabled={selectedDatasources.length === 0 || inductionLocked}
+                  disabled={
+                    selectedDatasources.length === 0 ||
+                    inductionLocked ||
+                    !canChange
+                  }
                   disabledReason={
-                    inductionLocked
+                    denied ??
+                    (inductionLocked
                       ? t(
                           "An induction is already in progress or a proposal is awaiting review. Finish reviewing it before starting a new one.",
                         )
-                      : undefined
+                      : undefined)
                   }
                 >
                   {t("Start induction")}
@@ -1045,6 +1061,20 @@ export function OntologyPage() {
             ),
           },
           {
+            id: "versions",
+            label: t("Versions"),
+            content: (
+              <VersionsTab apiClient={apiClient} namespace={namespaceId} />
+            ),
+          },
+          {
+            id: "domain-data",
+            label: t("Domain data"),
+            content: (
+              <DomainDataTab apiClient={apiClient} namespace={namespaceId} />
+            ),
+          },
+          {
             id: "ontologies",
             label: t("Reference ontologies"),
             content: (
@@ -1100,6 +1130,8 @@ const PROPOSAL_STATUS_MESSAGES: Record<string, AppMessage> = {
   accepting: "accepting",
   pending: "pending",
   updated: "updated",
+  // Falls through proposalStatusDisplay unchanged, like pending and updated.
+  cancelled: "cancelled",
 };
 
 /** Derive the ingest state of a registered ontology row.
@@ -1149,6 +1181,15 @@ export function proposalStatusDisplay(status: string): {
     return { type: "in-progress", label };
   }
   return { type: "pending", label: status };
+}
+
+/** A proposal's status as the Proposals list words it, in the reader's
+ * language; a status this console does not know is shown as it is. */
+export function proposalStatusText(status: string, t: AppTranslate): string {
+  const { label } = proposalStatusDisplay(status);
+  return Object.prototype.hasOwnProperty.call(PROPOSAL_STATUS_MESSAGES, label)
+    ? t(PROPOSAL_STATUS_MESSAGES[label])
+    : label;
 }
 
 /** What the UI should do when an induction job reaches ``completed``.
@@ -1213,6 +1254,9 @@ function OntologiesTab({
   namespace?: string;
 }) {
   const { t } = useAppI18n();
+  // A role that only reads (a data analyst) is not offered a load, upload or
+  // delete the API would refuse it.
+  const canChange = useCanManageOntology(namespace);
   const [items, setItems] = useState<OntologyRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1337,7 +1381,11 @@ function OntologiesTab({
   // Poll while any ontology is mid-delete (status === "deleting") so the card
   // disappears on its own once the backend finishes tearing down the graph +
   // embeddings and removes the registry row. Same pattern as the ingest poll.
-  const hasDeletingOntology = items.some((r) => r.status === "deleting");
+  // A failed delete keeps "deleting" with a deleteError and changes no further,
+  // so it is excluded (as in the inventory view) or the poll would never stop.
+  const hasDeletingOntology = items.some(
+    (r) => r.status === "deleting" && !r.deleteError,
+  );
   useEffect(() => {
     if (!namespace || !hasDeletingOntology) return;
     const id = window.setInterval(() => {
@@ -1584,6 +1632,8 @@ function OntologiesTab({
                   <Button
                     variant="inline-link"
                     loading={loadingUris.has(e.uri ?? "")}
+                    // An inline link takes no disabledReason: the table header says why.
+                    disabled={!canChange}
                     onClick={async () => {
                       if (!namespace) return;
                       setLoadingUris((s) => new Set(s).add(e.uri ?? ""));
@@ -1641,6 +1691,8 @@ function OntologiesTab({
               // re-loadable foundational reads differently from permanent
               // user/induced data.
               const isDeleting = e.status === "deleting";
+              // A failed delete stays "deleting" with a deleteError; re-issuing retries it.
+              const deleteFailed = isDeleting && !!e.deleteError;
               // Mirror the backend guard: a NON-induced ontology can't be deleted
               // while induced ontologies exist (they're grounded against it, so it
               // would leave them dangling — the API returns 409). Disable Delete
@@ -1654,7 +1706,11 @@ function OntologiesTab({
               const deleteButton = (
                 <Button
                   variant="inline-link"
-                  disabled={isDeleting || blockedByInduced}
+                  disabled={
+                    (isDeleting && !deleteFailed) ||
+                    blockedByInduced ||
+                    !canChange
+                  }
                   onClick={() => setOntologyToDelete(e)}
                 >
                   {t("Delete")}
@@ -1662,7 +1718,11 @@ function OntologiesTab({
               );
               return (
                 <SpaceBetween direction="horizontal" size="xs">
-                  {isDeleting ? (
+                  {deleteFailed ? (
+                    <StatusIndicator type="error">
+                      {t("Delete failed")}
+                    </StatusIndicator>
+                  ) : isDeleting ? (
                     <StatusIndicator type="in-progress">
                       {t("Delete in progress")}
                     </StatusIndicator>
@@ -1710,9 +1770,15 @@ function OntologiesTab({
         header={
           <Header
             counter={`(${sortedItems.length})`}
-            description={t(
-              "Ontologies available for grounding. Load one from the catalog, or upload your own.",
-            )}
+            description={
+              canChange
+                ? t(
+                    "Ontologies available for grounding. Load one from the catalog, or upload your own.",
+                  )
+                : t(
+                    "Ontologies available for grounding. Your role on this namespace cannot load, upload or delete them.",
+                  )
+            }
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <SegmentedControl
@@ -1749,6 +1815,10 @@ function OntologiesTab({
                 </Button>
                 <Button
                   iconName="upload"
+                  disabled={!canChange}
+                  disabledReason={t(
+                    "Your role on this namespace does not allow this.",
+                  )}
                   onClick={() => setShowUploadModal(true)}
                 >
                   {t("Upload your own ontology")}
@@ -1856,7 +1926,7 @@ function ProposalsTab({
   apiClient: ApiClient;
   namespace?: string;
 }) {
-  const { t } = useAppI18n();
+  const { t, locale } = useAppI18n();
   const [items, setItems] = useState<Proposal[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -1919,11 +1989,10 @@ function ProposalsTab({
           header: t("Status"),
           sortingField: "status",
           cell: (e) => {
-            const { type, label } = proposalStatusDisplay(e.status);
-            const message = PROPOSAL_STATUS_MESSAGES[label];
+            const { type } = proposalStatusDisplay(e.status);
             return (
               <StatusIndicator type={type}>
-                {message ? t(message) : label}
+                {proposalStatusText(e.status, t)}
               </StatusIndicator>
             );
           },
@@ -1972,7 +2041,7 @@ function ProposalsTab({
           id: "created",
           header: t("Created"),
           sortingField: "created_at",
-          cell: (e) => formatTimestamp(e.created_at),
+          cell: (e) => formatTimestamp(e.created_at, locale),
         },
       ]}
       empty={<Box textAlign="center">{t("No proposals yet.")}</Box>}

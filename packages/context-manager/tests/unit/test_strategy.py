@@ -23,6 +23,7 @@ from coa_serve.tier1.metric_resolver import DeclinedMetricContext
 from coa_serve.tier2.strategy import (
     LEGACY_STRATEGY_ALIASES,
     StrategyContext,
+    StrategyDeclined,
     StrategyOption,
     StrategyResult,
     StructuredQueryTier,
@@ -71,6 +72,13 @@ def _make_empty_result(strategy_name: str = "test", confidence: float = 0.8) -> 
         row_count=0,
         truncated=False,
     )
+
+
+def _make_placeholder() -> StrategyResult:
+    """Ontop's answer to SPARQL that matches no mapping: one dummy row at a confident score."""
+    result = _make_result("ontop", confidence=0.73, rows=[{"uselessVariable": 1}])
+    result.sql = "SELECT 1 AS uselessVariable FROM (SELECT 1) AS tdummy"
+    return result
 
 
 # ── Sequential policy ───────────────────────────────────────────────────
@@ -181,6 +189,120 @@ class TestSequentialPolicy:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_nl_to_sql_first_does_not_answer_with_the_no_mapping_placeholder(self):
+        """The default chain: NL-to-SQL misses, Ontop returns its no-mapping placeholder.
+
+        The placeholder has one dummy row and a confident score, so it is not a
+        low-confidence empty, yet it answers nothing. It must not become the Tier 2
+        answer: the chain ends with no result, so the orchestrator asks Tier 3.
+        """
+        degenerate = _make_result("ontop", confidence=0.73, rows=[{"uselessVariable": 1}])
+        degenerate.sql = "SELECT 1 AS uselessVariable FROM (SELECT 1) AS tdummy"
+        nl = _make_strategy("nl_to_sql", result=None)
+        ontop = _make_strategy("ontop", result=degenerate)
+        tier = StructuredQueryTier(strategies=[ontop, nl])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option="nl_to_sql_first")
+
+        assert result is None
+        nl.resolve.assert_awaited_once()
+        ontop.resolve.assert_awaited_once()
+        failed = [s for s in ctx.trace.steps if s.step == "t2.vkg.failed"]
+        assert [s.detail for s in failed] == [{"strategy": "ontop", "reason": "degenerate_no_mapping"}]
+        assert failed[0].status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_ontop_first_falls_through_the_no_mapping_placeholder_to_nl_to_sql(self):
+        degenerate = _make_result("ontop", confidence=0.73, rows=[{"uselessVariable": 1}])
+        degenerate.sql = "SELECT 1 AS uselessVariable FROM (SELECT 1) AS tdummy"
+        ontop = _make_strategy("ontop", result=degenerate)
+        nl = _make_strategy("nl_to_sql", result=_make_result("nl_to_sql", confidence=0.6))
+        tier = StructuredQueryTier(strategies=[ontop, nl])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option="ontop_first")
+
+        assert result is not None
+        assert result.strategy_name == "nl_to_sql"
+        assert [s.detail["reason"] for s in ctx.trace.steps if s.step == "t2.vkg.failed"] == ["degenerate_no_mapping"]
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_strategy_falls_through_the_placeholder_when_tier3_follows(self):
+        placeholder = _make_placeholder()
+        tier = StructuredQueryTier(strategies=[_make_strategy("ontop", result=placeholder)])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option="ontop")
+
+        assert result is None
+        assert [s.detail for s in ctx.trace.steps if s.step == "t2.vkg.failed"] == [
+            {"strategy": "ontop", "reason": "degenerate_no_mapping"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_strategy_returns_the_placeholder_when_nothing_follows(self):
+        """strategy="ontop" under tierOverride 2: no strategy and no Tier 3 can run after Ontop.
+
+        The placeholder comes back as before the chain learned to skip it, with no failed
+        step, so a caller pinned to Ontop still reads its uselessVariable signature.
+        """
+        placeholder = _make_placeholder()
+        tier = StructuredQueryTier(strategies=[_make_strategy("ontop", result=placeholder)])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option="ontop", tier3_follows=False)
+
+        assert result is placeholder
+        assert ctx.trace.steps == []
+
+    @pytest.mark.asyncio
+    async def test_the_default_chain_returns_the_placeholder_when_nothing_follows(self):
+        """nl_to_sql_first under tierOverride 2: NL-to-SQL misses and Ontop, the last strategy, has the placeholder."""
+        placeholder = _make_placeholder()
+        nl = _make_strategy("nl_to_sql", result=None)
+        tier = StructuredQueryTier(strategies=[_make_strategy("ontop", result=placeholder), nl])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option="nl_to_sql_first", tier3_follows=False)
+
+        assert result is placeholder
+        nl.resolve.assert_awaited_once()
+        assert [s.step for s in ctx.trace.steps] == []
+
+    @pytest.mark.asyncio
+    async def test_a_later_strategy_still_answers_before_the_placeholder_when_nothing_follows(self):
+        nl = _make_strategy("nl_to_sql", result=_make_result("nl_to_sql", confidence=0.6))
+        tier = StructuredQueryTier(strategies=[_make_strategy("ontop", result=_make_placeholder()), nl])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option="ontop_first", tier3_follows=False)
+
+        assert result is not None
+        assert result.strategy_name == "nl_to_sql"
+        assert [s.detail["reason"] for s in ctx.trace.steps if s.step == "t2.vkg.failed"] == ["degenerate_no_mapping"]
+
+    @pytest.mark.asyncio
+    async def test_the_placeholder_is_returned_when_no_later_strategy_answers_and_nothing_follows(self):
+        """ontop_first under tierOverride 2: Ontop has the placeholder and NL-to-SQL, tried next, misses.
+
+        The trace keeps the failed step recorded when the chain moved on to NL-to-SQL.
+        """
+        placeholder = _make_placeholder()
+        nl = _make_strategy("nl_to_sql", result=_make_empty_result("nl_to_sql", confidence=0.1))
+        tier = StructuredQueryTier(strategies=[_make_strategy("ontop", result=placeholder), nl])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option="ontop_first", tier3_follows=False)
+
+        assert result is placeholder
+        nl.resolve.assert_awaited_once()
+        assert [(s.step, s.detail["reason"]) for s in ctx.trace.steps] == [
+            ("t2.vkg.failed", "degenerate_no_mapping"),
+            ("t2.sql.failed", "empty_low_confidence"),
+        ]
+
+    @pytest.mark.asyncio
     async def test_access_denied_propagates(self):
         s1 = _make_strategy("a", error=AccessDeniedError("denied"))
         s2 = _make_strategy("b", result=_make_result("b"))
@@ -194,6 +316,51 @@ class TestSequentialPolicy:
 
         # Second strategy never attempted after terminal deny
         s2.resolve.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_declined_strategy_hands_the_question_to_the_next_one(self):
+        """NL-to-SQL's writer says the schema cannot answer it: the default chain asks Ontop."""
+        nl = _make_strategy("nl_to_sql", result=StrategyDeclined("nl_to_sql"))
+        ontop = _make_strategy("ontop", result=_make_result("ontop"))
+        tier = StructuredQueryTier(strategies=[ontop, nl])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option="nl_to_sql_first")
+
+        assert result is not None
+        assert result.strategy_name == "ontop"
+        assert [(s.step, s.status, s.detail) for s in ctx.trace.steps] == [
+            ("t2.sql.failed", "failed", {"strategy": "nl_to_sql", "reason": "cannot_answer"})
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tier3_follows", [True, False])
+    async def test_every_strategy_declining_is_no_result(self, tier3_follows):
+        nl = _make_strategy("nl_to_sql", result=StrategyDeclined("nl_to_sql"))
+        ontop = _make_strategy("ontop", result=StrategyDeclined("ontop"))
+        tier = StructuredQueryTier(strategies=[ontop, nl])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option="nl_to_sql_first", tier3_follows=tier3_follows)
+
+        assert result is None
+        assert [(s.step, s.detail["reason"]) for s in ctx.trace.steps] == [
+            ("t2.sql.failed", "cannot_answer"),
+            ("t2.vkg.failed", "cannot_answer"),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("option", ["nl_to_sql", "ontop"])
+    async def test_a_pinned_strategy_that_declines_is_no_result(self, option):
+        pinned = _make_strategy(option, result=StrategyDeclined(option))
+        other = _make_strategy("nl_to_sql" if option == "ontop" else "ontop", result=_make_result())
+        tier = StructuredQueryTier(strategies=[pinned, other])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        result = await tier.resolve("query", "ns", ctx, option=option, tier3_follows=False)
+
+        assert result is None
+        other.resolve.assert_not_awaited()
 
 
 # ── Parallel policy ──────────────────────────────────────────────────────
@@ -292,6 +459,31 @@ class TestParallelPolicy:
 
         res = await tier.resolve("query", "ns", StrategyContext(trace=TraceCollector()), option="best")
         assert res is None
+
+    @pytest.mark.asyncio
+    async def test_a_declined_strategy_is_never_the_winner(self):
+        n = _make_strategy("nl_to_sql", result=StrategyDeclined("nl_to_sql"))
+        o = _make_strategy("ontop", result=_make_result("ontop", confidence=0.6))
+        tier = StructuredQueryTier(strategies=[o, n])
+
+        res = await tier.resolve("query", "ns", StrategyContext(trace=TraceCollector()), option="best")
+        assert res is not None
+        assert res.strategy_name == "ontop"
+
+    @pytest.mark.asyncio
+    async def test_all_declined_falls_through_to_tier3_and_says_why(self):
+        n = _make_strategy("nl_to_sql", result=StrategyDeclined("nl_to_sql"))
+        o = _make_strategy("ontop", result=StrategyDeclined("ontop"))
+        tier = StructuredQueryTier(strategies=[o, n])
+
+        ctx = StrategyContext(trace=TraceCollector())
+        res = await tier.resolve("query", "ns", ctx, option="best")
+
+        assert res is None
+        assert sorted((s.step, s.detail["reason"]) for s in ctx.trace.steps) == [
+            ("t2.sql.failed", "cannot_answer"),
+            ("t2.vkg.failed", "cannot_answer"),
+        ]
 
     @pytest.mark.asyncio
     async def test_ignores_exceptions(self):
@@ -637,8 +829,8 @@ class TestResolveStrategySelection:
 
 @pytest.mark.unit
 class TestOrchestratorWithStrategy:
-    def _make_orchestrator_with_strategy(self, strategy_result: StrategyResult | None = None):
-        """Build an orchestrator with a structured_query_tier that returns the given result."""
+    def _make_orchestrator_with_strategy(self, strategy_result: StrategyResult | None = None, name: str = "nl_to_sql"):
+        """Build an orchestrator with a structured_query_tier whose one strategy, ``name``, returns the given result."""
         from coa_serve.tier1.metric_resolver import MetricMatch
         from coa_serve.tier3.knowledge_retriever import Tier3Result
 
@@ -655,7 +847,7 @@ class TestOrchestratorWithStrategy:
             trace_steps=(),
         )
 
-        mock_strategy = _make_strategy("nl_to_sql", result=strategy_result)
+        mock_strategy = _make_strategy(name, result=strategy_result)
         structured_tier = StructuredQueryTier(
             strategies=[mock_strategy],
         )
@@ -719,6 +911,106 @@ class TestOrchestratorWithStrategy:
         response = await orch.resolve(request)
         # Strategy fails → falls through to Tier 3
         assert response.result.tier == 3
+
+    @pytest.mark.asyncio
+    async def test_a_question_pinned_to_ontop_and_tier_2_gets_the_placeholder_row(self):
+        """Nothing can run after Ontop here, so its placeholder is the answer, as before.
+
+        The workshop's REST notebook asks with strategy="ontop" and tierOverride=2 and reads
+        uselessVariable in queryUsed as a degraded answer; a 404 would end its cell.
+        """
+        from coa_serve.models import InvokeRequest
+
+        orch, _ = self._make_orchestrator_with_strategy(_make_placeholder(), name="ontop")
+
+        trace = TraceCollector()
+        request = InvokeRequest(query="test", namespace="demo", options={"strategy": "ontop", "tierOverride": 2})
+        response = await orch.resolve(request, trace=trace)
+
+        assert response.result.tier == 2
+        assert response.result.result_rows == [{"uselessVariable": 1}]
+        assert "t2.vkg.failed" not in [s.step for s in trace.steps]
+
+    @pytest.mark.asyncio
+    async def test_a_question_pinned_to_ontop_and_tier_1_gets_the_placeholder_row(self):
+        """tierOverride 1 with a strategy runs Tier 2 after a Tier 1 miss and never Tier 3, so nothing follows Ontop."""
+        from coa_serve.models import InvokeRequest
+
+        orch, _ = self._make_orchestrator_with_strategy(_make_placeholder(), name="ontop")
+
+        trace = TraceCollector()
+        request = InvokeRequest(query="test", namespace="demo", options={"strategy": "ontop", "tierOverride": 1})
+        response = await orch.resolve(request, trace=trace)
+
+        assert response.result.tier == 2
+        assert response.result.result_rows == [{"uselessVariable": 1}]
+        assert "t2.vkg.failed" not in [s.step for s in trace.steps]
+
+    @pytest.mark.asyncio
+    async def test_best_pinned_to_tier_2_gets_no_result_for_the_placeholder(self):
+        """best drops the placeholder even when nothing runs after Tier 2, as it did before the chain skipped it."""
+        from coa_serve.models import InvokeRequest
+
+        orch, _ = self._make_orchestrator_with_strategy(_make_placeholder(), name="ontop")
+
+        request = InvokeRequest(query="test", namespace="demo", options={"strategy": "best", "tierOverride": 2})
+        with pytest.raises(NoResultError):
+            await orch.resolve(request)
+
+    @pytest.mark.asyncio
+    async def test_a_question_pinned_to_ontop_asks_tier3_after_the_placeholder(self):
+        from coa_serve.models import InvokeRequest
+
+        orch, _ = self._make_orchestrator_with_strategy(_make_placeholder(), name="ontop")
+
+        request = InvokeRequest(query="test", namespace="demo", options={"strategy": "ontop"})
+        response = await orch.resolve(request)
+
+        assert response.result.tier == 3
+        assert response.result.synthesized_answer == "Fallback."
+
+    @pytest.mark.asyncio
+    async def test_the_default_chain_asks_tier3_after_the_placeholder(self):
+        from coa_serve.models import InvokeRequest
+
+        orch, strategy = self._make_orchestrator_with_strategy(_make_placeholder(), name="ontop")
+
+        trace = TraceCollector()
+        response = await orch.resolve(InvokeRequest(query="test", namespace="demo"), trace=trace)
+
+        assert response.result.tier == 3
+        strategy.resolve.assert_awaited_once()
+        assert [s.detail.get("reason") for s in trace.steps if s.step == "t2.vkg.failed"] == ["degenerate_no_mapping"]
+
+    @pytest.mark.asyncio
+    async def test_the_default_chain_asks_tier3_when_tier2_declines(self):
+        """A question about a term no table maps: Tier 2 declines, so Tier 3 (documents) answers it."""
+        from coa_serve.models import InvokeRequest
+
+        orch, strategy = self._make_orchestrator_with_strategy(StrategyDeclined("nl_to_sql"))
+
+        trace = TraceCollector()
+        response = await orch.resolve(InvokeRequest(query="test", namespace="demo"), trace=trace)
+
+        assert response.result.tier == 3
+        assert response.result.synthesized_answer == "Fallback."
+        strategy.resolve.assert_awaited_once()
+        assert [s.detail for s in trace.steps if s.step == "t2.sql.failed"] == [
+            {"strategy": "nl_to_sql", "reason": "cannot_answer"}
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["nl_to_sql", "ontop"])
+    async def test_a_strategy_pinned_to_tier_2_that_declines_gets_no_result(self, name):
+        from coa_serve.models import InvokeRequest
+
+        orch, _ = self._make_orchestrator_with_strategy(StrategyDeclined(name), name=name)
+
+        request = InvokeRequest(query="test", namespace="demo", options={"strategy": name, "tierOverride": 2})
+        with pytest.raises(NoResultError) as exc_info:
+            await orch.resolve(request)
+        assert exc_info.value.status_code == 404
+        assert exc_info.value.tier == 2
 
 
 # ── model_id propagation ──────────────────────────────────────────────────

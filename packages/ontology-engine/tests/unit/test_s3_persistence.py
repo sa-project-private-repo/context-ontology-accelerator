@@ -1,158 +1,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for _persist_induced_to_s3 and /datasources/induced endpoint."""
+"""Unit tests for the schema.sql and VKG-ontology helpers in proposals and the /datasources/induced endpoint."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 pytestmark = pytest.mark.unit
-
-
-class TestPersistInducedToS3:
-    """Tests for proposals._persist_induced_to_s3."""
-
-    @patch("boto3.client")
-    @patch("coa_ontology.stores.neptune_db_graph._gsp_get_turtle")
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_writes_ontology_and_r2rml(self, mock_dynamo, mock_gsp, mock_s3_client):
-        from coa_ontology.proposals import _persist_induced_to_s3
-
-        mock_gsp.return_value = "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n:Claim a owl:Class ."
-        mock_dynamo.list_proposals.return_value = [
-            {"r2rml_turtle": "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n:TM1 a rr:TriplesMap ."},
-            {"r2rml_turtle": "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n:TM2 a rr:TriplesMap ."},
-        ]
-        mock_s3 = MagicMock()
-        mock_s3_client.return_value = mock_s3
-
-        _persist_induced_to_s3(
-            "http://example.org/ns/test/onto#",
-            "my-namespace",
-            "https://coa.amazon.com/graph/my-namespace/encoded-uri",
-        )
-
-        assert mock_s3.put_object.call_count == 4
-        calls = mock_s3.put_object.call_args_list
-        # induced/ writes
-        assert calls[0].kwargs["Key"].endswith(".ttl")
-        assert "my-namespace/induced/" in calls[0].kwargs["Key"]
-        assert b"owl:Class" in calls[0].kwargs["Body"]
-        assert calls[1].kwargs["Key"].endswith(".r2rml.ttl")
-        assert b"TriplesMap" in calls[1].kwargs["Body"]
-        # latest/ writes (VKG consumption)
-        assert calls[2].kwargs["Key"] == "ontologies/my-namespace/latest/ontology.ttl"
-        assert b"owl:Class" in calls[2].kwargs["Body"]
-        assert calls[3].kwargs["Key"] == "ontologies/my-namespace/latest/mappings.r2rml"
-        assert b"TriplesMap" in calls[3].kwargs["Body"]
-
-    @patch("boto3.client")
-    @patch("coa_ontology.stores.neptune_db_graph._gsp_get_turtle")
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_skips_when_no_turtle(self, mock_dynamo, mock_gsp, mock_s3_client):
-        from coa_ontology.proposals import _persist_induced_to_s3
-
-        mock_gsp.return_value = None
-        mock_s3 = MagicMock()
-        mock_s3_client.return_value = mock_s3
-
-        _persist_induced_to_s3("http://x.org/o#", "ns", "https://graph/uri")
-        mock_s3.put_object.assert_not_called()
-
-    @patch("boto3.client")
-    @patch("coa_ontology.stores.neptune_db_graph._gsp_get_turtle")
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_skips_r2rml_when_none(self, mock_dynamo, mock_gsp, mock_s3_client):
-        from coa_ontology.proposals import _persist_induced_to_s3
-
-        mock_gsp.return_value = ":X a owl:Class ."
-        mock_dynamo.list_proposals.return_value = [{"r2rml_turtle": ""}]
-        mock_s3 = MagicMock()
-        mock_s3_client.return_value = mock_s3
-
-        _persist_induced_to_s3("http://x.org/o#", "ns", "https://graph/uri")
-        # induced ontology + latest ontology (no r2rml)
-        assert mock_s3.put_object.call_count == 2
-        keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
-        assert any("induced/" in k for k in keys)
-        assert any("latest/ontology.ttl" in k for k in keys)
-
-    @patch("boto3.client")
-    @patch("coa_ontology.stores.neptune_db_graph._gsp_get_turtle")
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_deduplicates_prefixes(self, mock_dynamo, mock_gsp, mock_s3_client):
-        from coa_ontology.proposals import _persist_induced_to_s3
-
-        mock_gsp.return_value = ":X a owl:Class ."
-        mock_dynamo.list_proposals.return_value = [
-            {"r2rml_turtle": "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n:TM1 a rr:TriplesMap ."},
-            {"r2rml_turtle": "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n:TM2 a rr:TriplesMap ."},
-        ]
-        mock_s3 = MagicMock()
-        mock_s3_client.return_value = mock_s3
-
-        _persist_induced_to_s3("http://x.org/o#", "ns", "https://graph/uri")
-
-        # Check the induced r2rml (index 1)
-        r2rml_body = mock_s3.put_object.call_args_list[1].kwargs["Body"].decode()
-        assert r2rml_body.count("@prefix rr:") == 1
-        assert ":TM1" in r2rml_body
-        assert ":TM2" in r2rml_body
-        # Check the latest r2rml (index 3) has same content
-        latest_r2rml = mock_s3.put_object.call_args_list[3].kwargs["Body"].decode()
-        assert latest_r2rml == r2rml_body
-
-    @patch("boto3.client")
-    @patch("coa_ontology.stores.neptune_db_graph._gsp_get_turtle")
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_deduplicates_triplesmaps_across_proposals(self, mock_dynamo, mock_gsp, mock_s3_client):
-        from coa_ontology.proposals import _persist_induced_to_s3
-
-        # Two proposals both define TriplesMap_Claim with a logicalTable
-        r2rml_common = (
-            "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n"
-            "@prefix ind: <http://ex.org/> .\n"
-            "ind:TriplesMap_Claim a rr:TriplesMap ;\n"
-            '    rr:logicalTable [ rr:tableName "\\"claim\\"" ] .\n'
-        )
-        mock_gsp.return_value = "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n<http://ex.org/Claim> a owl:Class ."
-        mock_dynamo.list_proposals.return_value = [
-            {"r2rml_turtle": r2rml_common},
-            {"r2rml_turtle": r2rml_common},
-        ]
-        mock_s3 = MagicMock()
-        mock_s3_client.return_value = mock_s3
-
-        _persist_induced_to_s3("http://x.org/o#", "ns", "https://graph/uri")
-
-        # The latest R2RML (index 3) should have TriplesMap_Claim only once
-        latest_r2rml = mock_s3.put_object.call_args_list[3].kwargs["Body"].decode()
-        assert latest_r2rml.count("TriplesMap_Claim") >= 1
-        # Ontop would fail if there are 2 logicalTable nodes — verify only 1
-        assert latest_r2rml.count("tableName") == 1
-
-    @patch("boto3.client")
-    @patch("coa_ontology.stores.neptune_db_graph._gsp_get_turtle")
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_raises_on_s3_error(self, mock_dynamo, mock_gsp, mock_s3_client):
-        """#467: an S3 write failure must RAISE, not be swallowed as a warning.
-
-        Previously this returned silently, leaving DDB ``accepted`` + Neptune
-        populated but the VKG ``latest/`` copy stale (a silent Neptune<->S3
-        split-brain). It's now a retried step in the accept pipeline
-        (``_run_accept_step`` → on exhaustion the proposal is ``accept_failed``),
-        so the primitive must surface the failure."""
-        from coa_ontology.proposals import _persist_induced_to_s3
-
-        mock_gsp.return_value = ":X a owl:Class ."
-        mock_dynamo.list_proposals.return_value = []
-        mock_s3 = MagicMock()
-        mock_s3.put_object.side_effect = Exception("S3 boom")
-        mock_s3_client.return_value = mock_s3
-
-        with pytest.raises(Exception, match="S3 boom"):
-            _persist_induced_to_s3("http://x.org/o#", "ns", "https://graph/uri")
 
 
 class TestGenerateSchemaSql:
@@ -193,39 +48,6 @@ class TestGenerateSchemaSql:
         mock_fetch.side_effect = RuntimeError("catalog endpoint 503")
         with pytest.raises(SchemaSqlGenerationError, match="catalog endpoint 503"):
             _generate_schema_sql("ns", "http://x.org/o#")
-
-
-class TestPersistSchemaSqlFailureIsNonFatalButVisible:
-    """A schema.sql generation failure during persist logs at ERROR, writes no
-    schema.sql, and does not crash persist (#457).
-    """
-
-    @patch("coa_ontology.proposals._generate_schema_sql")
-    @patch("boto3.client")
-    @patch("coa_ontology.stores.neptune_db_graph._gsp_get_turtle")
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_generation_failure_logs_error_and_skips_schema_sql(
-        self, mock_dynamo, mock_gsp, mock_s3_client, mock_gen, caplog
-    ):
-        import logging
-
-        from coa_ontology.proposals import SchemaSqlGenerationError, _persist_induced_to_s3
-
-        mock_gsp.return_value = ":X a owl:Class ."
-        mock_dynamo.list_proposals.return_value = []
-        mock_s3 = MagicMock()
-        mock_s3_client.return_value = mock_s3
-        mock_gen.side_effect = SchemaSqlGenerationError("RuntimeError: catalog endpoint 503")
-
-        with caplog.at_level(logging.ERROR):
-            # Must not raise — persist stays best-effort.
-            _persist_induced_to_s3("http://x.org/o#", "ns", "https://graph/uri")
-
-        # No schema.sql was written (generation failed).
-        keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
-        assert not any(k.endswith("schema.sql") for k in keys)
-        # But the failure is visible as an ERROR log, not silently swallowed.
-        assert any("schema.sql generation FAILED" in r.message for r in caplog.records)
 
 
 class TestListInducedDatasources:
@@ -388,6 +210,42 @@ class TestCleanOntologyForVkg:
         assert "decimal" in result
         # name should remain xsd:string (already matches)
         assert "string" in result
+
+    @pytest.mark.parametrize(
+        "literal_range",
+        [
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral",
+            "http://www.w3.org/2000/01/rdf-schema#Literal",
+        ],
+    )
+    def test_aligns_a_non_xsd_literal_range_with_r2rml_datatype(self, literal_range):
+        """Ontop's copy must carry the column's datatype whatever literal range the ontology gives the property."""
+        from coa_ontology.proposals import _clean_ontology_for_vkg
+        from rdflib import Graph, URIRef
+        from rdflib.namespace import RDFS, XSD
+
+        ontology = f"""
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+<http://ex.org/amount> a owl:DatatypeProperty ;
+    rdfs:range <{literal_range}> .
+<http://ex.org/Target> a owl:Class .
+<http://ex.org/buyer> a owl:ObjectProperty ;
+    rdfs:range <http://ex.org/Target> .
+"""
+        r2rml = """
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+<http://ex.org/POM_Amount> rr:predicate <http://ex.org/amount> ;
+    rr:objectMap <http://ex.org/POM_Amount/OM> .
+<http://ex.org/POM_Amount/OM> rr:column "amount" ;
+    rr:datatype xsd:decimal .
+"""
+        g = Graph().parse(data=_clean_ontology_for_vkg(ontology, r2rml_turtle=r2rml), format="turtle")
+        assert set(g.objects(URIRef("http://ex.org/amount"), RDFS.range)) == {XSD.decimal}
+        # A class range is not a literal range: it is never replaced.
+        assert set(g.objects(URIRef("http://ex.org/buyer"), RDFS.range)) == {URIRef("http://ex.org/Target")}
 
     def test_r2rml_alignment_no_op_when_no_r2rml(self):
         from coa_ontology.proposals import _clean_ontology_for_vkg
@@ -738,12 +596,9 @@ class TestSubstepFailureVisibility:
     """#467, second half: a substep that fails must NOT leave the proposal
     'accepted' while pretending it succeeded.
 
-    Three substeps used to swallow their own exceptions and log a warning, so the
-    accept completed regardless. Each is handled per its actual blast radius:
-
-      - schema.sql generation -> FATAL (Ontop can't validate R2RML without it)
-      - reconcile_counts      -> non-fatal, but checkpointed 'skipped' not 'done'
-      - EventBridge notify    -> non-fatal, but its own retried step + 'skipped'
+    schema.sql generation used to swallow its own exceptions and log a warning, so
+    the accept completed regardless. It is FATAL now: Ontop can't validate R2RML
+    without it, so the publish fails instead.
     """
 
     @patch("coa_ontology.proposals.dynamo_store")
@@ -779,93 +634,3 @@ class TestSubstepFailureVisibility:
 
         mock_dynamo.list_proposals.return_value = [{"metadata": {}}]
         assert _generate_schema_sql("ns", "http://x.org/o#") is None
-
-    def test_reconcile_counts_raises_so_the_wrapper_can_retry(self):
-        """Must RAISE, not swallow. Non-fatality is the caller's declaration
-        (``_run_accept_step(..., fatal=False)``); a step that catches its own
-        exception makes the wrapper's 3-attempt retry silently never happen."""
-        from coa_ontology.proposals import _reconcile_counts
-
-        with (
-            patch(
-                "coa_ontology.stores.build_stores",
-                side_effect=RuntimeError("neptune down"),
-            ),
-            pytest.raises(RuntimeError, match="neptune down"),
-        ):
-            _reconcile_counts("http://x.org/o#", "ns", "https://graph/uri")
-
-    def test_reconcile_counts_reports_nothing_to_do_as_false(self):
-        """``False`` is reserved for 'genuinely nothing to reconcile' (no counts
-        from the backend) — checkpointed ``skipped``, not a false ``done``."""
-        from coa_ontology.proposals import _reconcile_counts
-
-        graph = MagicMock()
-        graph.count_classes_and_properties.return_value = {}
-        with (
-            patch("coa_ontology.stores.build_stores", return_value=(graph, MagicMock())),
-            patch("coa_ontology.proposals.dynamo_store"),
-        ):
-            assert _reconcile_counts("http://x.org/o#", "ns", "https://graph/uri") is False
-
-    def test_reconcile_counts_reports_success_as_true(self):
-        from coa_ontology.proposals import _reconcile_counts
-
-        graph = MagicMock()
-        graph.count_classes_and_properties.return_value = {"classes": 3, "properties": 4}
-        with (
-            patch("coa_ontology.stores.build_stores", return_value=(graph, MagicMock())),
-            patch("coa_ontology.proposals.dynamo_store"),
-        ):
-            assert _reconcile_counts("http://x.org/o#", "ns", "https://graph/uri") is True
-
-    def test_emit_ontology_published_raises_so_the_wrapper_can_retry(self):
-        """A lost VKG-reload signal must be retried, not swallowed on attempt 1:
-        S3 is correct but VKG keeps serving the previous payload."""
-        from coa_ontology.proposals import _emit_ontology_published
-
-        with (
-            patch("boto3.client") as mock_client,
-            pytest.raises(RuntimeError, match="eventbridge down"),
-        ):
-            mock_client.return_value.put_events.side_effect = RuntimeError("eventbridge down")
-            _emit_ontology_published("ns", "v1")
-
-    def test_emit_ontology_published_raises_on_partial_failure(self):
-        """FailedEntryCount > 0 is a failure even though put_events returned 200,
-        so it must raise into the retry like any other transient failure."""
-        from coa_ontology.proposals import _emit_ontology_published
-
-        with (
-            patch("boto3.client") as mock_client,
-            pytest.raises(RuntimeError, match="FailedEntryCount=1"),
-        ):
-            mock_client.return_value.put_events.return_value = {"FailedEntryCount": 1, "Entries": [{"ErrorCode": "x"}]}
-            _emit_ontology_published("ns", "v1")
-
-    def test_emit_ontology_published_reports_success_as_true(self):
-        from coa_ontology.proposals import _emit_ontology_published
-
-        with patch("boto3.client") as mock_client:
-            mock_client.return_value.put_events.return_value = {"FailedEntryCount": 0, "Entries": [{"EventId": "e1"}]}
-            assert _emit_ontology_published("ns", "v1") is True
-
-    def test_persist_no_longer_emits_the_event_itself(self):
-        """notify_vkg is its own retried step now; persist must do S3 writes only,
-        so a lost notification can't be hidden inside a successful persist."""
-        from coa_ontology.proposals import _persist_induced_to_s3
-
-        with (
-            patch("boto3.client") as mock_client,
-            patch(
-                "coa_ontology.stores.neptune_db_graph._gsp_get_turtle",
-                return_value=":X a owl:Class .",
-            ),
-            patch("coa_ontology.proposals.dynamo_store") as mock_ds,
-            patch("coa_ontology.proposals._generate_schema_sql", return_value=None),
-            patch("coa_ontology.proposals._emit_ontology_published") as mock_emit,
-        ):
-            mock_ds.list_proposals.return_value = []
-            mock_client.return_value = MagicMock()
-            _persist_induced_to_s3("http://x.org/o#", "ns", "https://graph/uri")
-        mock_emit.assert_not_called()

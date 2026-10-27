@@ -307,7 +307,11 @@ def _check_active_induction_jobs(namespace_id: str) -> list[str]:
 
         active = body.get("activeJobs", 0)
         if active:
-            return [f"{active} ontology induction/ingest job(s) or proposal accept(s) in progress"]
+            # The engine's count covers every background writer, so name them all.
+            return [
+                f"{active} ontology job(s) in progress: induction, ingest, proposal accept, publish or "
+                "deployment, domain ABox build, or Ontology designer assistant turn"
+            ]
         return []
 
     # Exhausted retries without a successful response. Fail OPEN so an

@@ -642,6 +642,9 @@ export class ServeStack extends SCLStack {
           // ontology-engine neptune_db_graph). Serve reads these graphs, so a
           // reader-only override matches nothing — hence the guard above.
           GRAPH_URI_TEMPLATE: `${DEFAULT_GRAPH_URI_BASE}/{namespace}`,
+          // Tier 3 appends the domain ABox's facts to the lexical prompt. Serve still
+          // skips the ABox when its version differs from the deployed domain graph's.
+          ABOX_CONTEXT_ENABLED: "true",
           DATA_SOURCES_TABLE: dataSourcesTableName,
           NAMESPACES_TABLE: namespacesTableName,
           // Serve-path Cedar: DDB role-policy loading (control-plane parity).
@@ -829,6 +832,9 @@ export class ServeStack extends SCLStack {
             "athena:StartQueryExecution",
             "athena:GetQueryExecution",
             "athena:GetQueryResults",
+            // Stops a query whose caller gave up waiting, so it does not keep
+            // holding the account-wide active-query quota.
+            "athena:StopQueryExecution",
             "athena:GetWorkGroup",
             "athena:GetDataCatalog",
           ],
@@ -854,6 +860,8 @@ export class ServeStack extends SCLStack {
             "redshift-data:DescribeStatement",
             "redshift-data:GetStatementResult",
             "redshift-data:ListStatements",
+            // Cancels a statement whose caller gave up waiting.
+            "redshift-data:CancelStatement",
           ],
           // redshift-data actions do not support resource-level scoping to a
           // specific workgroup/statement (statement ids are created at call time

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React from "react";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { RationalePanel } from "./RationalePanel";
 import type { ChatMessage } from "@app-types";
@@ -434,6 +434,44 @@ describe("RationalePanel", () => {
     it("renders guardrails as passed when the t3.guardrail step succeeded", () => {
       renderPanel({ message: passedMessage });
       expect(screen.getByText("Guardrails: passed")).toBeInTheDocument();
+    });
+  });
+
+  describe("Tier-3 lexical-baseline answer", () => {
+    // The lexical path emits bare step IDs (no "t3." prefix); they still belong
+    // to the Tier 3 section, not a stray "Other" one.
+    const lexicalMessage: ChatMessage = {
+      id: "msg-t3-lexical",
+      role: "assistant",
+      content: "Acme Corp placed order 1001.",
+      timestamp: new Date("2026-01-01T12:00:00Z"),
+      response: {
+        requestId: "req-t3-lexical",
+        result: {
+          tier: 3,
+          confidence: { score: 0.85, rationale: "High confidence match" },
+          trace: [
+            {
+              step: "lexical_baseline_retrieve",
+              status: "success",
+              durationMs: 40,
+            },
+            { step: "domain_abox", status: "success", durationMs: 12 },
+            { step: "t3.synthesize", status: "success", durationMs: 800 },
+          ],
+          partial: false,
+        },
+      },
+    };
+
+    it("groups the domain facts step with Tier 3", () => {
+      renderPanel({ message: lexicalMessage });
+      const tier3 = screen.getByRole("list", {
+        name: "Tier 3 — Knowledge Retrieval",
+      });
+      expect(within(tier3).getByText("Lexical retrieval")).toBeInTheDocument();
+      expect(within(tier3).getByText("Domain facts")).toBeInTheDocument();
+      expect(screen.queryByText("Other")).not.toBeInTheDocument();
     });
   });
 

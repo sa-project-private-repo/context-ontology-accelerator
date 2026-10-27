@@ -8,9 +8,10 @@ state machine definition lives in CDK
 (``infra/lib/stacks/services/namespace-deletion-pipeline.ts``).
 
 Pipeline order (see pipeline construct for the full state machine):
-  1. delete_sources       — delete every source via the real sources-api
-                             delete path (S3 / OpenSearch / DataZone / Glue
-                             cleanup happens inside that Lambda, not here)
+  1. delete_sources       — stop the domain ABox builds, then delete every
+                             source via the real sources-api delete path
+                             (S3 / OpenSearch / DataZone / Glue cleanup
+                             happens inside that Lambda, not here)
   2. delete_metrics       — bulk-delete every metric via the real
                              metric-api delete path (Neptune + OpenSearch)
   3. delete_ontology      — ontology-engine full teardown + S3 artifacts

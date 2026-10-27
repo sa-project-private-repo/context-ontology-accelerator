@@ -61,6 +61,11 @@ describe("label maps cover the boundary-control step IDs", () => {
     }
   });
 
+  it("labels the bare domain-ABox step the Tier 3 lexical path emits", () => {
+    expect(STEP_LABELS.domain_abox).toBe("Domain facts");
+    expect(STEP_DISPLAY_NAMES.domain_abox).toBe("Domain facts");
+  });
+
   it("live STEP_LABELS and plan STEP_DISPLAY_NAMES share the core tier IDs", () => {
     for (const id of [
       "t1.metric_match",

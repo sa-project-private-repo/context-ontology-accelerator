@@ -33,11 +33,18 @@ use com.amazon.semanticcontext.common#ValidationError
         resultTtlInSeconds: 0
     }
 )
+// The web app calls RunSparqlQuery (the Ontology designer's Query tab), so the browser's preflight needs an answer.
+@cors(
+    origin: "${CorsOrigin}"
+    additionalAllowedHeaders: ["Authorization", "Content-Type", "x-amz-content-sha256"]
+    maxAge: 3600
+)
 service DataLayerService {
     version: "2025-05-01"
     operations: [
         Query
         TranslateSPARQL
+        RunSparqlQuery
         KBSearch
         GraphTraverse
         DescribeSchema

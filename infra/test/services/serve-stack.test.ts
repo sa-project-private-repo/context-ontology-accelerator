@@ -365,6 +365,23 @@ describe("ServeStack - Redshift execution engine IAM", () => {
     });
   });
 
+  it("lets the serve runtime stop the queries it stops waiting for", () => {
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Effect: "Allow",
+            Action: Match.arrayWith(["athena:StopQueryExecution"]),
+          }),
+          Match.objectLike({
+            Effect: "Allow",
+            Action: Match.arrayWith(["redshift-data:CancelStatement"]),
+          }),
+        ]),
+      },
+    });
+  });
+
   it("grants redshift-serverless:GetCredentials scoped to workgroups", () => {
     template.hasResourceProperties("AWS::IAM::Policy", {
       PolicyDocument: {
@@ -880,6 +897,16 @@ describe("ServeStack - GRAPH_URI_TEMPLATE reader/writer alignment", () => {
     expect(() =>
       createStack({ graph_uri_template: "https://x.example/{namespace}" }),
     ).toThrow(/DEFAULT_GRAPH_URI_BASE/);
+  });
+});
+
+describe("ServeStack - ABOX_CONTEXT_ENABLED", () => {
+  it("turns the Tier 3 domain-ABox context on in the runtime environment", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        ABOX_CONTEXT_ENABLED: "true",
+      }),
+    });
   });
 });
 

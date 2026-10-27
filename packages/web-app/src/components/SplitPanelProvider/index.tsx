@@ -39,8 +39,10 @@ export function SplitPanelProvider({
     setState({ content, isOpen: true, header });
   }, []);
 
+  // Closing a closed panel keeps the state, so its consumers do not render
+  // again: a page that closes the panel from an effect cannot loop through them.
   const closePanel = useCallback(() => {
-    setState((prev) => ({ ...prev, isOpen: false }));
+    setState((prev) => (prev.isOpen ? { ...prev, isOpen: false } : prev));
   }, []);
 
   return (

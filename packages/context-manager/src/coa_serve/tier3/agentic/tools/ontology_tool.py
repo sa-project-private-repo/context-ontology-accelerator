@@ -34,6 +34,11 @@ controller additionally caches the ontology on its accumulated context so it nee
 not re-invoke this tool at all within a request (Req 3.8); the tool-level cache is
 the defensive second layer that keeps a redundant invocation cheap.
 
+Deploys. Given a reader of the ontology version Neptune serves (the graph source
+gets one), an entry also records the version it was loaded under, and a lookup
+under another version loads again, so the first lookup after a deploy sees the
+deployed ontology.
+
 Empty result vs load failure are distinct outcomes (Req 3.10 vs 3.11). A successful
 load that yields no node types and no edge types is an EMPTY ontology: the tool
 returns a normal (non-degraded) :class:`ToolResult` carrying an ontology item with
@@ -62,6 +67,7 @@ from ..ontology import Ontology
 from .base import ToolResult
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ....served_version import ServedVersionReader
     from ..ontology import OntologySource
     from .registry import ToolRegistry
 
@@ -135,7 +141,13 @@ class OntologyLookupTool:
     (Req 3.10 vs 3.11).
     """
 
-    def __init__(self, source: OntologySource, *, source_name: str | None = None) -> None:
+    def __init__(
+        self,
+        source: OntologySource,
+        *,
+        source_name: str | None = None,
+        served_versions: ServedVersionReader | None = None,
+    ) -> None:
         """Build the Tool over an :class:`OntologySource`.
 
         Args:
@@ -146,6 +158,10 @@ class OntologyLookupTool:
             source_name: Human-readable label for the source in use, recorded in
                 the failure ``detail`` so the trace can name the source that failed
                 (Req 3.11). Defaults to the source's class name.
+            served_versions: Optional reader of the ontology version Neptune serves.
+                When given, a cached ontology is reused only while that version is
+                the one it was loaded under, so a deploy invalidates it. Without
+                it (the file source) the cache lasts as long as the Tool.
         """
         self.name = TOOL_NAME
         self.description = _DESCRIPTION
@@ -153,9 +169,11 @@ class OntologyLookupTool:
         self.output_schema = dict(_OUTPUT_SCHEMA)
         self._source = source
         self._source_name = source_name or type(source).__name__
-        # Per-namespace cache of successful loads (Req 3.8). Failures are not
-        # cached so a later attempt can retry.
-        self._cache: dict[str, Ontology] = {}
+        self._served_versions = served_versions
+        # Per-namespace cache of successful loads (Req 3.8), each with the served
+        # versions it was loaded under. Failures are not cached so a later attempt
+        # can retry.
+        self._cache: dict[str, tuple[frozenset[str] | None, Ontology]] = {}
 
     async def invoke(self, *, namespace: str, **_: Any) -> ToolResult:
         """Resolve the ontology for ``namespace`` and return a :class:`ToolResult`.
@@ -178,9 +196,11 @@ class OntologyLookupTool:
             carries no ontology item and a ``detail`` that says ``failed`` and names
             the source.
         """
+        served = await self._served(namespace)
         cached = self._cache.get(namespace)
-        if cached is not None:
-            return self._success_result(cached, from_cache=True)
+        # An unreadable version (None) keeps the cached ontology, as before versions.
+        if cached is not None and (served is None or cached[0] == served):
+            return self._success_result(cached[1], from_cache=True)
 
         try:
             ontology = await self._source.load(namespace)
@@ -206,8 +226,18 @@ class OntologyLookupTool:
         # 166/360 for the same namespace). Leaving empty uncached costs one re-query
         # next time and self-heals once the ontology is populated.
         if ontology.node_types or ontology.edge_types:
-            self._cache[namespace] = ontology
+            self._cache[namespace] = (served, ontology)
         return self._success_result(ontology, from_cache=False)
+
+    async def _served(self, namespace: str) -> frozenset[str] | None:
+        """Return the versions Neptune serves for ``namespace``, or ``None`` when unknown."""
+        if self._served_versions is None:
+            return None
+        try:
+            return await self._served_versions.versions(namespace)
+        except Exception as exc:  # noqa: BLE001 - a Tool must never raise (Req 9.1)
+            logger.warning("ontology_lookup_version_unread", namespace=namespace, error_type=type(exc).__name__)
+            return None
 
     def _success_result(self, ontology: Ontology, *, from_cache: bool) -> ToolResult:
         """Build the :class:`ToolResult` for a successful (possibly empty) load.
@@ -229,7 +259,13 @@ class OntologyLookupTool:
         return ToolResult(items=(_ontology_item(ontology),), detail=detail)
 
 
-def build_ontology_tool(registry: ToolRegistry, source: OntologySource, *, source_name: str | None = None) -> str:
+def build_ontology_tool(
+    registry: ToolRegistry,
+    source: OntologySource,
+    *,
+    source_name: str | None = None,
+    served_versions: ServedVersionReader | None = None,
+) -> str:
     """Register the single :class:`OntologyLookupTool` into ``registry``.
 
     Mirrors :func:`build_graph_tool` / :func:`build_vector_tool`: a thin builder
@@ -242,11 +278,13 @@ def build_ontology_tool(registry: ToolRegistry, source: OntologySource, *, sourc
         registry: The :class:`ToolRegistry` to register the tool into.
         source: The configured :class:`OntologySource` the tool resolves through.
         source_name: Optional human-readable source label for failure traces.
+        served_versions: Optional reader of the served ontology version that the
+            cache is keyed on (see :class:`OntologyLookupTool`).
 
     Returns:
         The registered Tool name (``"ontology_lookup"``).
     """
-    tool = OntologyLookupTool(source, source_name=source_name)
+    tool = OntologyLookupTool(source, source_name=source_name, served_versions=served_versions)
     registry.register(tool)
     logger.info("ontology_tool_registered", tool_name=tool.name, source=tool._source_name)
     return tool.name

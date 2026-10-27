@@ -18,6 +18,7 @@ use com.amazon.semanticcontext.common#PresignedUrl
 use com.amazon.semanticcontext.common#ServiceUnavailableError
 use com.amazon.semanticcontext.common#Uuid
 use com.amazon.semanticcontext.common#ValidationError
+use com.amazon.semanticcontext.graphstudio#StudioRevision
 use com.amazon.semanticcontext.metric#DataSourceId
 
 // ── Local constrained primitives ────────────────────────────────────
@@ -510,6 +511,21 @@ operation GetProposal {
         /// Populated when an ``accepting`` → ``pending`` rollback occurred;
         /// cleared on the next ``AcceptProposal`` call.
         acceptError: String
+
+        /// Version this proposal's accept published; absent until the accept succeeds.
+        publishedVersion: Integer
+
+        /// Why the automatic deployment after accept did not start (`reason`, optional `metrics` or
+        /// `error`); absent when it started or was not requested.
+        autoDeployHeld: Document
+
+        /// Identifier of the deployment started automatically after accept; absent when none was started.
+        autoDeployId: String
+
+        /// Ontology designer draft state (`base_version`, `revision`, `ontology_id`, `style`, `applied`, `redo`,
+        /// `counts`, `opened_at`, `opened_by`, `updated_at`, `updated_by`); absent until the proposal is
+        /// opened in the Ontology designer, after which its Turtle edits go through the designer only.
+        studio: Document
     }
 
     errors: [
@@ -517,15 +533,22 @@ operation GetProposal {
     ]
 }
 
-/// Accept a proposal asynchronously — merge its ontology into the target
-/// namespace on a background worker. Returns 202 immediately with the
-/// proposal flipped to ``accepting``. Clients poll ``GetProposal`` until
-/// ``status`` becomes ``accepted`` (success) or ``pending`` (failed —
-/// ``acceptError`` on the proposal record carries the reason).
+/// Accept a proposal asynchronously: publish it as the namespace's next immutable ontology
+/// version, and deploy that version unless `deploy` is false. Returns 202 with the proposal
+/// flipped to ``accepting``. Clients poll ``GetProposal`` until ``status`` becomes ``accepted``
+/// (with ``publishedVersion``) or ``accept_failed`` (``acceptError`` carries the reason).
 ///
 /// Naturally idempotent, so there is no `clientToken`: accepting an
-/// already-accepted proposal returns ``accepted`` without starting a new job,
+/// already-accepted proposal returns ``accepted`` without publishing again,
 /// and a repeat while the first accept is in progress is a ConflictError (409).
+///
+/// A proposal open in the Ontology designer is accepted as its draft: the revision named by `expectedRevision`
+/// is published, in replace mode, as the whole next version. Errors carry `detail.code`: 422
+/// `ExpectedRevisionRequired` without `expectedRevision`; 409 `DraftConflict` (with the current
+/// `revision`) when the draft moved on; 409 `RebaseRequired` (with `baseVersion` and `headVersion`)
+/// when a newer version was published after the draft was built. When a newer version lands after
+/// those checks the publish fails instead: ``accept_failed``, with an ``acceptError`` that advises a
+/// rebase and `accept_progress.code` set to `RebaseRequired` on the proposal row.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/accept", code: 202)
 operation AcceptProposal {
     input := {
@@ -539,6 +562,14 @@ operation AcceptProposal {
 
         /// Target ontology ID to merge into. If omitted, uses the proposal's own ontology ID.
         ontologyId: OntologyId
+
+        /// Deploy the published version immediately (default true). When false the version is only published.
+        deploy: Boolean
+
+        /// Required for a proposal open in the Ontology designer: the draft revision the user reviewed. The accept
+        /// publishes that revision as the whole next version; 409 `DraftConflict` when the draft moved on,
+        /// 409 `RebaseRequired` when a newer version was published after it was built.
+        expectedRevision: StudioRevision
     }
 
     output := {
@@ -552,6 +583,7 @@ operation AcceptProposal {
     errors: [
         NotFoundError
         ConflictError
+        ValidationError
     ]
 }
 
@@ -618,6 +650,8 @@ operation CancelProposal {
 /// ``PATCH /{proposalId}`` because PATCH ergonomics are awkward with
 /// API Gateway request validation here. Either Turtle artifact may be
 /// independently revised.
+///
+/// A proposal open in the Ontology designer refuses the update with 409 `StudioDraftOpen`: edit it in the designer.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/update", code: 200)
 operation UpdateProposal {
     input := {
@@ -690,6 +724,8 @@ operation UpdateProposal {
 /// A 409, 412, or ambiguous network outcome requires requesting a fresh
 /// revision and re-uploading every changed artifact; callers must not reuse the
 /// prior URLs or assume that an uncertain write succeeded.
+///
+/// A proposal open in the Ontology designer refuses with 409 `StudioDraftOpen`: edit it in the designer.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/upload-url", code: 200)
 operation GetProposalUploadUrls {
     input := {
@@ -960,8 +996,19 @@ operation GetProposalValidationJob {
 /// persisting — used by the accept-time guard to detect unrepaired datatype
 /// issues before an accept, without mutating the proposal.
 ///
+/// A proposal open in the Ontology designer is repaired in its draft, not in the stored Turtle: the change list
+/// is computed over the draft's current revision, and a repair (no `dryRun`) applies it as one change
+/// set of `replace_datatype` ops, a new revision that can be undone. It needs `expectedRevision`, and
+/// the output carries the draft's `revision` afterwards (unchanged when there was nothing to repair).
+/// Errors carry `detail.code`: 422 `ExpectedRevisionRequired` without `expectedRevision`; 409
+/// `DraftConflict` (with the current `revision`) when the draft moved on; 409 `ProposalNotEditable`
+/// (with `status`) once the proposal left review; 409 `InvalidChange` when a token cannot be rewritten
+/// (for example one that is not an XSD datatype).
+///
 /// Naturally idempotent, so there is no `clientToken`: a repeat finds the
-/// tokens already canonical and rewrites nothing (`repairedCount` 0).
+/// tokens already canonical and rewrites nothing (`repairedCount` 0). For a
+/// designer draft a repeat that names the revision the first repair moved
+/// on from is a 409 `DraftConflict`, whose `revision` shows the repair landed.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/repair-datatypes", code: 200)
 operation RepairProposalDatatypes {
     input := {
@@ -976,6 +1023,10 @@ operation RepairProposalDatatypes {
         /// When true, preview the repairs (return the change list) without
         /// persisting anything or changing the proposal's status. Defaults false.
         dryRun: Boolean
+
+        /// Required to repair (not to preview) a proposal open in the Ontology designer: the draft revision the
+        /// user reviewed. 409 `DraftConflict` when the draft moved on.
+        expectedRevision: StudioRevision
     }
 
     output := {
@@ -994,6 +1045,10 @@ operation RepairProposalDatatypes {
 
         /// Echoes the request mode: true when this was a non-persisting preview.
         dryRun: Boolean
+
+        /// The designer draft's revision after the repair; absent for a proposal not open in the designer
+        /// and for a dry run.
+        revision: Integer
     }
 
     errors: [

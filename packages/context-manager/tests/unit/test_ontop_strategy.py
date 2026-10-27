@@ -297,6 +297,27 @@ class TestOntopStrategyResolve:
         assert len(validate_steps) == 1, "expected the retry's validate sub-step to be replayed"
 
     @pytest.mark.asyncio
+    async def test_a_version_skew_is_not_retried_and_the_trace_says_why(self, strategy, nl_to_sparql, vkg_translator):
+        """A VKG still on the previous version compiles any SPARQL against the old
+        mapping, so rewriting the SPARQL cannot help: no retry, no result, and the
+        compile step names both versions so the fallback is explained."""
+        nl_to_sparql.translate.return_value = _make_sparql_result()
+        skewed = _make_tier2_result(error="vkg_version_skew")
+        reason = "The VKG still serves v1; the ontology is v2."
+        skewed.trace_steps[0].detail = {"error": "vkg_version_skew", "reason": reason}
+        vkg_translator.resolve.return_value = skewed
+        context = _make_context()
+
+        result = await strategy.resolve("How many purchase orders?", "ns1", context)
+
+        assert result is None
+        assert nl_to_sparql.translate.call_count == 1
+        assert vkg_translator.resolve.call_count == 1
+        compile_steps = [s for s in context.trace.steps if s.step == "t2.vkg.compile"]
+        assert [(s.status, s.detail["reason"]) for s in compile_steps] == [("error", reason)]
+        assert not [s for s in context.trace.steps if s.step == "t2.vkg.retry"]
+
+    @pytest.mark.asyncio
     async def test_retry_also_fails_surfaces_both_compile_steps(self, strategy, nl_to_sparql, vkg_translator):
         """When the retry's VKG translation also fails, BOTH compile failures
         must be visible — the first attempt's and the retry's — so the trace

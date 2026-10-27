@@ -338,3 +338,51 @@ describe("NamespaceDeletionPipeline GraphRAG index teardown", () => {
     );
   });
 });
+
+describe("NamespaceDeletionPipeline domain ABox teardown", () => {
+  let template: Template;
+
+  beforeAll(() => {
+    const app = new cdk.App();
+    const stack = new cdk.Stack(app, "AboxStack");
+    const vpc = new ec2.Vpc(stack, "Vpc");
+    const table = (id: string) =>
+      new dynamodb.Table(stack, id, {
+        partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+      });
+
+    new NamespaceDeletionPipeline(stack, "DeletionPipeline", {
+      prefixed: (name: string) => `coa-dev-${name}`,
+      lambdaCode: lambda.Code.fromInline("def handler(event, context): pass"),
+      vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      namespacesTable: table("Namespaces"),
+      resourceRoleMappingsTable: table("RRM"),
+      rolesTable: table("Roles"),
+      sourcesApiFnName: "coa-dev-sources-api",
+      metricApiFnName: "coa-dev-metric-api",
+      ontologyEngineEndpoint: "http://ontology-engine.coa-dev-services.local:8001",
+      resourcePrefix: "coa-dev-",
+    });
+    template = Template.fromStack(stack);
+  });
+
+  test("DeleteSources Lambda can reach the ontology-engine to stop ABox builds first", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "coa-dev-ns-deletion-sources",
+      Environment: {
+        Variables: Match.objectLike({
+          ONTOLOGY_ENGINE_ENDPOINT:
+            "http://ontology-engine.coa-dev-services.local:8001",
+        }),
+      },
+    });
+  });
+
+  test("DeleteOntology Lambda outlasts the engine call's 300s timeout plus the S3 sweep", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "coa-dev-ns-deletion-ontology",
+      Timeout: 480,
+    });
+  });
+});

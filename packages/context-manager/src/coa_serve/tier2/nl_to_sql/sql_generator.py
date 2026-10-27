@@ -11,7 +11,9 @@ Pipeline:
     reached tables with their columns (``graph_expander``; on by default, and skipped
     when no graph client is wired)
 4. Build DDL context from retrieved class metadata
-5. LLM generates SQL directly from question + DDL context
+5. LLM generates SQL directly from question + DDL context. Told the namespace's terms
+   that no table holds (``unmapped_terms``), it replies ``CANNOT_ANSWER`` instead of SQL
+   to a question about one of them
 
 Execution is handled by the orchestrator — this component only generates SQL.
 """
@@ -28,8 +30,17 @@ from typing import Any, Protocol, runtime_checkable
 import structlog
 
 from ...clients.base import ConverseResult, LLMClient, VectorClient, VectorHit
+from ...served_version import ServedVersionReader
 from ..sql_firewall import SQLFirewall
 from ..table_qualifier import AMBIGUOUS_KEY, AMBIGUOUS_SOURCE
+from ..unmapped_terms import (
+    CANNOT_ANSWER,
+    DECLINED,
+    UnmappedTerms,
+    UnmappedTermsReader,
+    declined,
+    sql_prompt_block,
+)
 
 # Matches opening OR closing <user_context> tags, case-insensitively and
 # tolerant of surrounding whitespace (e.g. "</USER_CONTEXT>",
@@ -114,8 +125,9 @@ def _resolve_max_output_tokens() -> int:
 # schema, so hop 2 would trade a missing join table for a haystack.
 #
 # MAX_TABLES bounds the APPENDED block, whose size is otherwise set by FK fan-out
-# rather than by relevance: the walk is unconditional and ranks by hop then label
-# (adjacency, not question similarity), so on a wide schema an uncapped hop-1
+# rather than by relevance: the walk is unconditional and ranks by hop then table
+# name, the ``coa:physicalName`` deploy wrote or else the label (adjacency, not
+# question similarity), so on a wide schema an uncapped hop-1
 # frontier is dozens of tables and the appended block dominates a prompt whose
 # useful part came from retrieval. The reference point is the retrieved block:
 # retrieval contributes ``DEFAULT_RETRIEVAL_K`` (7) tables, so this roughly doubles
@@ -329,6 +341,9 @@ class NLtoSQLResult:
     # SQL per shot — including corrected SQL, whose table set may differ — without
     # holding on to the retrieval hits. Pass it through ``sql_table_routing``.
     table_sources: dict[str, str] = field(default_factory=dict)
+    # The terms with no table that the writer was told of, so the correction shot is
+    # told the same (see SQLGenerator.correct).
+    unmapped_terms: UnmappedTerms = field(default_factory=UnmappedTerms)
 
 
 class SQLGenerator:
@@ -352,6 +367,8 @@ class SQLGenerator:
         guardrail_id: str | None = None,
         *,
         guardrail_id_provider: Callable[[], str] | None = None,
+        served_versions: ServedVersionReader | None = None,
+        unmapped_terms: UnmappedTermsReader | None = None,
     ):
         """Configure the LLM/vector clients, FK graph, and generation limits.
 
@@ -369,6 +386,14 @@ class SQLGenerator:
             guardrail_id_provider: Optional callable returning the guardrail id
                 LIVE on each call; when supplied it takes precedence over
                 ``guardrail_id`` at the generation call site.
+            served_versions: Optional reader of the ontology version Neptune serves,
+                consulted only when no class is mapped (see the legacy bridge in
+                :meth:`generate`). Without it the bridge works as before.
+            unmapped_terms: Optional reader of the namespace's terms that no table
+                maps. :meth:`generate` lists them to the writer, which replies
+                ``CANNOT_ANSWER`` to a question about one of them instead of writing
+                SQL that stands in for it. Without it, or with nothing to list, the
+                prompt is as before.
         """
         self._llm = llm_client
         self._vector = vector_client
@@ -378,6 +403,8 @@ class SQLGenerator:
         self._system_prompt = _build_system_prompt(dialect)
         self._guardrail_id = guardrail_id
         self._guardrail_id_provider = guardrail_id_provider
+        self._served_versions = served_versions
+        self._unmapped_terms = unmapped_terms
 
     def _effective_guardrail_id(self) -> str | None:
         """Resolve the guardrail id LIVE via the provider when injected.
@@ -391,6 +418,20 @@ class SQLGenerator:
             gid = self._guardrail_id_provider()
             return gid or None
         return self._guardrail_id
+
+    async def _has_published_version(self, namespace: str) -> bool:
+        """True when Neptune serves a published version of ``namespace``.
+
+        False without a reader, and when the version cannot be read: NL-to-SQL has
+        never depended on Neptune here, so a namespace then keeps today's bridge.
+        """
+        if self._served_versions is None:
+            return False
+        try:
+            return bool(await self._served_versions.versions(namespace))
+        except Exception as e:  # noqa: BLE001 - an unreadable version keeps the legacy behavior
+            logger.warning("nl_to_sql_version_check_failed", namespace=namespace, error=type(e).__name__)
+            return False
 
     @property
     def llm(self) -> LLMClient:
@@ -492,10 +533,14 @@ class SQLGenerator:
         # silently break Tier-2. A cheap count gate (count_documents) decides once
         # per request whether the namespace has ANY mapped class; if none, we drop
         # the gate and run an unfiltered top-k (mirrors the T-Box isMapped bridge).
+        # Except for a namespace with a published version: deploy rewrites the class
+        # documents with every version and stamps data_source_id on each class mapped
+        # from a source, so none there means none is mapped (say, the designer deleted
+        # them all), and its unmapped classes have no table to write SQL against.
         start = time.perf_counter()
         try:
             mapped_count = await self._vector.count_documents(index=index, entity_type="class", require_mapped=True)
-            use_mapped_gate = mapped_count > 0
+            use_mapped_gate = mapped_count > 0 or await self._has_published_version(namespace)
 
             hits = await self._vector.search(
                 query_embedding,
@@ -684,12 +729,31 @@ class SQLGenerator:
             context_preview_truncated=len(ddl_context) > _CONTEXT_PREVIEW_CHARS,
         )
 
-        # Step 5: Generate SQL via LLM
+        # Step 5: Generate SQL via LLM, told the terms no table holds (none for a
+        # namespace without them, whose prompt is unchanged).
+        unmapped = await self._unmapped_terms.read(namespace) if self._unmapped_terms else UnmappedTerms()
         start = time.perf_counter()
         try:
             sql, confidence = await self._generate_sql(
-                question, ddl_context, evidence, model_id=model_id, dialect=dialect, governed_metric=governed_metric
+                question,
+                ddl_context,
+                evidence,
+                model_id=model_id,
+                dialect=dialect,
+                governed_metric=governed_metric,
+                unmapped_terms=unmapped,
             )
+            # Only a prompt that listed terms offered the word: without them it is SQL, as before.
+            if unmapped and sql == CANNOT_ANSWER:
+                trace.append({"step": "generate_sql", "status": "declined", "ms": _ms(start)})
+                return NLtoSQLResult(
+                    sql="",
+                    retrieved_tables=retrieved_tables,
+                    expanded_tables=expanded_tables,
+                    trace_steps=trace,
+                    error=DECLINED,
+                    unmapped_terms=unmapped,
+                )
             trace.append({"step": "generate_sql", "status": "ok", "ms": _ms(start), "confidence": confidence})
         except Exception as e:
             logger.warning("nl_to_sql_generate_failed", error=str(e), error_type=type(e).__name__)
@@ -719,6 +783,7 @@ class SQLGenerator:
             data_source_id=resolved_source,
             ddl_context=ddl_context,
             table_sources=table_sources,
+            unmapped_terms=unmapped,
         )
 
     async def generate_from_context(
@@ -737,7 +802,10 @@ class SQLGenerator:
         The public seam onto the SQL writer for callers that do their own table
         selection — the Tier-2 tool layer, whose consumer chose the tables
         explicitly — so retrieval is skipped but generation stays identical to
-        :meth:`generate`'s final step.
+        :meth:`generate`'s final step, except that the writer is not told the
+        namespace's terms that no table maps: the deep-reasoning agent, whose
+        ``generate_sql`` tool calls this, never sees ``CANNOT_ANSWER`` and writes
+        SQL as before.
 
         Args:
             question: Natural language question.
@@ -771,6 +839,7 @@ class SQLGenerator:
         evidence: str = "",
         model_id: str | None = None,
         governed_metric: str = "",
+        unmapped_terms: UnmappedTerms | None = None,
     ) -> tuple[str, float]:
         """LLM-driven repair of a SQL statement that failed to execute.
 
@@ -793,7 +862,13 @@ class SQLGenerator:
         the schema, discarding the governed formula on exactly the retry the writer
         most needs it — the point of #1116.
 
-        Returns (corrected_sql, confidence).
+        ``unmapped_terms`` are the terms with no table the first shot was told of
+        (``NLtoSQLResult.unmapped_terms``). A first shot that used one of them as a
+        column fails, and without them the correction drops the condition and answers
+        a broader question; with them it can reply ``CANNOT_ANSWER``.
+
+        Returns (corrected_sql, confidence), or (``CANNOT_ANSWER``, 0.0) when the
+        writer replied that the schema cannot answer the question.
         """
         evidence_block = (
             (
@@ -808,8 +883,12 @@ class SQLGenerator:
         governed_metric_block = (
             f"\n## Governed metric (first-party, authoritative)\n{governed_metric}\n" if governed_metric else ""
         )
+        unmapped_block, return_line = _unmapped_parts(
+            unmapped_terms, "Return ONLY the corrected SQL in a ```sql code block"
+        )
         prompt = (
             f"## Database Schema (relevant tables)\n```sql\n{ddl_context}\n```\n"
+            f"{unmapped_block}"
             f"{governed_metric_block}"
             f"{evidence_block}"
             f"\n## Question\n{question}\n\n"
@@ -820,7 +899,7 @@ class SQLGenerator:
             "type mismatch needing a CAST, a column/table not present in the "
             "schema, a wrong function signature, or a missing GROUP BY column — "
             "but rely on the actual error, not assumptions.\n"
-            "Return ONLY the corrected SQL in a ```sql code block.\n"
+            f"{return_line}\n"
             "After the query, rate your confidence (0.0-1.0). Format: Confidence: X.X"
         )
 
@@ -833,6 +912,9 @@ class SQLGenerator:
             model_id=model_id,
         )
         _warn_if_truncated(result, max_tokens, step="correct")
+        if unmapped_terms and declined(result.text):
+            logger.info("nl_to_sql_declined", step="correct", reply=result.text[:200])
+            return CANNOT_ANSWER, 0.0
         return _extract_sql(result.text), _extract_confidence(result.text)
 
     def _expand_with_fk(self, tables: list[str]) -> list[str]:
@@ -860,6 +942,7 @@ class SQLGenerator:
         dialect: str | None = None,
         feedback: str = "",
         governed_metric: str = "",
+        unmapped_terms: UnmappedTerms | None = None,
     ) -> tuple[str, float]:
         """Call LLM to generate SQL from question and DDL context.
 
@@ -880,9 +963,14 @@ class SQLGenerator:
                 which is labelled untrusted user input and truncated to 500
                 chars. Given, the writer extends the governed formula instead of
                 reinventing one.
+            unmapped_terms: Optional terms of the namespace that no table holds. Given
+                any, they are listed after the schema with the rule to reply
+                ``CANNOT_ANSWER`` to a question about one of them; none leaves the
+                prompt byte-identical.
 
         Returns:
-            Tuple of (sql_string, confidence_score).
+            Tuple of (sql_string, confidence_score), or (``CANNOT_ANSWER``, 0.0) when
+            the writer replied that the schema cannot answer the question.
         """
         evidence_block = (
             (
@@ -919,12 +1007,14 @@ class SQLGenerator:
         # exempt. Duplicating the question here in the prompt text would
         # double the token cost with no additional protection, since the
         # guardrail can only score the guardContent copy.
+        unmapped_block, return_line = _unmapped_parts(unmapped_terms, "Return the SQL in a ```sql code block")
         prompt = (
             f"## Database Schema (relevant tables)\n```sql\n{ddl_context}\n```\n"
+            f"{unmapped_block}"
             f"{governed_metric_block}"
             f"{evidence_block}"
             f"{feedback_block}\n"
-            "Return the SQL in a ```sql code block.\n"
+            f"{return_line}\n"
             "After the query, rate your confidence (0.0-1.0) that this query "
             "correctly answers the question. Format: Confidence: X.X"
         )
@@ -948,7 +1038,21 @@ class SQLGenerator:
         )
 
         _warn_if_truncated(result, max_tokens, step="generate")
+        if unmapped_terms and declined(result.text):
+            logger.info("nl_to_sql_declined", step="generate", reply=result.text[:200])
+            return CANNOT_ANSWER, 0.0
         return _extract_sql(result.text), _extract_confidence(result.text)
+
+
+def _unmapped_parts(unmapped_terms: UnmappedTerms | None, return_line: str) -> tuple[str, str]:
+    """``(block, closing line)`` for a prompt: the terms no table holds and their rule, when there are any.
+
+    Without any, the block is empty and the closing line is ``return_line`` as before,
+    so the prompt is byte-identical.
+    """
+    if not unmapped_terms:
+        return "", f"{return_line}."
+    return f"\n{sql_prompt_block(unmapped_terms)}\n", f"{return_line}, or reply CANNOT_ANSWER as described above."
 
 
 def _warn_if_truncated(result: ConverseResult, max_tokens: int, *, step: str) -> None:

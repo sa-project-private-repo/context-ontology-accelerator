@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ...clients.factory import _graph_store_uri, build_lexical_retriever
+from ...served_version import ServedVersionReader
 from ..vector_retriever import VectorRetriever
 from .budget import AgenticBudgetConfig
 from .ontology import OntologyFileSource, OntologyGraphSource
@@ -140,6 +141,7 @@ def build_tool_registry(
     vector_retriever: VectorRetriever | None = None,
     ontology_source: OntologySource | None = None,
     structured_query_tier: Any | None = None,
+    served_versions: ServedVersionReader | None = None,
 ) -> ToolRegistry:
     """Build the internal :class:`ToolRegistry` with endpoint-gated tools (Req 12.4-12.6).
 
@@ -161,6 +163,9 @@ def build_tool_registry(
         structured_query_tier: Optional Tier-2 structured-query tier; when supplied
             the ``nl_to_sql`` / ``nl_to_sparql`` structured tools are registered so
             the planner can query databases (omitted when ``None``).
+        served_versions: Optional reader of the ontology version Neptune serves, the
+            one serve shares with Tier 2. The ``graph`` ontology source keys its
+            cache on it; ``None`` gives that source a reader of its own.
 
     Returns:
         The populated :class:`ToolRegistry`, never exposed outside the Serve_Layer
@@ -255,7 +260,12 @@ def build_tool_registry(
 
     # ── Ontology_Lookup_Tool — ALWAYS (Req 12.4) ───────────────────────
     source = ontology_source if ontology_source is not None else build_ontology_source(config, clients)
-    build_ontology_tool(registry, source, source_name=type(source).__name__)
+    # The graph source reads the deployed ontology, so its cache follows the version
+    # Neptune serves; a file does not change with a deploy.
+    lookup_versions = None
+    if isinstance(source, OntologyGraphSource):
+        lookup_versions = served_versions if served_versions is not None else ServedVersionReader(clients.graph)
+    build_ontology_tool(registry, source, source_name=type(source).__name__, served_versions=lookup_versions)
 
     logger.info(
         "agentic_tool_registry_built",
@@ -276,6 +286,7 @@ def build_agentic_retriever(
     embed_client: LLMClient | None = None,
     structured_query_tier: Any | None = None,
     guardrail_id_provider: Callable[[], str] | None = None,
+    served_versions: ServedVersionReader | None = None,
 ) -> AgenticRetriever:
     """Compose the :class:`AgenticRetriever` from the registry and its collaborators.
 
@@ -310,6 +321,8 @@ def build_agentic_retriever(
             each call; forwarded to the :class:`Synthesizer` and
             :class:`DecompositionPlanner` so an operator's SSM guardrail change
             reaches the warm agentic path without a redeploy.
+        served_versions: Optional reader of the served ontology version, forwarded
+            to :func:`build_tool_registry` for the ontology lookup's cache.
 
     Returns:
         The composed :class:`AgenticRetriever`.
@@ -324,7 +337,11 @@ def build_agentic_retriever(
         registry
         if registry is not None
         else build_tool_registry(
-            config, clients, vector_retriever=vector_retriever, structured_query_tier=structured_query_tier
+            config,
+            clients,
+            vector_retriever=vector_retriever,
+            structured_query_tier=structured_query_tier,
+            served_versions=served_versions,
         )
     )
     # The agentic path synthesizes over EVERY chunk its multi-step session gathered

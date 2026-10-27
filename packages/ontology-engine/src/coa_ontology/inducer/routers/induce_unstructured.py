@@ -135,9 +135,10 @@ def start_unstructured_job(
     # the in-flight window). The block-until-reviewed proposal check runs
     # AFTER it is acquired — see below.
     #
-    # Unstructured proposals go through the same accept pipeline as structured
-    # ones (accepting -> embeddings_sync -> accepted | accept_failed), so they
-    # block on the same status set, defined once in proposals.py.
+    # Unstructured proposals go through the same accept as structured ones
+    # (accepting -> accepted | accept_failed; legacy rows may still sit in
+    # embeddings_sync), so they block on the same status set, defined once in
+    # proposals.py.
     from coa_ontology.proposals import PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
 
     try:

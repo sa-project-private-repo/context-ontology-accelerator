@@ -13,6 +13,7 @@
  */
 import {
   createContext,
+  type MouseEvent as ReactMouseEvent,
   useCallback,
   useContext,
   useEffect,
@@ -42,8 +43,13 @@ import {
   Position,
   ReactFlowProvider,
   applyNodeChanges,
+  getViewportForBounds,
   useStore,
+  useStoreApi,
   useReactFlow,
+  type Rect,
+  type Viewport,
+  type XYPosition,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import "./graph.css";
@@ -53,8 +59,12 @@ import {
   HUB_DEGREE_THRESHOLD,
   isolatedNodeIds,
   layoutForceGraph,
+  type LayoutEdge,
 } from "./layout";
-import { useLiveForceSimulation } from "./useLiveForceSimulation";
+import {
+  settledBounds,
+  useLiveForceSimulation,
+} from "./useLiveForceSimulation";
 import { projectEdgeLabel } from "./labelProjection";
 import { useAppI18n } from "../../i18n/LocaleProvider";
 import type { AppMessage } from "../../i18n/appMessages";
@@ -75,9 +85,25 @@ export interface GraphNodeData {
   hasChildren?: boolean;
   /** True when the node's sub-classes are currently all visible. */
   expanded?: boolean;
-  /** Datatype properties of this class, revealed as nodes on hover. */
+  /** Datatype properties of this class, revealed as nodes on hover and after a click. */
   attributes?: GraphAttribute[];
+  /** A small pill on the node (Ontology designer: the class's domain ABox instance count). */
+  badge?: GraphNodeBadge;
+  /** What a previewed change does to the node (Ontology designer change set preview). */
+  highlight?: GraphHighlight;
   [key: string]: unknown;
+}
+
+/** A previewed change: drawn green, orange or red (dashed for removed). */
+export type GraphHighlight = "added" | "changed" | "removed";
+
+/** A pill drawn at the top of a node. */
+export interface GraphNodeBadge {
+  text: string;
+  /** Tooltip; also the accessible name of the pill. */
+  title?: string;
+  /** Drawn faded (Ontology designer: the ABox does not match the active version). */
+  dimmed?: boolean;
 }
 
 /** A datatype property (attribute) of a class. */
@@ -98,6 +124,8 @@ export interface GraphEdgeData {
   label?: string;
   /** Drives edge styling: subclass edges are dashed purple with a hollow arrow. */
   kind?: GraphEdgeKind;
+  /** What a previewed change does to the edge; overrides the kind's color. */
+  highlight?: GraphHighlight;
 }
 
 export type GraphLayout = "hierarchical" | "force";
@@ -120,6 +148,30 @@ interface Props {
    * sub-classes (or collapse them again when already expanded).
    */
   onNodeExpand?: (node: GraphNodeData) => void;
+  /**
+   * Ids drawn as selected. With `onSelectionChange`, a click selects one node
+   * and a Shift/Ctrl/Cmd-click adds or removes one (multi-select).
+   */
+  selectedIds?: readonly string[];
+  onSelectionChange?: (ids: string[]) => void;
+  /** Right-click on a node; the browser menu is suppressed only when this is set. */
+  onNodeContextMenu?: (
+    node: GraphNodeData,
+    point: { x: number; y: number },
+  ) => void;
+  /**
+   * Keep class labels readable, in the force layout (the Ontology designer).
+   * Below READABLE_ZOOM, nodes, attribute rings and relationship labels keep
+   * the size they have there, up to MAX_NODE_SCALE times their own, and the
+   * graph frames itself (when it opens, when its classes change, in and out
+   * of full screen) no further out than MIN_READABLE_FRAME_ZOOM. When the
+   * whole graph does not fit there, the frame centres the selected class,
+   * else `focusId`, else a hub or the class nearest the middle. The fit-view
+   * control still shows the whole graph.
+   */
+  readableLabels?: boolean;
+  /** The class a focus view is built around, centred as `readableLabels` says. */
+  focusId?: string | null;
 }
 
 /** React Flow node carrying our typed ontology payload. */
@@ -136,12 +188,158 @@ const NODE_SIZE = 64;
  */
 const MIN_STAGGER_CHORD = 220;
 
+/** Live force-simulation settings, shared with the settled-frame prediction. */
+const FORCE_OPTIONS = { nodeSize: NODE_SIZE, linkDistance: 330 };
+
 /** Edge labels are hidden below this zoom — they are unreadable confetti there. */
 export const EDGE_LABEL_MIN_ZOOM = 0.55;
 
+/** At this zoom a class label (11px) is drawn about 9px tall, about the least that reads. */
+export const READABLE_ZOOM = 0.8;
+/** The most a readable graph enlarges its nodes, so they do not swallow their neighbours. */
+export const MAX_NODE_SCALE = 2;
+/** Below this zoom even enlarged nodes no longer read: a readable graph frames no further out. */
+export const MIN_READABLE_FRAME_ZOOM = READABLE_ZOOM / MAX_NODE_SCALE;
+/** React Flow's default fit padding, which every frame here uses. */
+const FIT_PADDING = 0.1;
+/**
+ * React Flow's fit on mount, once it has measured the nodes (the frame of
+ * where the graph settles follows it). A readable graph does not take it: it
+ * would come after the graph's own first frame and replace it.
+ */
+const FIT_OPTIONS = { padding: FIT_PADDING };
+
+/**
+ * How many times their own size nodes are drawn at `zoom` to keep their
+ * labels readable: 1 from READABLE_ZOOM up, growing as the graph zooms out,
+ * at most MAX_NODE_SCALE. Rounded to a twentieth, so a zoom gesture redraws
+ * the nodes in steps rather than on every frame.
+ */
+export function readableNodeScale(zoom: number): number {
+  if (zoom >= READABLE_ZOOM) return 1;
+  return Math.round(Math.min(READABLE_ZOOM / zoom, MAX_NODE_SCALE) * 20) / 20;
+}
+
+/**
+ * The viewport that frames `bounds` in a `width` by `height` pane as React
+ * Flow's fit does, but zoomed out no further than `minZoom`. When the bounds
+ * do not fit there, it centres `centre` (else their middle) as far as it can
+ * while the view stays on the bounds, with the fit's padding at their edge:
+ * what does not fit is cut on the side away from `centre`, and no empty
+ * margin is shown on the other.
+ */
+export function readableViewport(
+  bounds: Rect,
+  width: number,
+  height: number,
+  minZoom: number,
+  maxZoom: number,
+  centre: XYPosition | null,
+): Viewport {
+  const whole = getViewportForBounds(
+    bounds,
+    width,
+    height,
+    0,
+    maxZoom,
+    FIT_PADDING,
+  );
+  if (whole.zoom >= minZoom) return whole;
+  /** The flow coordinate the pane's middle shows along one axis. */
+  const axis = (at: number, start: number, size: number, pane: number) => {
+    const view = pane / minZoom;
+    const pad = (view - view / (1 + FIT_PADDING)) / 2;
+    if (size + 2 * pad <= view) return start + size / 2;
+    return Math.min(
+      Math.max(at, start - pad + view / 2),
+      start + size + pad - view / 2,
+    );
+  };
+  const c = centre ?? {
+    x: bounds.x + bounds.width / 2,
+    y: bounds.y + bounds.height / 2,
+  };
+  return {
+    x: width / 2 - axis(c.x, bounds.x, bounds.width, width) * minZoom,
+    y: height / 2 - axis(c.y, bounds.y, bounds.height, height) * minZoom,
+    zoom: minZoom,
+  };
+}
+
+/**
+ * Where a readable frame is centred when the graph does not fit: the first of
+ * `preferred` that is in `centres`; else the node with the most edges, when
+ * the layout counts it a hub; else the node nearest the middle of `bounds`,
+ * so the frame shows nodes rather than the gap between two clusters. Null
+ * only without nodes.
+ */
+export function framingCentre(
+  centres: ReadonlyMap<string, XYPosition>,
+  edges: readonly LayoutEdge[],
+  preferred: readonly (string | null | undefined)[],
+  bounds: Rect,
+): XYPosition | null {
+  for (const id of preferred) {
+    const c = id ? centres.get(id) : undefined;
+    if (c) return c;
+  }
+  const degree = new Map<string, number>();
+  for (const e of edges) {
+    for (const id of [e.source, e.target]) {
+      if (centres.has(id)) degree.set(id, (degree.get(id) ?? 0) + 1);
+    }
+  }
+  let hub: XYPosition | null = null;
+  let most = 0;
+  for (const [id, c] of centres) {
+    const d = degree.get(id) ?? 0;
+    if (d > most) {
+      hub = c;
+      most = d;
+    }
+  }
+  if (most >= HUB_DEGREE_THRESHOLD) return hub;
+  const mx = bounds.x + bounds.width / 2;
+  const my = bounds.y + bounds.height / 2;
+  let nearest: XYPosition | null = null;
+  let closest = Infinity;
+  for (const c of centres.values()) {
+    const d = Math.hypot(c.x - mx, c.y - my);
+    if (d < closest) {
+      nearest = c;
+      closest = d;
+    }
+  }
+  return nearest;
+}
+
+/** Each node's centre, by id. */
+function centresOf(nodes: readonly Node[]): Map<string, XYPosition> {
+  return new Map(
+    nodes.map((n) => [
+      n.id,
+      { x: n.position.x + NODE_SIZE / 2, y: n.position.y + NODE_SIZE / 2 },
+    ]),
+  );
+}
+
+/** The box around the nodes. */
+function boundsOf(nodes: readonly Node[]): Rect {
+  const xs = nodes.map((n) => n.position.x);
+  const ys = nodes.map((n) => n.position.y);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return {
+    x,
+    y,
+    width: Math.max(...xs) + NODE_SIZE - x,
+    height: Math.max(...ys) + NODE_SIZE - y,
+  };
+}
+
 /** Arrowhead size (px, user space) and the gap it needs before the node edge. */
 const ARROW_SIZE = 16;
-/** Attribute (datatype-property) node diameter, revealed on class hover. */
+/** Attribute (datatype-property) node diameter, revealed around the hovered or clicked class. */
 const ATTR_SIZE = 52;
 const ARROW_GAP = 3;
 
@@ -245,6 +443,15 @@ const KIND_COLORS: Record<string, { bg: string; border: string }> = {
   unknown: { bg: "#f3f4f6", border: "#9ca3af" },
 };
 
+const HIGHLIGHT_COLORS: Record<
+  GraphHighlight,
+  { bg: string; border: string; label: AppMessage }
+> = {
+  added: { bg: "#dcfce7", border: "#16a34a", label: "Added" },
+  changed: { bg: "#ffedd5", border: "#ea580c", label: "Changed" },
+  removed: { bg: "#fee2e2", border: "#dc2626", label: "Removed" },
+};
+
 const LEGEND_ITEMS: Array<{ kind: string; label: AppMessage }> = [
   { kind: "class", label: "Novel class" },
   { kind: "grounded", label: "Grounded class" },
@@ -272,15 +479,21 @@ const EDGE_STYLES: Record<
 
 function styleEdge(e: GraphEdgeData, showLabel: boolean): Edge {
   const s = EDGE_STYLES[e.kind ?? "objectProperty"];
+  const mark = e.highlight ? HIGHLIGHT_COLORS[e.highlight] : null;
+  const stroke = mark?.border ?? s.stroke;
   return {
     id: e.id,
     source: e.source,
     target: e.target,
     label: showLabel ? e.label : undefined,
-    style: { stroke: s.stroke, strokeWidth: 1.5, strokeDasharray: s.dash },
+    style: {
+      stroke,
+      strokeWidth: mark ? 2.5 : 1.5,
+      strokeDasharray: e.highlight === "removed" ? "4 4" : s.dash,
+    },
     markerEnd: {
       type: s.marker,
-      color: s.stroke,
+      color: stroke,
       width: ARROW_SIZE,
       height: ARROW_SIZE,
       markerUnits: "userSpaceOnUse",
@@ -296,20 +509,46 @@ function styleEdge(e: GraphEdgeData, showLabel: boolean): Edge {
 }
 
 /**
- * Hover state delivered to nodes via context rather than through node `data`,
- * so hovering never re-creates node objects (which would make React Flow
- * re-render every node and fight the live simulation's position updates).
+ * Hover state (and the selection, and how large readable labels draw the
+ * nodes) delivered to nodes via context rather than through node `data`, so
+ * hovering or selecting never re-creates node objects (which would make React
+ * Flow re-render every node and fight the live simulation's position updates).
  */
 const HoverContext = createContext<{
   hoveredId: string | null;
   neighbourIds: ReadonlySet<string> | null;
   setHoveredEdgeId: (id: string | null) => void;
-}>({ hoveredId: null, neighbourIds: null, setHoveredEdgeId: () => {} });
+  selected: ReadonlySet<string>;
+  /** How many times their own size nodes and edge labels are drawn (see readableNodeScale). */
+  nodeScale: number;
+}>({
+  hoveredId: null,
+  neighbourIds: null,
+  setHoveredEdgeId: () => {},
+  selected: new Set(),
+  nodeScale: 1,
+});
+
+/** The ids after clicking `id`: Shift/Ctrl/Cmd toggles it, a plain click selects only it. */
+export function nextSelection(
+  current: readonly string[],
+  id: string,
+  additive: boolean,
+): string[] {
+  if (!additive) return [id];
+  return current.includes(id)
+    ? current.filter((x) => x !== id)
+    : [...current, id];
+}
 
 function OntologyNode({ data }: { data: GraphNodeData }) {
   const { t } = useAppI18n();
-  const colors = KIND_COLORS[data.kind] ?? KIND_COLORS.unknown;
-  const { hoveredId, neighbourIds } = useContext(HoverContext);
+  const colors = data.highlight
+    ? HIGHLIGHT_COLORS[data.highlight]
+    : (KIND_COLORS[data.kind] ?? KIND_COLORS.unknown);
+  const { hoveredId, neighbourIds, selected, nodeScale } =
+    useContext(HoverContext);
+  const isSelected = selected.has(data.id);
   const dimmed =
     hoveredId !== null && neighbourIds !== null && !neighbourIds.has(data.id);
   return (
@@ -323,12 +562,12 @@ function OntologyNode({ data }: { data: GraphNodeData }) {
           : data.label
       }
       style={{
-        opacity: dimmed ? 0.25 : 1,
+        opacity: dimmed ? 0.25 : data.highlight === "removed" ? 0.75 : 1,
         position: "relative",
         width: NODE_SIZE,
         height: NODE_SIZE,
         borderRadius: "50%",
-        border: `3px solid ${colors.border}`,
+        border: `3px ${data.highlight === "removed" ? "dashed" : "solid"} ${colors.border}`,
         background: colors.bg,
         display: "flex",
         alignItems: "center",
@@ -339,7 +578,15 @@ function OntologyNode({ data }: { data: GraphNodeData }) {
         cursor: "grab",
         overflow: "hidden",
         padding: 6,
+        boxShadow: isSelected ? "0 0 0 4px #0972d3" : undefined,
+        // Around the node's centre, so the layout and the edges keep it.
+        scale: nodeScale === 1 ? undefined : String(nodeScale),
       }}
+      // Not aria-selected / aria-pressed: this div has no role and is not the
+      // focusable element (React Flow's role="group" wrapper is), so ARIA
+      // states are not valid here. A plain data attribute marks it for tests.
+      data-selected={isSelected ? "true" : undefined}
+      data-highlight={data.highlight}
     >
       <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
       <div
@@ -379,6 +626,32 @@ function OntologyNode({ data }: { data: GraphNodeData }) {
           {data.expanded ? "−" : "+"}
         </span>
       )}
+      {data.badge && (
+        <span
+          className="coa-graph-node-badge"
+          role="img"
+          title={data.badge.title}
+          aria-label={data.badge.title ?? data.badge.text}
+          style={{
+            position: "absolute",
+            top: 4,
+            left: "50%",
+            transform: "translateX(-50%)",
+            minWidth: 20,
+            padding: "0 5px",
+            borderRadius: 8,
+            background: "#0f172a",
+            color: "#ffffff",
+            fontSize: 9,
+            fontWeight: 700,
+            lineHeight: "14px",
+            textAlign: "center",
+            opacity: data.badge.dimmed ? 0.45 : 1,
+          }}
+        >
+          {data.badge.text}
+        </span>
+      )}
       <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
     </div>
   );
@@ -386,15 +659,17 @@ function OntologyNode({ data }: { data: GraphNodeData }) {
 
 /**
  * Small red node for a class's datatype property (attribute). Rendered only
- * transiently around a class while it is hovered (see attributeOverlay), so it
- * is pointer-transparent — you hover the class, not its attributes.
+ * around the hovered class, or the one clicked last (see attributeOverlay), so
+ * it is pointer-transparent: you hover the class, not its attributes.
  */
 function AttributeNode({ data }: { data: GraphNodeData }) {
   const colors = KIND_COLORS["datatype-property"];
+  const { nodeScale } = useContext(HoverContext);
   return (
     <div
       title={data.label}
       style={{
+        scale: nodeScale === 1 ? undefined : String(nodeScale),
         width: ATTR_SIZE,
         height: ATTR_SIZE,
         borderRadius: "50%",
@@ -466,7 +741,7 @@ function FloatingEdge({
 }: EdgeProps<Edge<FloatingEdgeData>>) {
   const sourceNode = useInternalNode(source);
   const targetNode = useInternalNode(target);
-  const { setHoveredEdgeId } = useContext(HoverContext);
+  const { setHoveredEdgeId, nodeScale } = useContext(HoverContext);
   if (!sourceNode || !targetNode) return null;
 
   const centre = (n: InternalNode) => ({
@@ -475,8 +750,9 @@ function FloatingEdge({
   });
   const s = centre(sourceNode);
   const t = centre(targetNode);
-  const rSource = (sourceNode.measured.width ?? NODE_SIZE) / 2;
-  const rTarget = (targetNode.measured.width ?? NODE_SIZE) / 2;
+  // Both ends are drawn nodeScale times their measured size.
+  const rSource = ((sourceNode.measured.width ?? NODE_SIZE) / 2) * nodeScale;
+  const rTarget = ((targetNode.measured.width ?? NODE_SIZE) / 2) * nodeScale;
   const dx = t.x - s.x;
   const dy = t.y - s.y;
   const len = Math.hypot(dx, dy) || 1;
@@ -519,7 +795,9 @@ function FloatingEdge({
           <div
             className="coa-graph-edge-label"
             style={{
-              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)${
+                nodeScale === 1 ? "" : ` scale(${nodeScale})`
+              }`,
               opacity: style?.opacity,
             }}
             onMouseEnter={() => setHoveredEdgeId(id)}
@@ -602,8 +880,15 @@ function OntologyGraphFlowInner({
   collapseStandalone = true,
   onNodeSelect,
   onNodeExpand,
+  selectedIds,
+  onSelectionChange,
+  onNodeContextMenu,
+  readableLabels = false,
+  focusId = null,
 }: Props) {
   const isForce = layout === "force";
+  // Only the force layout's edges follow the size a node is drawn at.
+  const readable = readableLabels && isForce;
 
   // Classes with no relationships carry no information in a *relationship*
   // graph; in real proposals they are ~40% of the nodes. A toggle hides them
@@ -633,6 +918,11 @@ function OntologyGraphFlowInner({
   // (not the zoom) means the graph re-renders only when the threshold is
   // crossed, not on every pan/zoom frame.
   const showEdgeLabels = useStore((s) => s.transform[2] >= EDGE_LABEL_MIN_ZOOM);
+  // A readable graph draws its nodes larger below READABLE_ZOOM. The value
+  // moves in steps, so a zoom gesture re-renders them only now and then.
+  const nodeScale = useStore((s) =>
+    readable ? readableNodeScale(s.transform[2]) : 1,
+  );
 
   const { t } = useAppI18n();
   const flowNodes: OntologyFlowNode[] = useMemo(
@@ -731,23 +1021,60 @@ function OntologyGraphFlowInner({
 
   // Force mode keeps the physics running: nodes spring into place on load and
   // follow a dragged neighbour (see hook doc).
-  const { fitView, fitBounds } = useReactFlow();
+  const { fitView, fitBounds, setViewport } = useReactFlow();
+  const store = useStoreApi();
+  // Read when a frame is taken, so a click or a hover never moves the view.
+  const pinnedRef = useRef<string | null>(null);
+  const focusRef = useRef(focusId);
+  focusRef.current = focusId;
+  const liveNodesRef = useRef(liveNodes);
+  liveNodesRef.current = liveNodes;
+  /**
+   * Frames `bounds` no further out than labels read; when the whole graph
+   * does not fit there, centres the selected class, else the focus, else a
+   * hub or the class nearest the middle (see framingCentre).
+   */
+  const frameReadable = useCallback(
+    (
+      bounds: Rect,
+      centres: ReadonlyMap<string, XYPosition>,
+      links: readonly LayoutEdge[],
+      duration?: number,
+    ) => {
+      const { width, height, maxZoom } = store.getState();
+      const centre = framingCentre(
+        centres,
+        links,
+        [pinnedRef.current, focusRef.current],
+        bounds,
+      );
+      void setViewport(
+        readableViewport(
+          bounds,
+          width,
+          height,
+          MIN_READABLE_FRAME_ZOOM,
+          maxZoom,
+          centre,
+        ),
+        { duration },
+      );
+    },
+    [store, setViewport],
+  );
   const simulation = useLiveForceSimulation(
     initialNodes,
     structuralEdges,
     setLiveNodes,
-    {
-      enabled: isForce,
-      nodeSize: NODE_SIZE,
-      linkDistance: 330,
-      nodeRadius,
-    },
+    { enabled: isForce, ...FORCE_OPTIONS, nodeRadius },
   );
 
   // Re-frame promptly whenever the node SET changes (e.g. a search or expand),
-  // by fitting to the FINAL packed layout immediately rather than waiting for
-  // the settle animation to finish — otherwise the viewport visibly lags the
-  // results. The settle then animates inside the already-correct frame.
+  // by fitting to where the live simulation will SETTLE immediately rather than
+  // waiting for the settle animation to finish (otherwise the viewport visibly
+  // lags the results). The settle then animates inside the already-correct
+  // frame. The packed layout is not that frame: the weak home forces let a
+  // dense cluster spread well past it, and fitting to it cut nodes off.
   const nodeSetSig = useMemo(
     () =>
       `${initialNodes.length}:${initialNodes[0]?.id ?? ""}:${
@@ -755,30 +1082,39 @@ function OntologyGraphFlowInner({
       }`,
     [initialNodes],
   );
+  const frame = useMemo(
+    () =>
+      isForce
+        ? settledBounds(initialNodes, structuralEdges, FORCE_OPTIONS)
+        : null,
+    [isForce, initialNodes, structuralEdges],
+  );
+  // A readable graph's first frame is the view it opens on, so it is taken at
+  // once rather than animated from React Flow's default view.
+  const framedRef = useRef(false);
   useEffect(() => {
-    if (!isForce || initialNodes.length === 0) return;
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const n of initialNodes) {
-      minX = Math.min(minX, n.position.x);
-      minY = Math.min(minY, n.position.y);
-      maxX = Math.max(maxX, n.position.x);
-      maxY = Math.max(maxY, n.position.y);
-    }
-    const bounds = {
-      x: minX,
-      y: minY,
-      width: maxX - minX + NODE_SIZE,
-      height: maxY - minY + NODE_SIZE,
-    };
-    const handle = window.setTimeout(
-      () => void fitBounds(bounds, { padding: 0.1, duration: 300 }),
-      0,
-    );
+    if (!frame) return;
+    const handle = window.setTimeout(() => {
+      if (readable) {
+        frameReadable(
+          frame,
+          centresOf(initialNodes),
+          structuralEdges,
+          framedRef.current ? 300 : 0,
+        );
+        framedRef.current = true;
+      } else void fitBounds(frame, { padding: 0.1, duration: 300 });
+    }, 0);
     return () => window.clearTimeout(handle);
-  }, [isForce, nodeSetSig, initialNodes, fitBounds]);
+  }, [
+    nodeSetSig,
+    frame,
+    fitBounds,
+    readable,
+    frameReadable,
+    initialNodes,
+    structuralEdges,
+  ]);
 
   // Re-fit after the user toggles standalone classes: the graph's extent
   // changes substantially and the old viewport would show half of it.
@@ -788,12 +1124,15 @@ function OntologyGraphFlowInner({
       isFirstRender.current = false; // the `fitView` prop handles mount
       return;
     }
+    // The node set changed with the toggle, so a readable graph is already
+    // reframed above, where it settles; this fit would frame where it starts.
+    if (readable) return;
     const handle = window.setTimeout(
       () => void fitView({ padding: 0.1, duration: 250 }),
       0,
     );
     return () => window.clearTimeout(handle);
-  }, [showIsolated, fitView]);
+  }, [showIsolated, fitView, readable]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange<OntologyFlowNode>[]) =>
@@ -886,11 +1225,36 @@ function OntologyGraphFlowInner({
     unpinNode,
   ]);
 
+  // The class clicked last keeps its attributes on screen once the pointer
+  // leaves it. A caller that controls the selection decides it instead: the
+  // last selected id (the one a Shift-click added last).
+  const [clickedId, setClickedId] = useState<string | null>(null);
+  const pinnedId =
+    selectedIds !== undefined ? (selectedIds.at(-1) ?? null) : clickedId;
+  pinnedRef.current = pinnedId;
+
   const handleNodeClick = useCallback(
-    (_: unknown, node: OntologyFlowNode) => {
+    (event: ReactMouseEvent, node: OntologyFlowNode) => {
+      if (node.type === "ontology") setClickedId(node.id);
       onNodeSelect?.(node.data);
+      onSelectionChange?.(
+        nextSelection(
+          selectedIds ?? [],
+          node.id,
+          event.shiftKey || event.metaKey || event.ctrlKey,
+        ),
+      );
     },
-    [onNodeSelect],
+    [onNodeSelect, onSelectionChange, selectedIds],
+  );
+
+  const handleNodeContextMenu = useCallback(
+    (event: ReactMouseEvent, node: OntologyFlowNode) => {
+      if (!onNodeContextMenu || node.type !== "ontology") return;
+      event.preventDefault();
+      onNodeContextMenu(node.data, { x: event.clientX, y: event.clientY });
+    },
+    [onNodeContextMenu],
   );
 
   const handleNodeDoubleClick = useCallback(
@@ -901,8 +1265,10 @@ function OntologyGraphFlowInner({
   );
 
   const handlePaneClick = useCallback(() => {
+    setClickedId(null);
     onNodeSelect?.(null);
-  }, [onNodeSelect]);
+    onSelectionChange?.([]);
+  }, [onNodeSelect, onSelectionChange]);
 
   // Nodes not connected to the hovered one fade back (delivered via context —
   // see HoverContext).
@@ -922,8 +1288,14 @@ function OntologyGraphFlowInner({
     return null;
   }, [edges, hoveredId, hoveredEdgeId]);
   const hoverContext = useMemo(
-    () => ({ hoveredId, neighbourIds, setHoveredEdgeId }),
-    [hoveredId, neighbourIds],
+    () => ({
+      hoveredId,
+      neighbourIds,
+      setHoveredEdgeId,
+      selected: new Set(selectedIds ?? []),
+      nodeScale,
+    }),
+    [hoveredId, neighbourIds, selectedIds, nodeScale],
   );
 
   // Per-edge label `t` value (position along the chord as a fraction).
@@ -995,26 +1367,35 @@ function OntologyGraphFlowInner({
     return ts;
   }, [isForce, edges, initialNodes]);
 
-  // Attributes are drawn only for the hovered class: a ring of small red nodes
-  // around it, wired with red spokes. They live outside the simulation (pure
-  // derived state) and are pointer-transparent, so hovering stays on the class.
+  // Attributes are drawn only for one class, the hovered one or else the one
+  // clicked last: a ring of small red nodes around it, wired with red spokes.
+  // They live outside the simulation (pure derived state) and are
+  // pointer-transparent, so hovering stays on the class.
+  const ringId = hoveredId ?? pinnedId;
   const attributeOverlay = useMemo(() => {
     const empty: { nodes: OntologyFlowNode[]; edges: Edge[] } = {
       nodes: [],
       edges: [],
     };
-    if (!isForce || hoveredId === null) return empty;
-    const host = liveNodes.find((n) => n.id === hoveredId);
+    if (!isForce || ringId === null) return empty;
+    const host = liveNodes.find((n) => n.id === ringId);
     const attrs = host?.data.attributes ?? [];
     if (!host || attrs.length === 0) return empty;
     const cx = host.position.x + NODE_SIZE / 2;
     const cy = host.position.y + NODE_SIZE / 2;
     const radius = Math.max(140, ATTR_SIZE + attrs.length * 11);
     const attrColor = KIND_COLORS["datatype-property"].border;
+    // A readable graph draws the ring, its class and their neighbours
+    // nodeScale times larger: the ring is relaxed at their own size, in a frame
+    // shrunk around the class, and then scaled back out.
+    const toLocal = (x: number, y: number) => ({
+      x: cx + (x - cx) / nodeScale,
+      y: cy + (y - cy) / nodeScale,
+    });
 
     // Seed the attributes on a ring around the class, then relax them so they
     // don't overlap other graph nodes or each other — the same "nodes keep
-    // their distance" feel as the force layout. Cheap: runs only while hovering.
+    // their distance" feel as the force layout. Cheap: one class's ring at a time.
     const centres = attrs.map((_, i) => {
       const angle = (2 * Math.PI * i) / attrs.length - Math.PI / 2;
       return {
@@ -1023,10 +1404,9 @@ function OntologyGraphFlowInner({
       };
     });
     const obstacles = liveNodes
-      .filter((n) => n.id !== hoveredId)
+      .filter((n) => n.id !== ringId)
       .map((n) => ({
-        x: n.position.x + NODE_SIZE / 2,
-        y: n.position.y + NODE_SIZE / 2,
+        ...toLocal(n.position.x + NODE_SIZE / 2, n.position.y + NODE_SIZE / 2),
         r: NODE_SIZE / 2,
       }));
     // Relationship / FK edges as segments between their endpoints' centres, so
@@ -1034,7 +1414,7 @@ function OntologyGraphFlowInner({
     const centreById = new Map(
       liveNodes.map((n) => [
         n.id,
-        { x: n.position.x + NODE_SIZE / 2, y: n.position.y + NODE_SIZE / 2 },
+        toLocal(n.position.x + NODE_SIZE / 2, n.position.y + NODE_SIZE / 2),
       ]),
     );
     const segments = edges
@@ -1044,19 +1424,19 @@ function OntologyGraphFlowInner({
         return a && b ? { ax: a.x, ay: a.y, bx: b.x, by: b.y } : null;
       })
       .filter((s): s is NonNullable<typeof s> => s !== null);
-    // Scope label obstacles to the hovered node's incident edges only — the
+    // Scope label obstacles to the ring host's incident edges only: the
     // visible labels at this zoom are the ones on those edges (focus+context
     // dims the rest to 0.12), so attributes only need to yield around them.
     // Project each label position from the current source/target centres at
     // its topology-derived t, keeping the Bézier bow for curved edges.
     const incidentLabelPositions: { x: number; y: number }[] = [];
     for (const e of edges) {
-      if (e.source !== hoveredId && e.target !== hoveredId) continue;
+      if (e.source !== ringId && e.target !== ringId) continue;
       const a = centreById.get(e.source);
       const b = centreById.get(e.target);
       if (!a || !b) continue;
       const t = labelTValues.get(e.id) ?? 0.5;
-      const curve = edgeCurves.get(e.id) ?? 0;
+      const curve = (edgeCurves.get(e.id) ?? 0) / nodeScale;
       incidentLabelPositions.push(
         projectEdgeLabel(a.x, a.y, b.x, b.y, curve, t),
       );
@@ -1149,14 +1529,14 @@ function OntologyGraphFlowInner({
 
     const nodes: OntologyFlowNode[] = attrs.map((a, i) => {
       return {
-        id: `attr:${hoveredId}:${i}`,
+        id: `attr:${ringId}:${i}`,
         type: "attribute",
         position: {
-          x: centres[i].x - ATTR_SIZE / 2,
-          y: centres[i].y - ATTR_SIZE / 2,
+          x: cx + (centres[i].x - cx) * nodeScale - ATTR_SIZE / 2,
+          y: cy + (centres[i].y - cy) * nodeScale - ATTR_SIZE / 2,
         },
         data: {
-          id: `attr:${hoveredId}:${i}`,
+          id: `attr:${ringId}:${i}`,
           label: a.label,
           kind: "datatype-property",
         },
@@ -1167,9 +1547,9 @@ function OntologyGraphFlowInner({
       };
     });
     const overlayEdges: Edge[] = attrs.map((a, i) => ({
-      id: `attre:${hoveredId}:${i}`,
-      source: hoveredId,
-      target: `attr:${hoveredId}:${i}`,
+      id: `attre:${ringId}:${i}`,
+      source: ringId,
+      target: `attr:${ringId}:${i}`,
       type: "floating",
       zIndex: 5,
       data: { curve: 0 },
@@ -1183,7 +1563,7 @@ function OntologyGraphFlowInner({
       },
     }));
     return { nodes, edges: overlayEdges };
-  }, [isForce, hoveredId, liveNodes, edges, labelTValues, edgeCurves]);
+  }, [isForce, ringId, liveNodes, edges, labelTValues, edgeCurves, nodeScale]);
 
   const displayNodes = useMemo(
     () =>
@@ -1214,6 +1594,12 @@ function OntologyGraphFlowInner({
       : base;
   }, [flowEdges, attributeOverlay, labelTValues]);
 
+  // A previewed change set marks nodes or edges; the legend then explains the marks.
+  const highlighted = useMemo(
+    () => nodes.some((n) => n.highlight) || edges.some((e) => e.highlight),
+    [nodes, edges],
+  );
+
   // Fullscreen the graph via the native Fullscreen API on a wrapper around the
   // canvas, and refit once the size settles.
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -1231,11 +1617,16 @@ function OntologyGraphFlowInner({
     const onChange = () => {
       setIsFullscreen(document.fullscreenElement === wrapperRef.current);
       // The pane resizes after the fullscreen transition; reframe once settled.
-      window.setTimeout(() => void fitView({ padding: 0.1 }), 60);
+      window.setTimeout(() => {
+        const live = liveNodesRef.current;
+        if (readable && live.length > 0)
+          frameReadable(boundsOf(live), centresOf(live), structuralEdges);
+        else void fitView({ padding: 0.1 });
+      }, 60);
     };
     document.addEventListener("fullscreenchange", onChange);
     return () => document.removeEventListener("fullscreenchange", onChange);
-  }, [fitView]);
+  }, [fitView, readable, frameReadable, structuralEdges]);
 
   return (
     <HoverContext.Provider value={hoverContext}>
@@ -1258,6 +1649,9 @@ function OntologyGraphFlowInner({
           edgeTypes={edgeTypes}
           onNodeClick={handleNodeClick}
           onNodeDoubleClick={handleNodeDoubleClick}
+          onNodeContextMenu={
+            onNodeContextMenu ? handleNodeContextMenu : undefined
+          }
           onNodeDragStart={handleNodeDragStart}
           onNodeDrag={handleNodeDrag}
           onNodeDragStop={handleNodeDragStop}
@@ -1266,8 +1660,8 @@ function OntologyGraphFlowInner({
           onEdgeMouseEnter={handleEdgeMouseEnter}
           onEdgeMouseLeave={handleEdgeMouseLeave}
           onPaneClick={handlePaneClick}
-          fitView
-          fitViewOptions={{ padding: 0.1 }}
+          fitView={!readable}
+          fitViewOptions={FIT_OPTIONS}
           minZoom={0.15}
           maxZoom={2.5}
           nodesDraggable
@@ -1302,6 +1696,8 @@ function OntologyGraphFlowInner({
           </Panel>
           <MiniMap
             nodeColor={(n) => {
+              const mark = n.data?.highlight as GraphHighlight | undefined;
+              if (mark) return HIGHLIGHT_COLORS[mark].border;
               const kind =
                 typeof n.data?.kind === "string" ? n.data.kind : "unknown";
               return KIND_COLORS[kind]?.border ?? "#9ca3af";
@@ -1319,9 +1715,22 @@ function OntologyGraphFlowInner({
                 border: "1px solid #e5e7eb",
               }}
             >
-              {LEGEND_ITEMS.map(({ kind, label }) => (
+              {[
+                ...LEGEND_ITEMS.map(({ kind, label }) => ({
+                  key: kind,
+                  label,
+                  color: KIND_COLORS[kind].border,
+                })),
+                ...(highlighted
+                  ? Object.entries(HIGHLIGHT_COLORS).map(([key, c]) => ({
+                      key,
+                      label: c.label,
+                      color: c.border,
+                    }))
+                  : []),
+              ].map(({ key, label, color }) => (
                 <div
-                  key={kind}
+                  key={key}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -1334,7 +1743,7 @@ function OntologyGraphFlowInner({
                       width: 10,
                       height: 10,
                       borderRadius: "50%",
-                      background: KIND_COLORS[kind].border,
+                      background: color,
                       display: "inline-block",
                     }}
                   />

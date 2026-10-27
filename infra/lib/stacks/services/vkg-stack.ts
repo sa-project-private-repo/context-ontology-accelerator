@@ -237,12 +237,18 @@ export class VkgStack extends SCLStack {
     // Ontology Reload (EventBridge → Lambda → ECS forceNewDeployment)
     // ================================================================
     // Reserved concurrency bounds this function's blast radius (it drives ECS
-    // service updates and is effectively serial). Configurable via
-    // `lambda_reserved_concurrency`; `0`/undefined omits the reservation so the
-    // stack deploys on reduced-quota accounts (see resolveLambdaReservedConcurrency).
+    // service updates). It is NOT serial: up to that many invocations (5 by
+    // default) run at once, so a deploy's and a delete's events for the same
+    // namespace can overlap; the handler decides from the files in latest/ and
+    // re-reads them after every action. The sweep's per-namespace invocations
+    // share the same limit; Lambda queues and retries the throttled ones.
+    // Configurable via `lambda_reserved_concurrency`; `0`/undefined omits the
+    // reservation so the stack deploys on reduced-quota accounts (see
+    // resolveLambdaReservedConcurrency).
     const reservedConcurrency = resolveLambdaReservedConcurrency(this.node);
+    const reloadFnName = this.prefixed("vkg-reload");
     const reloadFn = new lambda.Function(this, "VkgReloadFn", {
-      functionName: this.prefixed("vkg-reload"),
+      functionName: reloadFnName,
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: "index.handler",
       code: lambda.Code.fromAsset("lambda/vkg-reload"),
@@ -300,6 +306,18 @@ export class VkgStack extends SCLStack {
     );
     reloadFn.addToRolePolicy(
       new iam.PolicyStatement({
+        // The sweep invokes this function once per namespace. The ARN is built
+        // from the literal name: reloadFn.functionArn here (or grantInvoke on
+        // itself) would make the function's role policy depend on the function,
+        // which already depends on that policy: a circular dependency.
+        actions: ["lambda:InvokeFunction"],
+        resources: [
+          `arn:aws:lambda:${this.region}:${this.account}:function:${reloadFnName}`,
+        ],
+      }),
+    );
+    reloadFn.addToRolePolicy(
+      new iam.PolicyStatement({
         actions: ["ecs:RegisterTaskDefinition", "ecs:DescribeTaskDefinition"],
         resources: ["*"],
       }),
@@ -335,6 +353,38 @@ export class VkgStack extends SCLStack {
     );
     reloadFn.addToRolePolicy(
       new iam.PolicyStatement({
+        // A TargetTrackingScaling PutScalingPolicy also requires the caller to
+        // manage the policy's CloudWatch alarms (Application Auto Scaling
+        // identity-based policy examples, "ECS services"). Those alarms are named
+        // TargetTracking-service/<cluster>/<service>-Alarm{High,Low}-<uuid>, so
+        // they can be scoped to this cluster.
+        actions: [
+          "cloudwatch:DescribeAlarms",
+          "cloudwatch:PutMetricAlarm",
+          "cloudwatch:DeleteAlarms",
+        ],
+        resources: [
+          `arn:aws:cloudwatch:${this.region}:${this.account}:alarm:TargetTracking-service/${this.cluster.clusterName}/*`,
+        ],
+      }),
+    );
+    reloadFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        // The first ECS RegisterScalableTarget in an account creates the ECS
+        // autoscaling service-linked role; nothing else in this app creates it.
+        actions: ["iam:CreateServiceLinkedRole"],
+        resources: [
+          `arn:aws:iam::${this.account}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService`,
+        ],
+        conditions: {
+          StringLike: {
+            "iam:AWSServiceName": "ecs.application-autoscaling.amazonaws.com",
+          },
+        },
+      }),
+    );
+    reloadFn.addToRolePolicy(
+      new iam.PolicyStatement({
         actions: [
           "logs:CreateLogGroup",
           "logs:CreateLogStream",
@@ -347,6 +397,18 @@ export class VkgStack extends SCLStack {
       }),
     );
     vkgImageParam.grantRead(reloadFn);
+    // The handler lists ontologies/{ns}/latest/ to decide between reloading and
+    // scaling to zero (ListObjectsV2 is authorized as s3:ListBucket), scoped to
+    // those prefixes only.
+    reloadFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:ListBucket"],
+        resources: [this.ontologyBucket.bucketArn],
+        conditions: {
+          StringLike: { "s3:prefix": ["ontologies/*/latest/*"] },
+        },
+      }),
+    );
     // PutMetricData has no resource-level scoping; restrict by metric namespace.
     reloadFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -381,7 +443,11 @@ export class VkgStack extends SCLStack {
           scopedSource === legacySource
             ? [scopedSource]
             : [scopedSource, legacySource],
-        detailType: ["ontology.published"],
+        // ``ontology.deployed`` is what ontology-engine emits when a version is
+        // deployed (or the domain ontology is deleted, with version null).
+        // ``ontology.published`` is the pre-versioning event; keep it for one
+        // release so an older ontology-engine task still triggers a reload.
+        detailType: ["ontology.deployed", "ontology.published"],
       },
       targets: [
         new targets.LambdaFunction(reloadFn, {
@@ -393,12 +459,18 @@ export class VkgStack extends SCLStack {
 
     // Scheduled sweep: weekly, reconcile EVERY per-namespace VKG service to the
     // latest SSM image. OntologyPublishedRule only refreshes a namespace when
-    // its ontology is re-accepted, so a long-lived namespace that is never
-    // republished keeps its provision-time image forever — and Renovate
+    // one of its versions is deployed, so a long-lived namespace that is never
+    // redeployed keeps its provision-time image forever, and Renovate
     // base-image digest bumps never reach a running task, leaving stale
-    // (Inspector-flagged) VKG images. The sweep closes that gap. It is a no-op
-    // per namespace when the image already matches, and each reload deploys with
-    // the circuit-breaker + rollback in the handler, so a bad image self-heals.
+    // (Inspector-flagged) VKG images. The sweep closes that gap. Like an event,
+    // it first matches serving to the files in latest/ (scale to zero without
+    // them, back to one with them), which also repairs a lost event. A running
+    // service is force-deployed even when the image already matches (its task
+    // restarts), and each reload deploys with the circuit-breaker + rollback in
+    // the handler, so a bad image self-heals. The {sweep:true} invocation only
+    // lists the services and asynchronously invokes the function once per
+    // namespace ({sweep_namespace}), so each namespace has its own timeout and
+    // retries instead of the whole sweep sharing one 30 s run.
     new events.Rule(this, "VkgReloadSweepRule", {
       ruleName: this.prefixed("vkg-reload-sweep"),
       schedule: events.Schedule.rate(cdk.Duration.days(7)),

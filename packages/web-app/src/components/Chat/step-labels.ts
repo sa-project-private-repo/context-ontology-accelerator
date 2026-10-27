@@ -57,6 +57,9 @@ export const STEP_LABELS: Readonly<Record<string, AppMessage>> = {
   agentic_final_semantic_search: "Final knowledge-base sweep",
   agentic_retrieval_stop: "Finishing retrieval",
   llm_synthesize: "Synthesizing answer",
+  // Bare ID (no `t3.` prefix), emitted by the Tier 3 lexical-baseline path when it
+  // adds facts from the namespace's domain ABox to the prompt.
+  domain_abox: "Domain facts",
 };
 
 /** Noun-phrase labels shown in the detailed execution plan (RationalePanel). */
@@ -93,6 +96,8 @@ export const STEP_DISPLAY_NAMES: Readonly<Record<string, AppMessage>> = {
   // Legacy ID from the graphrag lexical-baseline retrieval path (not migrated
   // to the t3.* taxonomy); labeled explicitly so it doesn't fall back to raw.
   lexical_baseline_retrieve: "Lexical retrieval",
+  // Bare ID from the same path: facts from the namespace's domain ABox.
+  domain_abox: "Domain facts",
 };
 
 /**

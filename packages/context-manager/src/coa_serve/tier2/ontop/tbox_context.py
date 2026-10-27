@@ -31,8 +31,10 @@ from ...query_utils import (
     namespace_graph_prefix,
     normalize_label_match_text,
     object_properties_sparql,
+    unmapped_property_filter,
     validate_namespace,
 )
+from ...served_version import ServedVersionReader, served_version_pattern
 from .types import VectorHit
 
 logger = structlog.get_logger(__name__)
@@ -124,9 +126,11 @@ _IS_MAPPED_PATTERN = f"?class <{_IS_MAPPED_IRI}> true ."
 # namespace has ANY mapped marker (``_namespace_has_mapped_markers``); when it
 # has none it drops the gate entirely (``mapped=False``), restoring the
 # pre-filter behavior (all classes exposed) for that namespace only. A namespace
-# with even ONE mapped class keeps the strict gate. The gate is selected
-# per-request via ``_class_gate(mapped)`` / ``_parent_pattern(mapped)`` so both
-# behaviors coexist across namespaces.
+# with even ONE mapped class keeps the strict gate, and so does one with a
+# published version (``_namespace_has_published_version``): deploy writes the
+# markers with every version, so a versioned namespace without any marker has no
+# mapped class. The gate is selected per-request via ``_class_gate(mapped)`` /
+# ``_parent_pattern(mapped)`` so both behaviors coexist across namespaces.
 #
 # ── HOW TO REMOVE THIS BRIDGE (revert to the strict pre-bridge behavior) ──
 # Added 2026-07-16; TEMPORARY. Revisit by ~2026-10 (≈3 months). If you are here
@@ -137,8 +141,8 @@ _IS_MAPPED_PATTERN = f"?class <{_IS_MAPPED_IRI}> true ."
 # coa:isMapped markers) and users have been given notice. Removal is a pure
 # deletion, no logic to re-derive: every bridge site below is tagged
 # ``# BRIDGE:`` and carries the exact PRE-BRIDGE line to restore. To remove:
-# 1. Delete ``_namespace_has_mapped_markers`` and the ``mapped = await …``
-# probe call + fallback log in ``build``.
+# 1. Delete ``_namespace_has_mapped_markers``, ``_namespace_has_published_version``
+# and the ``mapped = await …`` probe calls + fallback log in ``build``.
 # 2. Delete ``_NO_GATE``, ``_UNGATED_PARENT_PATTERN``, ``_class_gate``,
 # ``_parent_pattern``, and the ``mapped`` parameter on the four fetch
 # methods.
@@ -203,11 +207,17 @@ def _parent_pattern(mapped: bool) -> str:
 # excluding them here means the only object-property edges the LLM ever sees are
 # mapped<->mapped. (``owl:`` / ``rdfs:`` resolve as Neptune default prefixes, as
 # elsewhere in these queries.)
+#
+# Every datatype-property fetch below also carries the property gate: an attribute
+# added to a mapped class (in the Ontology designer) with no column behind it is
+# marked ``coa:isMapped false`` at deploy and must not be offered as a column.
+_PROPERTY_GATE = unmapped_property_filter("?property")
 _DATATYPE_PROPS_OPTIONAL = f"""OPTIONAL {{
               ?property a owl:DatatypeProperty .
               ?property rdfs:domain ?class .
               ?property rdfs:label ?propLabel .
               ?property rdfs:range ?range .
+              {_PROPERTY_GATE}
               OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}
             }}"""
 # Approximate tokens per ontology element (for prompt budget estimation)
@@ -315,7 +325,14 @@ class TBoxContextBuilder:
     ontology hits, and formats metric context from metric hits.
     """
 
-    def __init__(self, graph_client: GraphClient, graph_uri_template: str | None = None, metric_resolver=None):
+    def __init__(
+        self,
+        graph_client: GraphClient,
+        graph_uri_template: str | None = None,
+        metric_resolver=None,
+        *,
+        served_versions: ServedVersionReader | None = None,
+    ):
         """Bind the graph client, URI template, and optional metric resolver.
 
         Args:
@@ -324,8 +341,12 @@ class TBoxContextBuilder:
                 resolved when None.
             metric_resolver: Optional Tier-1 resolver that enriches metric hits
                 with full Neptune metric definitions.
+            served_versions: Optional reader of the versions Neptune serves, shared
+                with NL-to-SQL and the VKG check, which keeps a read for a minute;
+                without it the published-version probe asks Neptune each time.
         """
         self._graph = graph_client
+        self._served_versions = served_versions
         self._graph_uri_template = get_graph_uri_template(graph_uri_template)
         # optional Tier-1 MetricResolver — when present, metric vector
         # hits are enriched with the FULL Neptune-loaded :GovernedMetric
@@ -430,6 +451,12 @@ class TBoxContextBuilder:
         # Pre-bridge, this probe did not exist and every fetch below was
         # unconditionally gated — to remove, delete this call and pass nothing.
         mapped = await self._namespace_has_mapped_markers(namespace, graph_iris=graph_iris)
+        if not mapped and await self._namespace_has_published_version(namespace):
+            # Deploy writes the markers with every version, so a versioned namespace
+            # without one has no mapped class left (say, the designer deleted them all)
+            # and keeps the gate: its unmapped classes must not become structured.
+            logger.info("tbox_ismapped_bridge_skipped", namespace=namespace, reason="published_version")
+            mapped = True
         if not mapped:
             logger.info(
                 "tbox_ismapped_bridge_fallback",
@@ -574,6 +601,35 @@ class TBoxContextBuilder:
             logger.warning("tbox_ismapped_probe_failed", namespace=namespace, error=str(e))
             return True  # conservative: keep the gate on probe failure
 
+    async def _namespace_has_published_version(self, namespace: str) -> bool:
+        """Probe whether Neptune serves a published version (``vN``) of the namespace.
+
+        Asked only once the marker probe found none. The version registry writes the
+        markers with every deploy, so a namespace with a published version and no
+        marker has no mapped class, while one without a version may predate the
+        marker. Fails open (False, the legacy fallback) on error: this probe only
+        narrows the fallback when it has evidence, so a namespace whose version cannot
+        be read keeps today's behavior. With the shared reader, a read is reused for a
+        minute, as NL-to-SQL reuses it for the same question.
+        """
+        validate_namespace(namespace)
+        if self._served_versions is not None:
+            try:
+                return bool(await self._served_versions.versions(namespace))
+            except Exception as e:
+                logger.warning("tbox_published_version_probe_failed", namespace=namespace, error=str(e))
+                return False
+        if not self._graph_uri_template:
+            return False
+        graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
+        if not _is_safe_sparql_uri(graph_uri_prefix):
+            return False
+        try:
+            return bool(await self._graph.ask(f"ASK {{ {served_version_pattern(graph_uri_prefix)} }}"))
+        except Exception as e:
+            logger.warning("tbox_published_version_probe_failed", namespace=namespace, error=str(e))
+            return False
+
     async def _try_full_namespace_context(
         self,
         namespace: str,
@@ -673,6 +729,7 @@ class TBoxContextBuilder:
             ?property rdfs:domain ?class .
             ?property rdfs:label ?propLabel .
             ?property rdfs:range ?range .
+            {_PROPERTY_GATE}
             OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}"""
         props_sparql = f"""
         SELECT ?class ?property ?range ?propLabel (LANG(?propLabel) AS ?propLabelLang) ?distinctValue
@@ -870,6 +927,7 @@ class TBoxContextBuilder:
               ?property a owl:DatatypeProperty .
               ?property rdfs:domain ?class .
               ?property rdfs:label ?propLabel .
+              {_PROPERTY_GATE}
               OPTIONAL {{ ?property rdfs:range ?range . }}
               OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}
               ?class a owl:Class .
@@ -1014,6 +1072,7 @@ class TBoxContextBuilder:
             ?property rdfs:domain ?class .
             ?property rdfs:label ?propLabel .
             ?property rdfs:range ?range .
+            {_PROPERTY_GATE}
             OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}"""
         props_sparql = f"""
         SELECT ?class ?property ?range ?propLabel (LANG(?propLabel) AS ?propLabelLang) ?distinctValue

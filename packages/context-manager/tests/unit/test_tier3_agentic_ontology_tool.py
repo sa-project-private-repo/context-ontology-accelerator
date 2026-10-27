@@ -218,6 +218,63 @@ class TestPerRequestCaching:
         assert "(cached)" in cached.detail
 
 
+class FakeServedVersions:
+    """Stand-in for the reader of the ontology version Neptune serves."""
+
+    def __init__(self, *versions: str) -> None:
+        self.current = frozenset(versions)
+        self.raises: Exception | None = None
+
+    async def versions(self, namespace: str) -> frozenset[str]:
+        if self.raises is not None:
+            raise self.raises
+        return self.current
+
+
+_DEPLOYED = Ontology(node_types=("Client", "PurchaseOrder"), edge_types=("customer_id",), edge_map=())
+
+
+@pytest.mark.unit
+class TestCacheFollowsTheServedVersion:
+    """A deploy replaces the ontology the graph source reads, so the cached one must go with it."""
+
+    async def test_a_deploy_invalidates_the_cached_ontology(self):
+        source = FakeOntologySource(_POPULATED)
+        served = FakeServedVersions("v1")
+        tool = OntologyLookupTool(source, served_versions=served)
+        await tool.invoke(namespace="acme")
+        await tool.invoke(namespace="acme")
+
+        served.current = frozenset({"v2"})
+        source._ontology = _DEPLOYED
+        after = await tool.invoke(namespace="acme")
+
+        assert source.calls == ["acme", "acme"]  # once per served version
+        assert ontology_from_result(after) == _DEPLOYED
+        assert "(cached)" in (await tool.invoke(namespace="acme")).detail
+
+    async def test_an_unreadable_version_keeps_the_cached_ontology(self):
+        source = FakeOntologySource(_POPULATED)
+        served = FakeServedVersions("v1")
+        tool = OntologyLookupTool(source, served_versions=served)
+        await tool.invoke(namespace="acme")
+
+        served.raises = TimeoutError()
+        result = await tool.invoke(namespace="acme")
+
+        assert source.calls == ["acme"]
+        assert "(cached)" in result.detail
+
+    async def test_a_namespace_without_a_published_version_is_cached_as_before(self):
+        source = FakeOntologySource(_POPULATED)
+        tool = OntologyLookupTool(source, served_versions=FakeServedVersions())
+
+        await tool.invoke(namespace="acme")
+        await tool.invoke(namespace="acme")
+
+        assert source.calls == ["acme"]
+
+
 # ── Empty vs load failure are DISTINCT outcomes (Req 3.10 vs 3.11) ─
 
 

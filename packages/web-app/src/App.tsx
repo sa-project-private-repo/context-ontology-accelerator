@@ -30,7 +30,8 @@ import { SourceList } from "./pages/SourceList";
 import { ConnectSource } from "./pages/ConnectSource";
 import { SourceDetail } from "./pages/SourceDetail";
 import { OntologyPage } from "./pages/OntologyPage";
-import { ProposalDetailPage } from "./pages/ontology/induce/ProposalDetail";
+import { ProposalDetailRoute } from "./pages/ontology/induce/ProposalDetail";
+import { StudioRoute } from "./pages/ontology/studio/StudioPage";
 import { GraphSearchPage } from "./pages/ontology/GraphSearch";
 import { InducedOntologyDetailPage } from "./pages/ontology/InducedOntologyDetail";
 import { OntologyClassDetailPage } from "./pages/ontology/OntologyClassDetail";
@@ -601,7 +602,11 @@ function AppShell() {
               />
               <Route
                 path="/namespaces/:namespaceId/ontology/proposals/:proposalId"
-                element={<ProposalDetailPage />}
+                element={<ProposalDetailRoute />}
+              />
+              <Route
+                path="/namespaces/:namespaceId/ontology/proposals/:proposalId/studio"
+                element={<StudioRoute />}
               />
               <Route
                 path="/namespaces/:namespaceId/ontology/graph"
