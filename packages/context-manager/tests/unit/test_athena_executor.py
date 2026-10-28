@@ -92,6 +92,22 @@ class TestAthenaExecution:
             assert result.rows[0]["name"] == "Alice"
             assert result.truncated is False
 
+    async def test_the_result_names_the_statement_athena_ran(self):
+        """The console showed the SQL from before the executor capped it."""
+        with patch("boto3.client") as mock_boto, patch("boto3.resource"):
+            mock_athena = MagicMock()
+            mock_boto.return_value = mock_athena
+            mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-1"}
+            mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
+            mock_athena.get_query_results.return_value = {
+                "ResultSet": {"ResultSetMetadata": {"ColumnInfo": [{"Name": "id"}]}, "Rows": []}
+            }
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="t")
+            result = await executor.execute("SELECT id FROM person", namespace="demo", database="db", max_rows=1001)
+
+        sent = mock_athena.start_query_execution.call_args.kwargs["QueryString"]
+        assert result.sql == sent and sent.endswith("LIMIT 1001")
+
     async def test_invalid_timeout_raises(self):
         with patch("boto3.client"), patch("boto3.resource"):
             executor = AthenaQueryExecutor(region="us-east-1", sources_table="t")
@@ -1473,3 +1489,69 @@ def test_every_database_sub_type_but_native_glue_has_a_catalog_resolution_label(
         "'glue_nested'. Add each to _CATALOG_PATH_LABELS in coa_serve.clients.athena."
     )
     assert set(_CATALOG_PATH_LABELS) >= CONNECTOR_BACKED_SUB_TYPES
+
+
+async def _until(predicate, timeout: float = 2.0) -> None:
+    """Wait for a background executor call to land (the stop is submitted, not awaited)."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate() and loop.time() < deadline:
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.unit
+class TestAthenaStopsAbandonedQueries:
+    """A query nobody waits for any more is stopped, so it frees its slot of the account quota."""
+
+    def _executor(self, state: str):
+        mock_athena = MagicMock()
+        mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-run"}
+        mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": state}}}
+        mock_athena.get_query_results.return_value = {
+            "ResultSet": {
+                "ResultSetMetadata": {"ColumnInfo": [{"Name": "n"}]},
+                "Rows": [{"Data": [{"VarCharValue": "n"}]}],
+            }
+        }
+        with patch("boto3.client", return_value=mock_athena), patch("boto3.resource"):
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="t")
+        return executor, mock_athena
+
+    async def test_timeout_stops_the_query(self):
+        from coa_serve.clients.athena import AthenaTimeoutError
+
+        executor, athena = self._executor("RUNNING")
+        with pytest.raises(AthenaTimeoutError):
+            await executor.execute("SELECT 1 AS n", namespace="demo", database="mydb", timeout_seconds=1)
+
+        await _until(lambda: athena.stop_query_execution.called)
+        athena.stop_query_execution.assert_called_once_with(QueryExecutionId="qid-run")
+
+    async def test_a_caller_that_stops_waiting_stops_the_query(self):
+        import asyncio
+
+        executor, athena = self._executor("RUNNING")
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                executor.execute("SELECT 1 AS n", namespace="demo", database="mydb", timeout_seconds=30),
+                timeout=0.5,
+            )
+
+        await _until(lambda: athena.stop_query_execution.called)
+        athena.stop_query_execution.assert_called_once_with(QueryExecutionId="qid-run")
+
+    async def test_a_failed_stop_does_not_hide_the_timeout(self):
+        from coa_serve.clients.athena import AthenaTimeoutError
+
+        executor, athena = self._executor("RUNNING")
+        athena.stop_query_execution.side_effect = RuntimeError("AccessDenied")
+        with pytest.raises(AthenaTimeoutError):
+            await executor.execute("SELECT 1 AS n", namespace="demo", database="mydb", timeout_seconds=1)
+        await _until(lambda: athena.stop_query_execution.called)
+
+    async def test_a_finished_query_is_not_stopped(self):
+        executor, athena = self._executor("SUCCEEDED")
+        await executor.execute("SELECT 1 AS n", namespace="demo", database="mydb", timeout_seconds=5)
+        athena.stop_query_execution.assert_not_called()

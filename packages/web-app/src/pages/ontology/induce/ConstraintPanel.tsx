@@ -95,6 +95,7 @@ export function ConstraintPanel({
   compiledShapes,
   proposalName,
   isReadOnly,
+  deniedReason,
 }: {
   config: ConstraintConfig | null;
   onConfigChange: (config: ConstraintConfig) => void;
@@ -116,6 +117,11 @@ export function ConstraintPanel({
   // custom-rule add, and custom-SHACL input are disabled (mirrors the other
   // editable panels in ProposalDetail).
   isReadOnly?: boolean;
+  // Why the caller's role cannot change the ontology; the caller then also sets
+  // isReadOnly. Set, Validate is off too (compiling the constraints is a
+  // manageOntology request, and isReadOnly leaves it on), and the off buttons
+  // say why.
+  deniedReason?: string;
 }) {
   const { t } = useAppI18n();
   const [newRule, setNewRule] = useState("");
@@ -239,6 +245,7 @@ export function ConstraintPanel({
             onClick={onInfer}
             loading={inferring}
             disabled={isReadOnly}
+            disabledReason={deniedReason}
             iconName="gen-ai"
           >
             {t("Infer constraints")}
@@ -250,7 +257,10 @@ export function ConstraintPanel({
             variant="primary"
             onClick={() => config && onValidate(config, customTurtle)}
             loading={validating}
-            disabled={!config || totalEnabled === 0}
+            disabled={
+              !config || totalEnabled === 0 || deniedReason !== undefined
+            }
+            disabledReason={deniedReason}
           >
             {t("Validate")}
           </ButtonWithHint>

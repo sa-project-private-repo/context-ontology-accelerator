@@ -27,6 +27,7 @@ import structlog
 from ..exceptions import AccessDeniedError, AmbiguousReferenceError
 from ..step_ids import StepId
 from ..trace import TraceCollector
+from .unmapped_terms import DECLINED
 
 if TYPE_CHECKING:
     from ..deadline import Deadline
@@ -106,6 +107,19 @@ class StrategyResult:
     expanded_tables: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class StrategyDeclined:
+    """A strategy's writer replied that the schema cannot answer the question.
+
+    Its prompt listed the namespace's terms that no table maps (``tier2/unmapped_terms.py``),
+    and the question asks about one of them or about something else the schema does not
+    hold. Not an answer: the chain records a failed step with the reason
+    ``cannot_answer`` and goes on to the next strategy, then Tier 3.
+    """
+
+    strategy_name: str
+
+
 @dataclass
 class StrategyContext:
     """Shared context passed to all strategies during resolution."""
@@ -135,8 +149,10 @@ class StructuredQueryStrategy(Protocol):
 
     name: str
 
-    async def resolve(self, query: str, namespace: str, context: StrategyContext) -> StrategyResult | None:
-        """Resolve a query with this strategy, returning a result or None on miss."""
+    async def resolve(
+        self, query: str, namespace: str, context: StrategyContext
+    ) -> StrategyResult | StrategyDeclined | None:
+        """Resolve a query with this strategy: a result, a decline, or None on a miss."""
         ...
 
 
@@ -262,12 +278,20 @@ class StructuredQueryTier:
         context: StrategyContext,
         *,
         option: str | StrategyOption = DEFAULT_STRATEGY,
+        tier3_follows: bool = True,
     ) -> StrategyResult | None:
-        """Execute strategies for the given option. Returns first successful result, or None."""
+        """Execute strategies for the given option. Returns first successful result, or None.
+
+        ``tier3_follows``: whether the caller tries something else when this returns None
+        (the orchestrator asks Tier 3; the deep-reasoning planner picks another tool). The
+        orchestrator passes False when no tier runs after Tier 2 (``tierOverride`` 1 or 2).
+        The sequential chain then returns Ontop's no-mapping placeholder rather than None
+        when nothing after it answered, as it did before the chain learned to skip it.
+        """
         strategies = self._strategies_for(option)
         if option == StrategyOption.BEST:
             return await self._resolve_parallel(query, namespace, context, strategies)
-        return await self._resolve_sequential(query, namespace, context, strategies)
+        return await self._resolve_sequential(query, namespace, context, strategies, tier3_follows=tier3_follows)
 
     def _strategies_for(self, option: str) -> list[StructuredQueryStrategy]:
         """Select and order strategies based on the option."""
@@ -297,14 +321,56 @@ class StructuredQueryTier:
         return fallback
 
     async def _resolve_sequential(
-        self, query: str, namespace: str, context: StrategyContext, strategies: list[StructuredQueryStrategy]
+        self,
+        query: str,
+        namespace: str,
+        context: StrategyContext,
+        strategies: list[StructuredQueryStrategy],
+        *,
+        tier3_follows: bool,
     ) -> StrategyResult | None:
         attempted: list[str] = []
-        for strategy in strategies:
+        placeholder: StrategyResult | None = None
+        for position, strategy in enumerate(strategies, start=1):
             attempted.append(strategy.name)
             try:
                 result = await strategy.resolve(query, namespace, context)
+                if isinstance(result, StrategyDeclined):
+                    # The writer said the schema cannot answer it: no answer from this
+                    # strategy, so the next one (then Tier 3) is asked, as for a miss.
+                    logger.info("strategy_declined", strategy=strategy.name, attempted=attempted)
+                    context.trace.record(
+                        _failed_step_id(strategy.name),
+                        "failed",
+                        0,
+                        detail={"strategy": strategy.name, "reason": DECLINED},
+                    )
+                    continue
                 if result is not None:
+                    # Ontop's no-mapping placeholder carries a dummy row and a
+                    # confident score, so the empty check below never catches it.
+                    # It answers nothing: try the next strategy / Tier 3, as the
+                    # parallel path already does. It is kept in case neither can
+                    # run (see the end of the chain).
+                    if is_degenerate_result(result):
+                        placeholder = placeholder or result
+                        if position == len(strategies) and not tier3_follows:
+                            # Nothing runs after it: it is returned below with no
+                            # failed step, as before.
+                            continue
+                        logger.info(
+                            "strategy_degenerate_no_mapping",
+                            strategy=strategy.name,
+                            confidence=result.confidence,
+                            attempted=attempted,
+                        )
+                        context.trace.record(
+                            _failed_step_id(strategy.name),
+                            "failed",
+                            0,
+                            detail={"strategy": strategy.name, "reason": "degenerate_no_mapping"},
+                        )
+                        continue
                     # Confidence-gated empty result (option C): a zero-row result
                     # from a low-confidence query is more likely a bad query than
                     # a true empty answer — fall through to the next strategy /
@@ -359,6 +425,12 @@ class StructuredQueryTier:
                     detail={"strategy": strategy.name, "error": type(e).__name__},
                 )
                 continue
+        if placeholder is not None and not tier3_follows:
+            # Nothing else answered and nothing runs after Tier 2, so the placeholder is
+            # the answer, as before the chain learned to skip it. A caller pinned to Ontop
+            # (the workshop's REST API notebook) reads uselessVariable as a degraded answer.
+            logger.info("strategy_degenerate_returned", strategy=placeholder.strategy_name, attempted=attempted)
+            return placeholder
         logger.info("strategy_all_failed", attempted=attempted)
         return None
 
@@ -382,7 +454,9 @@ class StructuredQueryTier:
             for _ in strategies
         ]
 
-        async def _run_with_timeout(strategy: StructuredQueryStrategy, ctx: StrategyContext) -> StrategyResult | None:
+        async def _run_with_timeout(
+            strategy: StructuredQueryStrategy, ctx: StrategyContext
+        ) -> StrategyResult | StrategyDeclined | None:
             return await asyncio.wait_for(strategy.resolve(query, namespace, ctx), timeout=_PARALLEL_STRATEGY_TIMEOUT_S)
 
         results = await asyncio.gather(
@@ -424,6 +498,15 @@ class StructuredQueryTier:
             (r, ctx) for r, ctx in valid_with_ctx if not is_low_confidence_empty(r) and not is_degenerate_result(r)
         ]
         if not acceptable:
+            # A declined strategy gave no result: say why, as the sequential path does.
+            for r in results:
+                if isinstance(r, StrategyDeclined):
+                    context.trace.record(
+                        _failed_step_id(r.strategy_name),
+                        "failed",
+                        0,
+                        detail={"strategy": r.strategy_name, "reason": DECLINED},
+                    )
             if valid_with_ctx:
                 logger.info(
                     "tier2_parallel_all_low_confidence_empty",

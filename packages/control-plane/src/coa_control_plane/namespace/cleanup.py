@@ -354,6 +354,33 @@ def delete_graphrag_indexes(namespace_id: str) -> list[str]:
 # ── Ontology teardown (delegates to ontology-engine service) ──────────────
 
 
+def stop_domain_abox_builds(namespace_id: str) -> None:
+    """Ask the ontology-engine to stop the namespace's domain ABox builds for good. Best-effort.
+
+    Each document source the pipeline deletes starts a document deletion pipeline that ends by
+    requesting an ABox build. Stopped first, none of those starts a build on a namespace being torn
+    down. ``delete_all_ontologies`` stops them again and waits out a build still running, so a
+    failure here costs only that wait.
+    """
+    endpoint = os.environ.get("ONTOLOGY_ENGINE_ENDPOINT", "").rstrip("/")
+    if not endpoint:
+        logger.warning("ontology_engine_endpoint_not_configured", namespace_id=namespace_id)
+        return
+
+    req = urllib_request.Request(
+        f"{endpoint}/internal/abox/teardown",
+        data=json.dumps({"namespace": namespace_id}).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            resp.read()
+        logger.info("domain_abox_builds_stopped", namespace_id=namespace_id)
+    except (HTTPError, URLError, OSError) as e:
+        logger.error("domain_abox_stop_failed", namespace_id=namespace_id, error=str(e))
+
+
 def delete_all_ontologies(namespace_id: str) -> None:
     """Call the ontology-engine to delete all ontology data for a namespace.
 
@@ -368,6 +395,10 @@ def delete_all_ontologies(namespace_id: str) -> None:
     with ``index_limit_breached``. Raising lets the pipeline step retry and, if
     it keeps failing, land the namespace in DELETE_FAILED, which is
     recoverable. A silent leak is not.
+
+    The timeout covers the engine's wait for a domain ABox build it stopped
+    (up to its 150 s ``DEPLOY_AMBIGUOUS_MOVE_WAIT_SECONDS``) on top of the
+    teardown itself.
     """
     endpoint = os.environ.get("ONTOLOGY_ENGINE_ENDPOINT", "").rstrip("/")
     if not endpoint:
@@ -378,7 +409,7 @@ def delete_all_ontologies(namespace_id: str) -> None:
     req = urllib_request.Request(url, method="DELETE")
 
     try:
-        with urllib_request.urlopen(req, timeout=120) as resp:  # noqa: S310
+        with urllib_request.urlopen(req, timeout=300) as resp:  # noqa: S310
             body = json.loads(resp.read().decode("utf-8"))
             logger.info(
                 "all_ontologies_deleted",

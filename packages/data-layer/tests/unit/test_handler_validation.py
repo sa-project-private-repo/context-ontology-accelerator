@@ -478,6 +478,65 @@ class TestTranslateSuccess:
 
 
 @pytest.mark.unit
+class TestSparqlQuery:
+    """The VKG SPARQL route of the Ontology designer query console (RunSparqlQuery)."""
+
+    RESOURCE = "/namespaces/{namespaceId}/sparql"
+
+    @pytest.mark.parametrize("body", [None, {"sparql": ""}, {"sparql": "   "}, {"sparql": 3}, {"query": "SELECT"}])
+    def test_a_missing_or_blank_query_is_400_without_a_backend_call(self, body):
+        with patch.object(handler_module, "_invoke_context_manager") as invoke:
+            result = handler(_api_event("POST", self.RESOURCE, body=body), None)
+        assert result["statusCode"] == 400 and "sparql" in result["body"]
+        invoke.assert_not_called()
+
+    def test_an_oversized_query_is_400(self):
+        body = {
+            "sparql": "SELECT * WHERE { ?s ?p ?o }" + " " * handler_module.contract.RUN_SPARQL_QUERY_SPARQL_MAX_LENGTH
+        }
+        with patch.object(handler_module, "_invoke_context_manager") as invoke:
+            assert handler(_api_event("POST", self.RESOURCE, body=body), None)["statusCode"] == 400
+        invoke.assert_not_called()
+
+    def test_the_query_goes_to_serve_with_the_caller_and_the_rows_come_back(self):
+        upstream = {
+            "statusCode": 200,
+            "form": "SELECT",
+            "columns": ["p"],
+            "rows": [["http://e/p/1"]],
+            "rowCount": 1,
+            "truncated": False,
+            "executedSql": "SELECT p FROM patients",
+            "requestId": "r-1",
+        }
+        sparql = "SELECT ?p WHERE { ?p a <http://e/o#Patient> }"
+        with patch.object(handler_module, "_invoke_context_manager", return_value=upstream) as invoke:
+            result = handler(_api_event("POST", self.RESOURCE, body={"sparql": sparql}), None)
+        assert result["statusCode"] == 200
+        assert json.loads(result["body"]) == {
+            "columns": ["p"],
+            "rows": [["http://e/p/1"]],
+            "rowCount": 1,
+            "truncated": False,
+            "executedSql": "SELECT p FROM patients",
+        }
+        payload, token = invoke.call_args.args
+        assert (
+            payload["action"] == "sparqlQuery"
+            and payload["sparql"] == sparql
+            and payload["namespace"] == "22222222-2222-4222-8222-222222222222"
+        )
+        assert payload["profile"]["userId"] == "user@example.com" and token == "test-token"
+
+    def test_a_serve_error_keeps_its_status_and_type(self):
+        upstream = {"statusCode": 400, "error": "ValidationError", "message": "GRAPH is not allowed"}
+        with patch.object(handler_module, "_invoke_context_manager", return_value=upstream):
+            result = handler(_api_event("POST", self.RESOURCE, body={"sparql": "SELECT * { GRAPH ?g {} }"}), None)
+        assert result["statusCode"] == 400
+        assert json.loads(result["body"]) == {"message": "GRAPH is not allowed", "error": "ValidationError"}
+
+
+@pytest.mark.unit
 class TestKbSearchSuccess:
     """KB search endpoint success path and topK passthrough."""
 

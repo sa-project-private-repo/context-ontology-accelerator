@@ -241,3 +241,95 @@ apply GetOntologyOverview @examples([
         }
     }
 ])
+
+apply ListOntologyVersions @examples([
+    {
+        title: "List versions with the one being served"
+        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d" }
+        output: {
+            versions: [
+                {
+                    version: 2
+                    status: "PUBLISHED"
+                    parentVersion: 1
+                    ontologyId: "http://coa/namespace/sales/ontology/induced#"
+                    source: "PROPOSAL"
+                    sourceProposalId: "7c2e9a1b-4d6f-4b8a-9e3c-1f0a2b5d7c9e"
+                    createdBy: "alice@example.com"
+                    createdAt: "2026-10-14T09:00:00+00:00"
+                    diffSummary: {
+                        classes: { added: 3, removed: 1, changed: 2 }
+                    }
+                }
+                {
+                    version: 1
+                    status: "PUBLISHED"
+                    ontologyId: "http://coa/namespace/sales/ontology/induced#"
+                    source: "BOOTSTRAP"
+                    createdBy: "system"
+                    createdAt: "2026-10-01T09:00:00+00:00"
+                }
+            ]
+            activeVersion: 1
+        }
+    }
+])
+
+apply GetOntologyVersion @examples([
+    {
+        title: "Inspect a version before deploying it"
+        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", version: 2 }
+        output: {
+            version: { version: 2, status: "PUBLISHED", parentVersion: 1, ontologyId: "http://coa/namespace/sales/ontology/induced#", source: "PROPOSAL" }
+            manifest: {
+                formatVersion: 1
+                version: 2
+                sourceProposals: ["7c2e9a1b-4d6f-4b8a-9e3c-1f0a2b5d7c9e"]
+            }
+            diff: {
+                classes: {
+                    added: ["http://coa/namespace/sales/ontology/induced#Invoice"]
+                    removed: []
+                    changed: []
+                }
+            }
+            downloadUrls: { "ontology.ttl": "https://s3.amazonaws.com/presigned-get" }
+            breakingMetrics: [
+                {
+                    metricId: "monthly_revenue"
+                    name: "monthly_revenue"
+                    missingClassIri: "http://coa/namespace/sales/ontology/induced#Order"
+                }
+            ]
+        }
+    }
+])
+
+apply DeployOntologyVersion @examples([
+    {
+        title: "Deploy v2, acknowledging the metric it breaks"
+        input: {
+            namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+            version: 2
+            acknowledgedBreakingMetrics: ["monthly_revenue"]
+        }
+        output: { deploymentId: "20261014T090500Z-1a2b3c4d" }
+    }
+])
+
+apply GetOntologyDeployment @examples([
+    {
+        title: "Poll a running deployment"
+        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", deploymentId: "20261014T090500Z-1a2b3c4d" }
+        output: {
+            deploymentId: "20261014T090500Z-1a2b3c4d"
+            version: 2
+            status: "DEPLOYING"
+            partial: false
+            progress: { stage: "done", swap: "done" }
+            requestedBy: "alice@example.com"
+            createdAt: "2026-10-14T09:05:00+00:00"
+            updatedAt: "2026-10-14T09:05:20+00:00"
+        }
+    }
+])

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from coa_serve.clients.vkg import VKGClient, VKGResult, VKGTranslationError
+from coa_serve.clients.vkg import VKGClient, VKGResult, VKGTranslationError, VKGUnavailableError
 
 
 def _mock_response(status_code=200, json_data=None, text=""):
@@ -189,3 +189,55 @@ class TestVKGClientTranslate:
 
         with pytest.raises(VKGTranslationError, match="RemoteProtocolError"):
             await client.translate("SELECT ?c WHERE { ?c a :Customer }", namespace="demo")
+
+
+@pytest.mark.unit
+class TestVKGUnavailable:
+    """A VKG that is not running or not ready is not a query the VKG cannot translate."""
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            httpx.ConnectError("[Errno 8] nodename nor servname provided"),  # scaled to zero: no DNS record
+            httpx.ConnectTimeout("Timed out"),
+            httpx.ReadTimeout("Timed out"),
+            httpx.RemoteProtocolError("Server disconnected"),
+            httpx.ReadError("Connection reset by peer"),
+        ],
+    )
+    @patch("retryhttp.retry", lambda **kwargs: lambda f: f)
+    async def test_a_vkg_that_cannot_be_reached_is_unavailable(self, failure):
+        client = VKGClient(base_url="http://vkg.local:8080", max_retries=3)
+        client._http = AsyncMock()
+        client._http.post.side_effect = failure
+        with pytest.raises(VKGUnavailableError, match=type(failure).__name__):
+            await client.translate("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+    @patch("retryhttp.retry", lambda **kwargs: lambda f: f)
+    async def test_a_vkg_that_is_not_ready_is_unavailable_but_one_that_cannot_translate_is_not(self):
+        client = VKGClient(base_url="http://vkg.local:8080", max_retries=3)
+        client._http = AsyncMock()
+        client._http.post.return_value = _mock_response(503, text='{"message": "Ontop not ready"}')
+        with pytest.raises(VKGUnavailableError, match="VKG returned 503"):
+            await client.translate("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+        # The VKG answers 500 when Ontop cannot reformulate the query: that one is the query's.
+        client._http.post.return_value = _mock_response(500, text='{"error": "Ontop error 500: unknown predicate"}')
+        with pytest.raises(VKGTranslationError, match="VKG returned 500") as raised:
+            await client.translate("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+        assert not isinstance(raised.value, VKGUnavailableError)
+
+    @pytest.mark.parametrize(
+        "failure",
+        [httpx.ConnectError("Connection refused"), _mock_response(503, text='{"message": "Ontop not ready"}')],
+    )
+    async def test_an_outage_is_unavailable_once_the_retries_run_out(self, failure):
+        """The retry decorator wrapped the last failure in tenacity's RetryError, which none of the clauses above
+        caught, so the outage still read as a translation error. One attempt shows it without the backoff."""
+        client = VKGClient(base_url="http://vkg.local:8080", max_retries=1)
+        client._http = AsyncMock()
+        if isinstance(failure, Exception):
+            client._http.post.side_effect = failure
+        else:
+            client._http.post.return_value = failure
+        with pytest.raises(VKGUnavailableError):
+            await client.translate("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")

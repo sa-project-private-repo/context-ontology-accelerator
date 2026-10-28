@@ -98,7 +98,7 @@ class _FakeDynamoTable:
 
         return _Batch()
 
-    def get_item(self, Key):
+    def get_item(self, Key, ConsistentRead=False):
         item = self.items.get((Key["PK"], Key["SK"]))
         return {"Item": dict(item)} if item is not None else {}
 
@@ -132,14 +132,35 @@ class _FakeDynamoTable:
         """``Query`` for the one key condition the registry listing uses.
 
         ``PK = :pk AND begins_with(SK, :skp)``: the partition's rows, then the
-        same paging and post-read filtering as :meth:`scan`.
+        same paging and post-read filtering as :meth:`scan`. The same condition
+        built with ``boto3.dynamodb.conditions.Key`` (the version registry's
+        form) reads the rows in sort-key order, honouring ``ScanIndexForward``.
         """
-        assert kwargs["KeyConditionExpression"] == "PK = :pk AND begins_with(SK, :skp)"
+        condition = kwargs["KeyConditionExpression"]
+        if not isinstance(condition, str):
+            return self._read(self._key_condition_rows(condition, kwargs.get("ScanIndexForward", True)), **kwargs)
         values = kwargs["ExpressionAttributeValues"]
-        ordered = [
-            (k, item) for k, item in self.items.items() if k[0] == values[":pk"] and k[1].startswith(values[":skp"])
-        ]
+        # Also ``delete_proposal``'s whole partition and ``chat_store.live_turns``'s ``:sk`` prefix.
+        prefixes = {
+            "PK = :pk AND begins_with(SK, :skp)": ":skp",
+            "PK = :pk AND begins_with(SK, :sk)": ":sk",
+            "PK = :pk": None,
+        }
+        assert condition in prefixes, condition
+        prefix = values[prefixes[condition]] if prefixes[condition] else ""
+        ordered = [(k, item) for k, item in self.items.items() if k[0] == values[":pk"] and k[1].startswith(prefix)]
         return self._read(ordered, **kwargs)
+
+    def _key_condition_rows(self, condition, forward: bool) -> list:
+        from boto3.dynamodb.conditions import ConditionExpressionBuilder
+
+        built = ConditionExpressionBuilder().build_expression(condition, is_key_condition=True)
+        assert built.condition_expression == "(#n0 = :v0 AND begins_with(#n1, :v1))"
+        assert built.attribute_name_placeholders == {"#n0": "PK", "#n1": "SK"}
+        pk = built.attribute_value_placeholders[":v0"]
+        prefix = built.attribute_value_placeholders[":v1"]
+        rows = [(k, item) for k, item in self.items.items() if k[0] == pk and k[1].startswith(prefix)]
+        return sorted(rows, key=lambda row: row[0][1], reverse=not forward)
 
     def _read(self, ordered: list, **kwargs):
         filter_expr: str = kwargs.get("FilterExpression", "")
@@ -469,18 +490,17 @@ class TestResolveOntologyBucket:
         monkeypatch.setenv("SCL_ENVIRONMENT", "dev")
 
         import coa_common.constants as consts
-
-        importlib.reload(consts)
         from coa_ontology import dynamo_store as ds
 
+        class _FakeSts:
+            def get_caller_identity(self):
+                return {"Account": "111122223333"}
+
+        # Patch before the reload: it re-runs the import-time bucket resolution.
+        monkeypatch.setattr(ds.boto3, "client", lambda *a, **k: _FakeSts())
+        importlib.reload(consts)
         ds = importlib.reload(ds)
         try:
-
-            class _FakeSts:
-                def get_caller_identity(self):
-                    return {"Account": "111122223333"}
-
-            monkeypatch.setattr(ds.boto3, "client", lambda *a, **k: _FakeSts())
             assert ds.resolve_ontology_bucket() == "scl-dev-ontology-artifacts-111122223333"
         finally:
             monkeypatch.undo()
@@ -1380,6 +1400,22 @@ class TestAsyncJobPersistence:
 
         assert ds.get_async_job("VALIDATE", "nope", namespace="ns") is None
 
+    def test_float_metrics_are_stored_as_decimals(self, fake_dynamo):
+        """A validation report carries float metrics, and boto3 refuses floats ("Float types are not supported")."""
+        from decimal import Decimal
+
+        from boto3.dynamodb.types import TypeSerializer
+        from coa_ontology import dynamo_store as ds
+
+        report = {"metrics": {"depth": 2.5, "ratios": [0.25, float("nan")]}}
+        ds.put_async_job("VALIDATE", "jf", {"job_id": "jf", "status": "running", "result": report}, namespace="ns")
+        ds.update_async_job("VALIDATE", "jf", {"status": "completed", "score": 0.9}, namespace="ns")
+        item = ds.get_async_job("VALIDATE", "jf", namespace="ns")
+        TypeSerializer().serialize(item)  # what boto3 does before the call; raises TypeError on a float
+        assert item["result"]["metrics"] == {"depth": Decimal("2.5"), "ratios": [Decimal("0.25"), None]}
+        assert item["score"] == Decimal("0.9")
+        assert report["metrics"]["depth"] == 2.5  # the caller's job dict is left as it was
+
     def test_stale_nonterminal_job_swept_to_failed(self, fake_dynamo, monkeypatch):
         # A running job whose updated_at is older than the stale window is
         # reported as failed on read (its worker died with a recycled task).
@@ -1721,6 +1757,11 @@ class TestCountActiveJobsSelfHeal:
         import coa_ontology.induce_catalog as ic
 
         monkeypatch.setattr(ic, "_STALE_INDUCTION_SECONDS", 60)
+        # No deployment, publish or ABox build in flight; the fake table models neither the
+        # version registry nor the ABOXLOCK row.
+        monkeypatch.setattr(ic.version_registry, "deploy_lock_holder", lambda namespace: None)
+        monkeypatch.setattr(ic.version_registry, "list_versions", lambda namespace: [])
+        monkeypatch.setattr(ic.abox_store, "lock_holder", lambda namespace: None)
 
         # An ``ingested`` job (terminal in the UNION) counts 0 active.
         _seed_induction_job(fake_dynamo, namespace="ns-ing", job_id="acc", status="ingested")
@@ -1958,8 +1999,8 @@ class TestSweepProposalIfStale:
             UpdateExpression="SET created_at = :c",
             ExpressionAttributeValues={":c": old},
         )
-        # ...but the worker checkpoints a step (exactly what _run_accept_step
-        # does), which stamps a fresh server-side updated_at.
+        # ...but the worker checkpoints progress via update_proposal, which
+        # stamps a fresh server-side updated_at.
         ds.update_proposal("p6", namespace="ns", accept_progress={"step": "ingest", "state": "done"})
 
         item = ds.get_proposal_by_id("p6", namespace="ns", hydrate_turtle=False)
@@ -2121,3 +2162,58 @@ class TestSweepStaleRecord:
         )
         assert out["status"] == "running"  # not falsely reported as swept
         assert "error" not in out
+
+    def test_lost_sweep_race_is_logged_at_info_not_as_an_exception(self, caplog):
+        """A conditional write rejected because the row changed is an expected race."""
+        import logging
+
+        from botocore.exceptions import ClientError
+        from coa_ontology import dynamo_store as ds
+
+        def lost_race(_fields):
+            raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "x"}}, "UpdateItem")
+
+        item = self._stale_item()
+        with caplog.at_level(logging.INFO, logger=ds._log.name):
+            out = ds.sweep_stale_record(
+                item,
+                is_in_progress=lambda s: s == "running",
+                max_age_seconds=60,
+                terminal_status="failed",
+                error_field="error",
+                error_message="x",
+                write=lost_race,
+                label="Job x",
+            )
+        assert out["status"] == "running" and "error" not in out
+        races = [r for r in caplog.records if "lost sweep race" in r.getMessage()]
+        assert len(races) == 1 and races[0].levelno == logging.INFO and races[0].exc_info is None
+        assert "Job x" in races[0].getMessage()
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_other_client_errors_are_still_logged_as_exceptions(self, caplog):
+        import logging
+
+        from botocore.exceptions import ClientError
+        from coa_ontology import dynamo_store as ds
+
+        def throttled(_fields):
+            raise ClientError(
+                {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "x"}}, "UpdateItem"
+            )
+
+        item = self._stale_item()
+        with caplog.at_level(logging.INFO, logger=ds._log.name):
+            out = ds.sweep_stale_record(
+                item,
+                is_in_progress=lambda s: s == "running",
+                max_age_seconds=60,
+                terminal_status="failed",
+                error_field="error",
+                error_message="x",
+                write=throttled,
+                label="Job x",
+            )
+        assert out["status"] == "running"
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1 and errors[0].exc_info is not None

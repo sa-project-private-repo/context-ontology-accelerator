@@ -206,6 +206,34 @@ def _extract_entities(metadata: dict) -> list[tuple[str, str, str]]:
     return out
 
 
+def _extract_chunk_ids(metadata: dict) -> list[str]:
+    """Read the lexical graph chunk ids a traversal result cites, in its order.
+
+    The traversal retrievers keep the raw ``SearchResult`` under ``metadata["result"]``:
+    each topic's ``chunks[].chunkId``, then its ``statements[].chunkId``. TopicBeamSearch
+    builds no entity contexts, so on that strategy these ids are what links the result to
+    the domain ABox, whose evidence nodes store the same ids as ``coa:chunkId``. Every
+    access is defensive, like ``_extract_entities``: an unexpected shape yields fewer ids.
+    """
+    out: list[str] = []
+    result = metadata.get("result")
+    topics = result.get("topics") if isinstance(result, dict) else None
+    if not isinstance(topics, list):
+        return out
+    for topic in topics:
+        if not isinstance(topic, dict):
+            continue
+        for key in ("chunks", "statements"):
+            items = topic.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                chunk_id = item.get("chunkId") if isinstance(item, dict) else None
+                if isinstance(chunk_id, str) and chunk_id:
+                    out.append(chunk_id)
+    return out
+
+
 @dataclass(frozen=True)
 class BaselineResult:
     """Result from graphrag-toolkit lexical retrieval."""
@@ -214,6 +242,9 @@ class BaselineResult:
     entities: tuple[GraphEntity, ...]
     source: str = "graphrag-toolkit/lexical"
     trace_steps: tuple[dict, ...] = ()
+    # The lexical graph's ids of the chunks the results cite, best-ranked result first, each once.
+    # ``ChunkResult.chunk_id`` is the toolkit's node id, not one of these.
+    chunk_ids: tuple[str, ...] = ()
 
 
 class BaselineLexicalRetriever:
@@ -500,7 +531,17 @@ class BaselineLexicalRetriever:
             chunks=tuple(chunks),
             entities=tuple(entities),
             trace_steps=tuple(trace_steps),
+            chunk_ids=self._map_chunk_ids(nodes),
         )
+
+    @staticmethod
+    def _map_chunk_ids(nodes: list) -> tuple[str, ...]:
+        """Return the chunk ids the nodes cite (``_extract_chunk_ids``), in node order, each once."""
+        chunk_ids: dict[str, None] = {}
+        for node in nodes:
+            metadata = node.metadata if hasattr(node, "metadata") and isinstance(node.metadata, dict) else {}
+            chunk_ids.update(dict.fromkeys(_extract_chunk_ids(metadata)))
+        return tuple(chunk_ids)
 
     @staticmethod
     def _map_results(nodes: list) -> tuple[list[ChunkResult], list[GraphEntity]]:

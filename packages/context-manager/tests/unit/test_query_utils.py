@@ -13,6 +13,7 @@ from coa_serve.query_utils import (
     _MAX_INLINED_GRAPHS,
     _SAFE_GRAPH_IRI_RE,
     DEFAULT_GRAPH_URI_TEMPLATE,
+    IS_MAPPED_IRI,
     MAX_QUERY_CODEPOINTS,
     MAX_SEARCH_TOKEN_CODEPOINTS,
     QuerySearchPlan,
@@ -664,11 +665,20 @@ class TestObjectPropertiesSparql:
 
     def test_the_mapped_gate_is_opt_in_and_covers_both_ends(self):
         ungated = object_properties_sparql("https://g.local/ns/", limit=10)
-        assert "isMapped" not in ungated
+        # No end of an ungated edge has to be a mapped class.
+        assert "> true ." not in ungated
 
         gated = object_properties_sparql("https://g.local/ns/", limit=10, mapped_gate_iri="urn:coa:vocab#isMapped")
         assert "?domain <urn:coa:vocab#isMapped> true ." in gated
         assert "?range <urn:coa:vocab#isMapped> true ." in gated
+
+    def test_a_relationship_marked_unmapped_is_never_an_edge(self):
+        """Deploy marks a relationship the designer added to a mapped class, with no
+        join behind it, ``coa:isMapped false``: neither a join path nor a hop, so the
+        filter is there with and without the class gate."""
+        gate = f"FILTER NOT EXISTS {{ ?op <{IS_MAPPED_IRI}> false }}"
+        assert gate in object_properties_sparql("https://g.local/ns/", limit=10)
+        assert gate in object_properties_sparql("https://g.local/ns/", limit=10, mapped_gate_iri=IS_MAPPED_IRI)
 
     def test_comment_is_opt_in(self):
         assert "?comment" not in object_properties_sparql("https://g.local/ns/", limit=10)

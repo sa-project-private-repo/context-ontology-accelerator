@@ -110,6 +110,17 @@ class TestOomRetry:
         assert ndb._gsp_post_turtle("urn:g", "<urn:s> <urn:p> <urn:o> .")["status"] == "ok"
         assert len(calls) == 2
 
+    def test_an_update_or_gsp_post_sent_once_is_not_retried(self, neptune):
+        """A caller whose own retry checks something before each attempt (an ABox build checks its lock)
+        sends once: a retry in here would send the write again unchecked."""
+        responses, calls = neptune
+        responses += [httpx.Response(500, json=_OOM_BODY)] * 2
+        with pytest.raises(NeptuneMemoryLimitError):
+            ndb._sparql_update("MOVE GRAPH <urn:a> TO GRAPH <urn:b>", retry_oom=False)
+        with pytest.raises(NeptuneMemoryLimitError):
+            ndb._gsp_post_turtle("urn:g", "<urn:s> <urn:p> <urn:o> .", retry_oom=False)
+        assert len(calls) == 2
+
     def test_gsp_get_retries_oom(self, neptune):
         responses, calls = neptune
         responses += [httpx.Response(500, json=_OOM_BODY), httpx.Response(200, text="# empty")]

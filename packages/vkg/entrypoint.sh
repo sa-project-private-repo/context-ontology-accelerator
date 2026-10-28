@@ -98,7 +98,11 @@ jdbc.password=
 EOF
 
 # Extract ontology version
-ONTOLOGY_VERSION=$(grep -oP 'owl:versionInfo\s+"?\K[^";\s]+' "${ONTOLOGY_FILE}" 2>/dev/null || echo "${VERSION}")
+# Snapshots are canonical N-Triples (full IRIs); hand-written Turtle uses the owl: prefix.
+# `|| true`: under pipefail, sed dying on SIGPIPE (head -n1 closed early) or an unreadable
+# file must fall back to ${VERSION}, not abort the entrypoint.
+ONTOLOGY_VERSION=$(sed -nE 's/.*(owl:versionInfo|<http:\/\/www\.w3\.org\/2002\/07\/owl#versionInfo>)[[:space:]]+"?([^";[:space:]]+).*/\2/p' "${ONTOLOGY_FILE}" 2>/dev/null | head -n1 || true)
+ONTOLOGY_VERSION=${ONTOLOGY_VERSION:-${VERSION}}
 export ONTOLOGY_VERSION ONTOP_PORT
 echo "[VKG] Ontology version: ${ONTOLOGY_VERSION}"
 

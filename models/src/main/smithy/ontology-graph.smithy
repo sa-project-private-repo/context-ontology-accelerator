@@ -10,6 +10,7 @@ $version: "2"
 namespace com.amazon.semanticcontext.ontologygraph
 
 use com.amazon.semanticcontext.common#ClientToken
+use com.amazon.semanticcontext.common#ConflictError
 use com.amazon.semanticcontext.common#NotFoundError
 use com.amazon.semanticcontext.common#OntologyId
 use com.amazon.semanticcontext.common#PaginatedOutput
@@ -641,12 +642,16 @@ structure GraphVertex {
     /// IRIs of the named graphs the vertex appears in.
     graphUris: StringList
 
-    /// Whether this vertex carries the ``coa:isMapped`` marker — i.e. it is
-    /// backed by an R2RML mapping and therefore answerable by the structured
-    /// Tier-2 (NL→SPARQL / NL→SQL) path. Structured / table-backed classes are
+    /// Whether this vertex carries ``coa:isMapped true``: it is backed by an
+    /// R2RML mapping and therefore answerable by the structured Tier-2
+    /// (NL-to-SPARQL / NL-to-SQL) path. Structured / table-backed classes are
     /// true; unstructured-induced and foundational classes are false (the marker
-    /// is absent). Derived from the top-level ``coa:isMapped`` triple and
-    /// excluded from ``edges``.
+    /// is absent). A property is never true: an attribute or relationship
+    /// (``owl:DatatypeProperty`` or ``owl:ObjectProperty``) that no mapping maps
+    /// although one of its domains (or, for a relationship, one of its ranges) is
+    /// mapped carries ``coa:isMapped false``, and structured queries leave it out.
+    /// Derived from the top-level ``coa:isMapped`` triple and excluded from
+    /// ``edges``.
     isMapped: Boolean
 
     /// Previous generations of this vertex's annotations, retired when a
@@ -659,7 +664,13 @@ structure GraphVertex {
     /// excluded from ``edges``. Empty when nothing has been superseded.
     superseded: SupersededAnnotations
 
-    /// Outgoing relationship edges from this vertex.
+    /// Outgoing relationship edges from this vertex. A mapped class read from
+    /// one table, and a mapped attribute read from one column, also carry a
+    /// ``coa:physicalName`` literal edge: the table or column name, which deploy
+    /// derives from the R2RML mapping like ``coa:isMapped``. A mapped property
+    /// whose domain (or range) is not the class its mapping reads it from (or
+    /// joins it to) carries ``coa:mappedDomain`` (or ``coa:mappedRange``) edges to
+    /// those classes, derived the same way.
     edges: GraphEdgeList
 }
 
@@ -934,5 +945,324 @@ operation GetOntologyOverview {
 
     errors: [
         ValidationError
+    ]
+}
+
+// ── Ontology versions ────────────────────────────────────────────────────
+/// Number of an ontology version, unique and increasing within a namespace.
+@range(min: 1, max: 1000000000)
+integer OntologyVersionNumber
+
+/// Identifier of an ontology deployment, as returned by DeployOntologyVersion.
+@length(min: 1, max: 128)
+string OntologyDeploymentId
+
+/// Identifier of a governed metric (its name).
+@length(min: 1, max: 128)
+string BreakingMetricId
+
+/// Governed-metric identifiers a deployment is allowed to break.
+@length(max: 1000)
+list BreakingMetricIdList {
+    member: BreakingMetricId
+}
+
+/// Lifecycle states of a published ontology version.
+enum OntologyVersionStatus {
+    /// The version number is reserved and its snapshot is being written.
+    PUBLISHING = "PUBLISHING"
+
+    /// The snapshot is complete and the version can be deployed.
+    PUBLISHED = "PUBLISHED"
+
+    /// Publishing failed; the version number stays as a gap.
+    PUBLISH_FAILED = "PUBLISH_FAILED"
+}
+
+/// Lifecycle states of an ontology deployment (deploy or rollback).
+enum OntologyDeploymentStatus {
+    /// The deployment is running.
+    DEPLOYING = "DEPLOYING"
+
+    /// Every deploy step completed.
+    DEPLOYED = "DEPLOYED"
+
+    /// A deploy step failed; see `partial` and `error`.
+    DEPLOY_FAILED = "DEPLOY_FAILED"
+}
+
+/// Added, removed and changed IRI counts for one kind of schema element.
+structure OntologyDiffCounts {
+    /// Number of IRIs added.
+    added: Integer
+
+    /// Number of IRIs removed.
+    removed: Integer
+
+    /// Number of IRIs whose triples changed.
+    changed: Integer
+}
+
+/// Change summary of a version against its parent version.
+structure OntologyDiffSummary {
+    /// Class changes.
+    classes: OntologyDiffCounts
+
+    /// Object property changes.
+    objectProperties: OntologyDiffCounts
+
+    /// Datatype property changes.
+    datatypeProperties: OntologyDiffCounts
+}
+
+/// One published ontology version.
+structure OntologyVersionSummary {
+    /// Version number, unique and increasing within the namespace.
+    @required
+    version: Integer
+
+    @required
+    status: OntologyVersionStatus
+
+    /// Version this one was built on; absent for a first version.
+    parentVersion: Integer
+
+    /// Ontology IRI shared by every version in the namespace.
+    @required
+    ontologyId: String
+
+    /// How the version was produced: `PROPOSAL` (accept) or `BOOTSTRAP` (captured from a pre-versioning namespace).
+    @required
+    source: String
+
+    /// Proposal whose accept produced this version.
+    sourceProposalId: String
+
+    /// Principal that published the version.
+    createdBy: String
+
+    /// ISO-8601 timestamp of publication.
+    createdAt: String
+
+    diffSummary: OntologyDiffSummary
+
+    /// Failure reason when `status` is `PUBLISH_FAILED`.
+    error: String
+}
+
+/// Ontology versions, newest first.
+list OntologyVersionSummaryList {
+    member: OntologyVersionSummary
+}
+
+/// A governed metric linked to a class that a deployment would remove.
+structure BreakingMetric {
+    /// Metric identifier (its name).
+    @required
+    metricId: String
+
+    /// Display name of the metric.
+    @required
+    name: String
+
+    /// IRI of the linked class the target version no longer contains.
+    @required
+    missingClassIri: String
+}
+
+/// Governed metrics a deployment would break.
+list BreakingMetricList {
+    member: BreakingMetric
+}
+
+/// Per-step deployment state keyed by step name (`stage`, `swap`, `embeddings`, `registry`, `latest`, `notify`).
+map DeploymentProgress {
+    key: String
+    value: String
+}
+
+/// Presigned GET URLs keyed by snapshot file name.
+map SnapshotDownloadUrls {
+    key: String
+    value: String
+}
+
+/// One deploy or rollback attempt.
+structure OntologyDeployment {
+    /// Identifier of the deployment.
+    @required
+    deploymentId: String
+
+    /// Version being deployed.
+    @required
+    version: Integer
+
+    @required
+    status: OntologyDeploymentStatus
+
+    /// True when the deployment failed after the graph swap; deploy the same version again to converge.
+    @required
+    partial: Boolean
+
+    @required
+    progress: DeploymentProgress
+
+    /// Principal that requested the deployment.
+    requestedBy: String
+
+    /// Failure reason when `status` is `DEPLOY_FAILED`.
+    error: String
+
+    /// ISO-8601 creation timestamp.
+    createdAt: String
+
+    /// ISO-8601 timestamp of the last update.
+    updatedAt: String
+}
+
+/// List the namespace's ontology versions, newest first, one page at a time.
+///
+/// Keep paging until `nextToken` is absent. `activeVersion`, `latestDeployment`,
+/// `servingDeployment` (the deployment that serving was left in) and
+/// `resetAfterVersion` describe the namespace, not the page: every page
+/// carries them, read at the time of that request.
+@readonly
+@paginated(inputToken: "nextToken", outputToken: "nextToken", pageSize: "maxResults", items: "versions")
+@http(method: "GET", uri: "/namespaces/{namespaceId}/ontology/versions", code: 200)
+operation ListOntologyVersions {
+    input := {
+        @required
+        @httpLabel
+        namespaceId: Uuid
+
+        /// Pagination token from a previous response.
+        @httpQuery("nextToken")
+        nextToken: PaginationToken
+
+        /// Maximum number of versions to return in one page (default 50).
+        @httpQuery("maxResults")
+        @range(min: 1, max: 200)
+        maxResults: Integer
+    }
+
+    output := with [PaginatedOutput] {
+        /// This page of versions, newest first.
+        @required
+        versions: OntologyVersionSummaryList
+
+        /// Version the namespace currently serves; absent when nothing is deployed. On every page.
+        activeVersion: Integer
+
+        /// The namespace's most recent deployment. On every page.
+        latestDeployment: OntologyDeployment
+
+        /// Latest deployment that may have changed what is served. A deployment that failed before its
+        /// graph swap (`partial` false) left serving untouched and is skipped, so when this one is `partial`
+        /// the graph, embeddings and VKG files are still out of step even if a later attempt failed:
+        /// deploy its version again to converge. A running deployment is reported, since it may already
+        /// have swapped. Absent until a deployment starts, or while every deployment failed before its swap.
+        servingDeployment: OntologyDeployment
+
+        /// Reset floor: versions at or below it belong to a deleted ontology and cannot be deployed
+        /// (`DeployOntologyVersion` returns 409). Absent until a domain ontology is deleted. On every page.
+        resetAfterVersion: Integer
+    }
+}
+
+/// Get one ontology version: manifest, diff, download links and the governed metrics deploying it would break.
+/// A version that is not PUBLISHED has no snapshot, so its `manifest`, `diff`, `downloadUrls` and
+/// `breakingMetrics` are empty. Returns 409 when a published version's snapshot is damaged or incomplete.
+@readonly
+@http(method: "GET", uri: "/namespaces/{namespaceId}/ontology/versions/{version}", code: 200)
+operation GetOntologyVersion {
+    input := {
+        @required
+        @httpLabel
+        namespaceId: Uuid
+
+        /// Version number.
+        @required
+        @httpLabel
+        version: OntologyVersionNumber
+    }
+
+    output := {
+        @required
+        version: OntologyVersionSummary
+
+        /// Snapshot manifest (format version, per-file SHA-256, source proposals). Empty unless the version is PUBLISHED.
+        @required
+        manifest: Document
+
+        /// Added, removed and changed IRIs per kind against the parent version. Empty unless the version is PUBLISHED.
+        @required
+        diff: Document
+
+        @required
+        downloadUrls: SnapshotDownloadUrls
+
+        @required
+        breakingMetrics: BreakingMetricList
+    }
+
+    errors: [
+        NotFoundError
+        ConflictError
+    ]
+}
+
+/// Deploy, or roll back to, an ontology version. Returns 202; poll `GetOntologyDeployment`.
+/// Returns 409 when the version is not published, another deployment is running, the version
+/// belongs to a deleted ontology (at or below `resetAfterVersion`), or governed metrics would
+/// break and were not acknowledged.
+///
+/// Takes no `clientToken`: a repeat while the first deployment runs is a 409, and deploying
+/// the version that is already active again converges on the same served state.
+@http(method: "POST", uri: "/namespaces/{namespaceId}/ontology/versions/{version}/deploy", code: 202)
+operation DeployOntologyVersion {
+    input := {
+        @required
+        @httpLabel
+        namespaceId: Uuid
+
+        /// Version number to deploy.
+        @required
+        @httpLabel
+        version: OntologyVersionNumber
+
+        /// Metric ids from `GetOntologyVersion.breakingMetrics` the caller accepts breaking.
+        acknowledgedBreakingMetrics: BreakingMetricIdList
+    }
+
+    output := {
+        /// Identifier to poll with `GetOntologyDeployment`.
+        @required
+        deploymentId: String
+    }
+
+    errors: [
+        ConflictError
+    ]
+}
+
+/// Get a deployment's status and per-step progress.
+@readonly
+@http(method: "GET", uri: "/namespaces/{namespaceId}/ontology/deployments/{deploymentId}", code: 200)
+operation GetOntologyDeployment {
+    input := {
+        @required
+        @httpLabel
+        namespaceId: Uuid
+
+        /// Identifier returned by `DeployOntologyVersion`.
+        @required
+        @httpLabel
+        deploymentId: OntologyDeploymentId
+    }
+
+    output: OntologyDeployment
+
+    errors: [
+        NotFoundError
     ]
 }

@@ -4,15 +4,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useCanManageOntology } from "@api-hooks/use-can-manage-ontology";
 import { useNamespace } from "@api-hooks/use-namespace";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
+import Checkbox from "@cloudscape-design/components/checkbox";
 import Container from "@cloudscape-design/components/container";
 import ExpandableSection from "@cloudscape-design/components/expandable-section";
 import Header from "@cloudscape-design/components/header";
 import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
+import Link from "@cloudscape-design/components/link";
 import Modal from "@cloudscape-design/components/modal";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Spinner from "@cloudscape-design/components/spinner";
@@ -30,6 +33,7 @@ import {
   putToPresignedUrl,
   getProposalValidationJob,
   inferConstraints,
+  listOntologyVersions,
   getInferConstraintsJob,
   repairProposalDatatypes,
   updateProposal,
@@ -39,6 +43,12 @@ import {
   type ProposalValidationFinding,
   type ProposalValidationJob,
 } from "../../../services/ontology-engine";
+import {
+  isDraftConflict,
+  isRebaseRequired,
+  openStudioDraft,
+  type StudioAcceptPreview,
+} from "../../../services/studio";
 import { ApiError, useApiClient } from "@components/ApiClientProvider";
 import {
   OntologyGraphFlow,
@@ -67,7 +77,11 @@ import { parseTurtleEntities, type TurtleEntity } from "./turtle";
 import { ProposalEntitiesPanel } from "./ProposalEntitiesPanel";
 import { InfoPopover } from "@components/InfoPopover";
 import { ButtonWithHint } from "@components/ButtonWithHint";
-import { useAppI18n } from "../../../i18n/LocaleProvider";
+import { formatTimestamp } from "@utils/helpers";
+import { useAppI18n, type AppTranslate } from "../../../i18n/LocaleProvider";
+import { autoDeployHeldMessage } from "../versions/versions-helpers";
+import { AcceptDialog } from "../studio/AcceptDialog";
+import { conflictMessage } from "../studio/studio-helpers";
 
 /**
  * Whether the proposal has a COMPUTED ontology to show constraints for.
@@ -113,6 +127,9 @@ const _READ_ONLY_STATUSES = new Set([
 export function proposalIsReadOnly(status: string): boolean {
   return _READ_ONLY_STATUSES.has(status);
 }
+
+/** The statuses a designer draft can be opened from (the same rule as the designer page). */
+const STUDIO_OPENABLE_STATUSES = ["pending", "updated", "accept_failed"];
 
 /**
  * Origin-based node kind for graph color coding, derived from a
@@ -569,8 +586,37 @@ function CodeBlock({ children }: { children: string }) {
   );
 }
 
+const POLL_INTERVAL_MS = 2000;
+// The accept worker starts the auto-deploy after flipping the proposal to
+// "accepted" (it parses the merged ontology and queries the graph first), so
+// the outcome can take a while to be recorded. Stop waiting after this long.
+const AUTO_DEPLOY_OUTCOME_WAIT_MS = 30 * 1000;
+
+/** What to tell the reviewer about the deployment their accept asked for ("" for nothing). */
+function deployNoteAfterAccept(
+  t: AppTranslate,
+  deployRequested: boolean,
+  proposal: Pick<Proposal, "auto_deploy_id" | "auto_deploy_held">,
+  waitingForOutcome: boolean,
+  gaveUpWaiting: boolean,
+): string {
+  if (!deployRequested)
+    return t("Deploy it from Ontology › Induction › Versions.");
+  if (proposal.auto_deploy_id)
+    return t(
+      "Deployment started. Follow it in Ontology › Induction › Versions.",
+    );
+  // A held deploy is explained by the warning banner.
+  if (proposal.auto_deploy_held) return "";
+  if (gaveUpWaiting)
+    return t(
+      "Deployment requested. Check Ontology › Induction › Versions for its status.",
+    );
+  return waitingForOutcome ? t("Waiting for the deployment to start…") : "";
+}
+
 export function ProposalDetailPage() {
-  const { t } = useAppI18n();
+  const { t, locale } = useAppI18n();
   const { namespaceId, proposalId } = useParams<{
     namespaceId: string;
     proposalId: string;
@@ -590,6 +636,11 @@ export function ProposalDetailPage() {
     },
     { text: proposalId ?? "" },
   ]);
+  // A role that only reads (a data analyst) is not offered what the API would refuse it.
+  const canChange = useCanManageOntology(namespaceId);
+  const denied = canChange
+    ? undefined
+    : t("Your role on this namespace does not allow this.");
 
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [loading, setLoading] = useState(true);
@@ -606,6 +657,22 @@ export function ProposalDetailPage() {
   // not replace the whole page with the "Could not load proposal" screen.
   const [parseError, setParseError] = useState<string | null>(null);
   const [accepting, setAccepting] = useState(false);
+  const [deployAfterAccept, setDeployAfterAccept] = useState(true);
+  // doAccept can run from a stale closure (after the datatype check or
+  // "Repair & accept"), so it reads the checkbox through this ref.
+  const deployAfterAcceptRef = useRef(true);
+  // What this tab's accept asked for; null until it has accepted one.
+  const [acceptedWithDeploy, setAcceptedWithDeploy] = useState<boolean | null>(
+    null,
+  );
+  const [outcomeWaitExpired, setOutcomeWaitExpired] = useState(false);
+  // Bumped by Refresh so the active-version lookup below re-runs.
+  const [versionsRefresh, setVersionsRefresh] = useState(0);
+  // The namespace's active ontology version, looked up to tell whether a held
+  // auto-deploy is still pending. undefined = not looked up yet.
+  const [activeVersion, setActiveVersion] = useState<number | null | undefined>(
+    undefined,
+  );
   const [cancelling, setCancelling] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [validating, setValidating] = useState(false);
@@ -625,6 +692,12 @@ export function ProposalDetailPage() {
     canonical: string;
   }> | null>(null);
   const [checkingAccept, setCheckingAccept] = useState(false);
+  const [openingStudio, setOpeningStudio] = useState(false);
+  // The designer draft revision being reviewed in the accept dialog; null = closed.
+  const [acceptRevision, setAcceptRevision] = useState<number | null>(null);
+  // An accept or repair answered 409 RebaseRequired: a newer version was published
+  // after the designer draft was built (the same advice comes from a failed accept).
+  const [rebaseRequired, setRebaseRequired] = useState(false);
   const [shaclValidation, setShaclValidation] =
     useState<ProposalValidationJob | null>(null);
   const [acceptResult, setAcceptResult] = useState<{
@@ -674,12 +747,13 @@ export function ProposalDetailPage() {
   // panel's expand/collapse and so the "Export SHACL" button can download it.
   const [compiledShacl, setCompiledShacl] = useState<string | null>(null);
 
-  const refresh = useCallback(() => {
-    if (!proposalId || !namespaceId) return;
+  /** Reloads the proposal; resolves it, or null when it could not be read. */
+  const refresh = useCallback((): Promise<Proposal | null> => {
+    if (!proposalId || !namespaceId) return Promise.resolve(null);
     setError(null);
     setSaveError(null);
     setLoading(true);
-    getProposal(apiClient, namespaceId, proposalId)
+    return getProposal(apiClient, namespaceId, proposalId)
       .then(async (p) => {
         // Prefer inline content (present for normal-size proposals). Large
         // artifacts are omitted from the response to stay under the 6 MB limit,
@@ -740,8 +814,12 @@ export function ProposalDetailPage() {
         setDirty(false);
         setPendingGroundingOverrides({});
         setEditingEntity(null);
+        return p;
       })
-      .catch((e: Error) => setError(e.message))
+      .catch((e: Error) => {
+        setError(e.message);
+        return null;
+      })
       .finally(() => setLoading(false));
   }, [apiClient, proposalId, namespaceId]);
 
@@ -757,15 +835,116 @@ export function ProposalDetailPage() {
   useEffect(() => {
     if (!isProposalAcceptInProgress(proposal?.status ?? "")) return;
     if (!proposalId || !namespaceId) return;
+    let cancelled = false;
     const id = window.setInterval(() => {
       getProposal(apiClient, namespaceId, proposalId)
-        .then(setProposal)
+        .then((p) => {
+          // A read that outlives its effect (status moved on, or unmounted)
+          // must not overwrite newer state.
+          if (!cancelled) setProposal(p);
+        })
         .catch(() => {
           /* Transient errors during polling are non-fatal. */
         });
     }, 3000);
-    return () => window.clearInterval(id);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
   }, [apiClient, proposal?.status, proposalId, namespaceId]);
+
+  const autoDeployHeld = proposal?.auto_deploy_held != null;
+  const hasAutoDeployOutcome =
+    autoDeployHeld || proposal?.auto_deploy_id != null;
+  const publishedVersion = proposal?.published_version;
+  const isAcceptedProposal = proposal?.status === "accepted";
+
+  // The accept worker records the auto-deploy outcome (auto_deploy_id or
+  // auto_deploy_held) some time after flipping the proposal to "accepted".
+  // Follow up until it shows, for a bounded time. This also covers a page
+  // loaded mid-accept, and skips the wait when the outcome is already there or
+  // this tab accepted without asking for a deployment. (A proposal accepted
+  // without a deployment in an earlier session looks the same on load, so it
+  // gets one bounded follow-up too.)
+  const awaitingAutoDeployOutcome =
+    isAcceptedProposal &&
+    publishedVersion != null &&
+    !hasAutoDeployOutcome &&
+    acceptedWithDeploy !== false;
+  useEffect(() => {
+    if (!awaitingAutoDeployOutcome || !proposalId || !namespaceId) return;
+    let cancelled = false;
+    let timer: number;
+    const deadline = Date.now() + AUTO_DEPLOY_OUTCOME_WAIT_MS;
+    const poll = async () => {
+      try {
+        const fresh = await getProposal(apiClient, namespaceId, proposalId);
+        if (cancelled) return;
+        if (fresh.auto_deploy_id != null || fresh.auto_deploy_held != null) {
+          // Merge just the outcome: a full replace would drop the constraint
+          // config that refresh() fetched from its presigned URL. That only
+          // protects the page-load path; the accept flow's own reads already
+          // replace the proposal wholesale.
+          setProposal((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  auto_deploy_id: fresh.auto_deploy_id,
+                  auto_deploy_held: fresh.auto_deploy_held,
+                }
+              : fresh,
+          );
+          return;
+        }
+      } catch {
+        /* Transient: keep polling until the deadline. */
+      }
+      if (cancelled) return;
+      if (Date.now() >= deadline) {
+        setOutcomeWaitExpired(true);
+        return;
+      }
+      timer = window.setTimeout(poll, POLL_INTERVAL_MS);
+    };
+    timer = window.setTimeout(poll, POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [apiClient, awaitingAutoDeployOutcome, proposalId, namespaceId]);
+
+  // A held auto-deploy only needs attention while its version is not yet
+  // covered by the active one (deploying it from the Versions tab clears the
+  // banner), so look up the active version. Keyed on whether the hold is
+  // present rather than on the proposal object, so polling doesn't refetch; the
+  // hold can arrive after the status flips to "accepted", and a changed
+  // published_version or a Refresh refetches.
+  useEffect(() => {
+    if (!isAcceptedProposal || !autoDeployHeld || !namespaceId) return;
+    let cancelled = false;
+    const lookUp = async () => {
+      let active: number | null;
+      try {
+        const list = await listOntologyVersions(apiClient, namespaceId);
+        active = list.activeVersion ?? null;
+      } catch {
+        // The lookup only dismisses a stale banner; if it fails, keep showing it.
+        active = null;
+      }
+      if (!cancelled) setActiveVersion(active);
+    };
+    void lookUp();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    apiClient,
+    namespaceId,
+    isAcceptedProposal,
+    autoDeployHeld,
+    publishedVersion,
+    versionsRefresh,
+  ]);
 
   // Parsing the (potentially multi-MB) Turtle and building the graph are
   // synchronous and block the main thread for ~1-2s on large ontologies — on
@@ -1002,6 +1181,36 @@ export function ProposalDetailPage() {
     },
     [updating],
   );
+  // Edits from the entities panel: one entity's Turtle, or the whole document.
+  // Memoized for the same effect. As new functions on every render they re-ran
+  // it on every render, and each run opened or closed the split panel, which
+  // renders the app shell and this page again: an endless stream of updates
+  // that held off every navigation away from the page.
+  const updateEntityTurtle = useCallback(
+    (entity: TurtleEntity, updatedBody: string) => {
+      if (!editedTurtle) return;
+      setEditedTurtle(editedTurtle.replace(entity.body, updatedBody));
+      setDirty(true);
+    },
+    [editedTurtle],
+  );
+  const updateTurtle = useCallback((updatedTurtle: string) => {
+    setEditedTurtle(updatedTurtle);
+    setDirty(true);
+  }, []);
+
+  // The accept preview can know more than this page: a version published since, or a
+  // change made elsewhere.
+  const onAcceptPreview = useCallback(
+    (preview: StudioAcceptPreview) => {
+      setRebaseRequired(preview.rebaseRequired);
+      if (preview.revision !== acceptRevision) {
+        setAcceptRevision(preview.revision);
+        void refresh();
+      }
+    },
+    [acceptRevision, refresh],
+  );
 
   async function requestAccept() {
     // Accept-time datatype guard: before accepting, cheaply check (dry-run, no
@@ -1028,56 +1237,140 @@ export function ProposalDetailPage() {
     } finally {
       setCheckingAccept(false);
     }
-    await doAccept();
+    await acceptOrReview();
+  }
+
+  /**
+   * Accepts once the datatype check is settled. A designer draft is first reviewed in the
+   * accept dialog: what it removes and renames, and the metrics it breaks.
+   * ``revision`` is the draft revision to review: the one on screen, or the one a repair
+   * just wrote (this runs from a closure that predates it).
+   */
+  async function acceptOrReview(revision?: number) {
+    if (!proposal?.studio) {
+      await doAccept();
+      return;
+    }
+    setAcceptDatatypeWarning(null);
+    setAcceptRevision(revision ?? proposal.studio.revision);
   }
 
   async function repairThenAccept() {
     // "Repair & accept" path from the confirm modal: apply the repair, then accept.
     if (!proposalId || !namespaceId) return;
     setAcceptDatatypeWarning(null);
+    setRebaseRequired(false);
     setRepairing(true);
+    // The repair of a designer draft writes a new revision: that is the one to accept.
+    let repairedRevision: number | undefined;
     try {
-      await repairProposalDatatypes(apiClient, namespaceId, proposalId);
-      refresh();
+      const repaired = await repairDatatypes(namespaceId, proposalId);
+      if (proposal?.studio) repairedRevision = repaired.revision;
+      // Wait for the reload so a slow read can't land a stale row after accept.
+      await refresh();
     } catch (e) {
-      setAcceptResult({
-        ok: false,
-        message: t("Datatype repair failed: {error}", {
-          error: (e as Error).message,
-        }),
-      });
+      if (!(await handleStudioFailure(e))) {
+        setAcceptResult({
+          ok: false,
+          message: t("Datatype repair failed: {error}", {
+            error: (e as Error).message,
+          }),
+        });
+      }
       return;
     } finally {
       setRepairing(false);
     }
-    await doAccept();
+    await acceptOrReview(repairedRevision);
   }
 
-  async function doAccept() {
+  /** Repairs the datatype tokens. A designer draft is repaired at the revision on screen. */
+  function repairDatatypes(namespace: string, id: string) {
+    return proposal?.studio
+      ? repairProposalDatatypes(apiClient, namespace, id, {
+          expectedRevision: proposal.studio.revision,
+        })
+      : repairProposalDatatypes(apiClient, namespace, id);
+  }
+
+  /**
+   * The failures only a proposal open in the Ontology designer gets from accept and
+   * datatype repair: a lost race reloads the draft, a stale page reloads too, and a
+   * newer published version sends the user to the designer to rebase. False for any
+   * other error.
+   */
+  async function handleStudioFailure(e: unknown): Promise<boolean> {
+    if (isDraftConflict(e)) {
+      await reloadAfterRefusal(conflictMessage(t));
+      return true;
+    }
+    if (isRebaseRequired(e)) {
+      setRebaseRequired(true);
+      return true;
+    }
+    // Sent without a revision because this page did not know the draft was open.
+    if (e instanceof ApiError && e.code === "ExpectedRevisionRequired") {
+      // Shown when an accept found the proposal open in the designer although this page did not know.
+      await reloadAfterRefusal(
+        t(
+          "This proposal is open in the Ontology designer. The page was reloaded; review the draft and accept again.",
+        ),
+      );
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Reloads the proposal after a refused accept or repair and says why, unless
+   * another tab's accept published the draft meanwhile: the page then shows it
+   * accepted, and there is nothing to accept again.
+   */
+  async function reloadAfterRefusal(message: string) {
+    const fresh = await refresh();
+    if (fresh?.status !== "accepted") setAcceptResult({ ok: false, message });
+  }
+
+  async function doAccept(
+    expectedRevision?: number,
+    deploy = deployAfterAcceptRef.current,
+  ) {
     // POST /accept returns 202 immediately; the worker runs ingestion
     // in the background. We poll the proposal until ``status`` leaves the
     // in-progress states (terminal: ``accepted``, or ``accept_failed`` with
     // ``accept_error`` naming the failed step; legacy: ``pending`` +
     // ``accept_error``). Time out after 5 minutes.
+    // ``expectedRevision`` is the designer draft revision the user reviewed.
     if (!proposalId || !namespaceId) return;
     setAcceptDatatypeWarning(null);
     setAcceptResult(null);
+    setRebaseRequired(false);
+    setOutcomeWaitExpired(false);
     setAccepting(true);
     try {
-      await acceptProposal(apiClient, namespaceId, proposalId);
+      await acceptProposal(apiClient, namespaceId, proposalId, {
+        deploy,
+        ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+      });
+      setAcceptedWithDeploy(deploy);
       const start = Date.now();
-      const POLL_INTERVAL_MS = 2000;
       const POLL_TIMEOUT_MS = 5 * 60 * 1000;
       while (Date.now() - start < POLL_TIMEOUT_MS) {
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
         const fresh = await getProposal(apiClient, namespaceId, proposalId);
         setProposal(fresh);
         if (fresh.status === "accepted") {
+          // The deployment note is added at render, once the outcome is known.
           setAcceptResult({
             ok: true,
-            message: t("Merged into ontology {id}", {
-              id: fresh.ontology_id,
-            }),
+            message:
+              fresh.published_version !== undefined
+                ? t("Published as version v{version}.", {
+                    version: fresh.published_version,
+                  })
+                : t("Merged into ontology {id}", {
+                    id: fresh.ontology_id,
+                  }),
           });
           return;
         }
@@ -1104,9 +1397,30 @@ export function ProposalDetailPage() {
         ),
       });
     } catch (e) {
-      setAcceptResult({ ok: false, message: (e as Error).message });
+      if (!(await handleStudioFailure(e))) {
+        setAcceptResult({ ok: false, message: (e as Error).message });
+      }
     } finally {
       setAccepting(false);
+    }
+  }
+
+  const studioPath = `/namespaces/${namespaceId}/ontology/proposals/${proposalId}/studio`;
+
+  async function openInStudio() {
+    if (!proposalId || !namespaceId) return;
+    if (proposal?.studio) {
+      navigate(studioPath);
+      return;
+    }
+    setOpeningStudio(true);
+    try {
+      await openStudioDraft(apiClient, namespaceId, proposalId);
+      navigate(studioPath);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setOpeningStudio(false);
     }
   }
 
@@ -1169,13 +1483,15 @@ export function ProposalDetailPage() {
     if (!proposalId || !namespaceId) return;
     setRepairing(true);
     try {
-      await repairProposalDatatypes(apiClient, namespaceId, proposalId);
+      await repairDatatypes(namespaceId, proposalId);
       setRepairOffenders(null);
       // Reload the (now-repaired) proposal and re-run validation so the
       // MALFORMED_DATATYPE_TOKENS finding clears.
       refresh();
       await validate();
     } catch (e) {
+      // Another change landed in the draft first: show it as it is now.
+      if (isDraftConflict(e)) refresh();
       setValidation({
         job_id: "",
         proposal_id: proposalId,
@@ -1211,7 +1527,44 @@ export function ProposalDetailPage() {
   const md = (proposal.metadata ?? {}) as Record<string, unknown>;
   // Gates every edit + accept control on this page. See proposalIsReadOnly.
   const isReadOnly = proposalIsReadOnly(proposal.status);
+  // The Ontology designer owns the draft once opened: the Turtle, entity and
+  // grounding editors below go read-only (the engine refuses /update with 409).
+  const studioOpen = !!proposal.studio;
+  const editLocked = isReadOnly || studioOpen || !canChange;
+  const canOpenInStudio =
+    studioOpen || STUDIO_OPENABLE_STATUSES.includes(proposal.status);
+  // A new draft is built from the saved proposal, so unsaved edits would be lost. An
+  // open draft is only continued, and its edits can no longer be saved here anyway.
+  // Opening one is a change, which a role that only reads cannot make; continuing reads.
+  const studioDisabledReason = !canOpenInStudio
+    ? t(
+        "Only a pending or updated proposal, or one whose accept failed, opens in the Ontology designer.",
+      )
+    : !studioOpen && !canChange
+      ? denied
+      : dirty && !studioOpen
+        ? t("Save or discard your edits first")
+        : undefined;
+  // A newer version beat the draft's publish. The failure code outlives a later
+  // rebase, so it counts only while the accept is failed.
+  const needsRebase =
+    rebaseRequired ||
+    (proposal.status === "accept_failed" &&
+      proposal.accept_progress?.code === "RebaseRequired");
+  // One sentence; the link to the designer stands where {studio} is.
+  const [rebaseBefore, rebaseAfter = ""] = t(
+    "A newer ontology version was published after this draft was built. Rebase the draft in the {studio}, review the result, and accept again.",
+  ).split("{studio}");
   const isAccepting = isProposalAcceptInProgress(proposal.status) || accepting;
+  // Hidden until the active version is known, so an already-deployed version
+  // doesn't flash a stale warning. A newer active version already contains this
+  // one, so deploying this one would roll back: no banner then either.
+  const showAutoDeployHeld =
+    proposal.auto_deploy_held != null &&
+    activeVersion !== undefined &&
+    (activeVersion === null ||
+      proposal.published_version === undefined ||
+      proposal.published_version > activeVersion);
   // Show the SHACL / infer-constraints panel whenever the proposal has a
   // computed ontology (see proposalHasComputedOntology) — hidden only for the
   // in-progress "inducing" stub and "failed" runs where nothing exists yet.
@@ -1257,7 +1610,13 @@ export function ProposalDetailPage() {
                 >
                   {t("Back")}
                 </Button>
-                <Button iconName="refresh" onClick={refresh}>
+                <Button
+                  iconName="refresh"
+                  onClick={() => {
+                    setVersionsRefresh((n) => n + 1);
+                    refresh();
+                  }}
+                >
                   {t("Refresh")}
                 </Button>
                 <ButtonWithHint
@@ -1266,16 +1625,28 @@ export function ProposalDetailPage() {
                   )}
                   onClick={saveChanges}
                   loading={updating}
-                  disabled={!dirty || isReadOnly}
+                  disabled={!dirty || editLocked}
+                  disabledReason={denied}
                 >
                   {t("Save changes")}
                 </ButtonWithHint>
                 <Button
                   onClick={cancel}
                   loading={cancelling}
-                  disabled={isReadOnly}
+                  disabled={isReadOnly || !canChange}
+                  disabledReason={denied}
                 >
                   {t("Cancel")}
+                </Button>
+                <Button
+                  onClick={openInStudio}
+                  loading={openingStudio}
+                  disabled={studioDisabledReason !== undefined}
+                  disabledReason={studioDisabledReason}
+                >
+                  {studioOpen
+                    ? t("Continue in Ontology designer")
+                    : t("Open in Ontology designer")}
                 </Button>
                 <ButtonWithHint
                   hint={t(
@@ -1283,18 +1654,40 @@ export function ProposalDetailPage() {
                   )}
                   onClick={validate}
                   loading={validating}
-                  disabled={!editedTurtle}
+                  disabled={!editedTurtle || !canChange}
+                  disabledReason={denied}
                 >
                   {t("Validate")}
                 </ButtonWithHint>
+                {proposal.status !== "accepted" && (
+                  <Checkbox
+                    checked={deployAfterAccept}
+                    disabled={
+                      isReadOnly ||
+                      isAccepting ||
+                      checkingAccept ||
+                      repairing ||
+                      !canChange
+                    }
+                    onChange={({ detail }) => {
+                      deployAfterAcceptRef.current = detail.checked;
+                      setDeployAfterAccept(detail.checked);
+                    }}
+                  >
+                    {t("Deploy immediately")}
+                  </Checkbox>
+                )}
                 <ButtonWithHint
                   hint={t(
-                    "Merges this draft into the namespace's live ontology (graph, search index, storage). Runs in the background; can't be undone here.",
+                    "Publishes this draft as the namespace's next ontology version. With “Deploy immediately” it also becomes the served ontology; otherwise deploy it later from Ontology › Induction › Versions.",
                   )}
                   variant="primary"
                   onClick={requestAccept}
                   loading={isAccepting || checkingAccept}
-                  disabled={isReadOnly || isAccepting || checkingAccept}
+                  disabled={
+                    isReadOnly || isAccepting || checkingAccept || !canChange
+                  }
+                  disabledReason={denied}
                 >
                   {proposal.status === "accepted"
                     ? t("Already accepted")
@@ -1308,12 +1701,42 @@ export function ProposalDetailPage() {
             {(md.label as string) ||
               t("Proposal {id}…", { id: proposalId?.slice(0, 8) ?? "" })}
           </Header>
-          {dirty && !hasMixedEdits && (
+          {!canChange && !isReadOnly && (
+            <Alert type="info">
+              {t(
+                "Your role on this namespace can read this proposal, but not change, validate, cancel or accept it.",
+              )}
+            </Alert>
+          )}
+          {studioOpen && !isReadOnly && (
+            <Alert
+              type="info"
+              header={t("Editing in Ontology designer")}
+              action={
+                <Button onClick={openInStudio}>
+                  {t("Open Ontology designer")}
+                </Button>
+              }
+            >
+              {t(
+                "This proposal is edited in the Ontology designer, so its Turtle, entity and grounding editors are read-only here. Accepting publishes the designer draft (revision {revision}).",
+                { revision: proposal.studio?.revision ?? 0 },
+              )}
+            </Alert>
+          )}
+          {dirty && studioOpen && (
+            <Alert type="warning">
+              {t(
+                "These edits cannot be saved: this proposal is open in the Ontology designer, which owns its draft. Refresh to discard them.",
+              )}
+            </Alert>
+          )}
+          {dirty && !studioOpen && !hasMixedEdits && (
             <Alert type="info">
               {t("Unsaved edits. Click Save changes to upload.")}
             </Alert>
           )}
-          {hasMixedEdits && (
+          {hasMixedEdits && !studioOpen && (
             <Alert
               type="warning"
               header="Choose which edits to save"
@@ -1342,6 +1765,17 @@ export function ProposalDetailPage() {
               {saveError}
             </Alert>
           )}
+          {studioOpen && proposal.published_version != null && (
+            <Alert type="info" header={t("Edited in Ontology designer")}>
+              {t(
+                "The Turtle, graph and classes below are the induction this proposal started from. Accepting published the designer draft (revision {revision}) as version v{version}; see Ontology › Induction › Versions.",
+                {
+                  revision: proposal.studio?.revision ?? 0,
+                  version: proposal.published_version,
+                },
+              )}
+            </Alert>
+          )}
           {acceptResult && (
             <Alert
               type={acceptResult.ok ? "success" : "error"}
@@ -1349,7 +1783,48 @@ export function ProposalDetailPage() {
               dismissible
               onDismiss={() => setAcceptResult(null)}
             >
-              <CodeBlock>{acceptResult.message}</CodeBlock>
+              <CodeBlock>
+                {/* The deployment note is its own line; CodeBlock keeps line breaks. */}
+                {acceptResult.ok && acceptedWithDeploy !== null
+                  ? [
+                      acceptResult.message,
+                      deployNoteAfterAccept(
+                        t,
+                        acceptedWithDeploy,
+                        proposal,
+                        awaitingAutoDeployOutcome,
+                        outcomeWaitExpired,
+                      ),
+                    ]
+                      .filter(Boolean)
+                      .join("\n")
+                  : acceptResult.message}
+              </CodeBlock>
+            </Alert>
+          )}
+          {needsRebase && (
+            <Alert type="warning" header={t("Rebase required")}>
+              {rebaseBefore}
+              <Link
+                href={studioPath}
+                onFollow={(e) => {
+                  e.preventDefault();
+                  navigate(studioPath);
+                }}
+              >
+                {t("Ontology designer")}
+              </Link>
+              {rebaseAfter}
+            </Alert>
+          )}
+          {showAutoDeployHeld && proposal.auto_deploy_held && (
+            <Alert
+              type="warning"
+              header={t("Version v{version} was published but not deployed", {
+                version: proposal.published_version ?? "?",
+              })}
+            >
+              {autoDeployHeldMessage(proposal.auto_deploy_held, t)}
             </Alert>
           )}
 
@@ -1387,7 +1862,7 @@ export function ProposalDetailPage() {
                         "Waiting for embeddings to become searchable in the vector index.",
                       )
                     : t(
-                        "Merging into ontology graph (Neptune + AOSS + S3 + embeddings).",
+                        "Publishing a new ontology version (merge, snapshot, VKG artifacts).",
                       )}
                 </Box>
               </SpaceBetween>
@@ -1429,7 +1904,7 @@ export function ProposalDetailPage() {
                       {t("Cancel")}
                     </Button>
                     <Button
-                      onClick={doAccept}
+                      onClick={() => acceptOrReview()}
                       disabled={repairing || accepting}
                     >
                       {t("Accept anyway")}
@@ -1492,6 +1967,31 @@ export function ProposalDetailPage() {
               </SpaceBetween>
             </Modal>
           )}
+
+          {proposal.studio &&
+            acceptRevision !== null &&
+            namespaceId &&
+            proposalId && (
+              <AcceptDialog
+                visible
+                apiClient={apiClient}
+                namespace={namespaceId}
+                proposalId={proposalId}
+                revision={acceptRevision}
+                accepting={accepting}
+                defaultDeploy={deployAfterAccept}
+                onDismiss={() => setAcceptRevision(null)}
+                onAccept={(deploy) => {
+                  // The reviewed revision, and the choice made in the dialog.
+                  setAcceptRevision(null);
+                  deployAfterAcceptRef.current = deploy;
+                  setDeployAfterAccept(deploy);
+                  void doAccept(acceptRevision, deploy);
+                }}
+                onPreview={onAcceptPreview}
+                onOpenStudio={() => navigate(studioPath)}
+              />
+            )}
 
           <ExpandableSection
             variant="container"
@@ -1559,7 +2059,7 @@ export function ProposalDetailPage() {
                 },
                 {
                   label: t("Created"),
-                  value: proposal.created_at ?? "—",
+                  value: formatTimestamp(proposal.created_at, locale),
                 },
                 {
                   label: t("Datasource(s)"),
@@ -1699,22 +2199,14 @@ export function ProposalDetailPage() {
               prelude={turtleParse.prelude}
               fullTurtle={editedTurtle}
               r2rmlTurtle={editedR2rml}
-              isReadOnly={isReadOnly}
+              isReadOnly={editLocked}
               onEditEntity={handleEditEntity}
               groundingMatches={groundingMatches}
               pendingGroundingOverrides={pendingGroundingOverrides}
               onSelectGroundingCandidate={stageGroundingCandidate}
               onMarkGroundingNovel={stageGroundingNovel}
-              onUpdateEntityTurtle={(entity, updatedBody) => {
-                if (!editedTurtle) return;
-                const updated = editedTurtle.replace(entity.body, updatedBody);
-                setEditedTurtle(updated);
-                setDirty(true);
-              }}
-              onUpdateTurtle={(updatedTurtle) => {
-                setEditedTurtle(updatedTurtle);
-                setDirty(true);
-              }}
+              onUpdateEntityTurtle={updateEntityTurtle}
+              onUpdateTurtle={updateTurtle}
             />
           )}
 
@@ -1736,7 +2228,7 @@ export function ProposalDetailPage() {
               }
               defaultExpanded={false}
               headerActions={
-                !isReadOnly && (
+                !editLocked && (
                   <Button
                     variant="inline-link"
                     onClick={() => setR2rmlEditMode((m) => !m)}
@@ -1754,7 +2246,7 @@ export function ProposalDetailPage() {
                     setDirty(true);
                   }}
                   rows={20}
-                  disabled={isReadOnly}
+                  disabled={editLocked}
                   ariaLabel={t("R2RML Turtle")}
                 />
               ) : (
@@ -1769,7 +2261,7 @@ export function ProposalDetailPage() {
               headerText={t("Ontology Source (Turtle)")}
               defaultExpanded={false}
               headerActions={
-                !isReadOnly && (
+                !editLocked && (
                   <Button
                     variant="inline-link"
                     onClick={() => {
@@ -1793,7 +2285,7 @@ export function ProposalDetailPage() {
                     value={turtleDraft ?? ""}
                     onChange={({ detail }) => setTurtleDraft(detail.value)}
                     rows={25}
-                    disabled={isReadOnly}
+                    disabled={editLocked}
                     ariaLabel={t("Ontology Turtle")}
                   />
                   <SpaceBetween direction="horizontal" size="xs">
@@ -1807,7 +2299,7 @@ export function ProposalDetailPage() {
                     </Button>
                     <Button
                       variant="primary"
-                      disabled={isReadOnly || turtleDraft === editedTurtle}
+                      disabled={editLocked || turtleDraft === editedTurtle}
                       onClick={() => {
                         if (turtleDraft != null) {
                           setEditedTurtle(turtleDraft);
@@ -1833,7 +2325,8 @@ export function ProposalDetailPage() {
               cancelled show it read-only — isReadOnly disables editing. */}
           {hasComputedOntology && (
             <ConstraintPanel
-              isReadOnly={isReadOnly}
+              isReadOnly={isReadOnly || !canChange}
+              deniedReason={denied}
               config={md?.constraint_config as never}
               onConfigChange={(updated) => {
                 if (!proposal) return;
@@ -2012,6 +2505,8 @@ export function ProposalDetailPage() {
                 value={editValue}
                 onChange={({ detail }) => setEditValue(detail.value)}
                 rows={20}
+                // Opened before the page learned the designer owns the draft.
+                disabled={studioOpen}
                 ariaLabel={t("Edit Turtle for {name}", {
                   name: editingEntity.entity.subject,
                 })}
@@ -2020,7 +2515,11 @@ export function ProposalDetailPage() {
                 <Button onClick={() => setEditingEntity(null)}>
                   {t("Cancel")}
                 </Button>
-                <Button variant="primary" onClick={applyEdit}>
+                <Button
+                  variant="primary"
+                  onClick={applyEdit}
+                  disabled={studioOpen}
+                >
                   {t("Apply")}
                 </Button>
               </SpaceBetween>
@@ -2044,14 +2543,29 @@ export function ProposalDetailPage() {
             iri={selectedClass}
             turtle={editedTurtle}
             onSelectClass={setSelectedClass}
-            onTurtleEdit={(t) => {
-              setEditedTurtle(t);
-              setDirty(true);
-            }}
+            // Without it the card offers no suggestion to confirm (a Turtle edit).
+            onTurtleEdit={
+              studioOpen
+                ? undefined
+                : (t) => {
+                    setEditedTurtle(t);
+                    setDirty(true);
+                  }
+            }
             onClose={() => setSelectedClass(null)}
           />
         </div>
       )}
     </div>
   );
+}
+
+/**
+ * Route element: keys the page by proposal so per-proposal state (accept
+ * result, auto-deploy follow-up, active-version lookup) starts fresh when the
+ * user navigates from one proposal to another.
+ */
+export function ProposalDetailRoute() {
+  const { proposalId } = useParams<{ proposalId: string }>();
+  return <ProposalDetailPage key={proposalId} />;
 }

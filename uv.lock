@@ -865,6 +865,7 @@ dependencies = [
     { name = "requests-aws4auth" },
     { name = "sqlalchemy" },
     { name = "sqlglot" },
+    { name = "strands-agents" },
     { name = "uvicorn" },
 ]
 
@@ -902,6 +903,7 @@ requires-dist = [
     { name = "rich", marker = "extra == 'demo'", specifier = ">=13.7" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "sqlglot", specifier = ">=25.0" },
+    { name = "strands-agents", specifier = ">=1.41.0" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
 provides-extras = ["demo"]

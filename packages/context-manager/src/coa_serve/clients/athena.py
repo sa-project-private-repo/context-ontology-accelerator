@@ -266,6 +266,12 @@ class AthenaQueryExecutor:
             await self._wait_for_completion(query_id, timeout_seconds)
         except AthenaQueryError as exc:
             raise self._explain_federation_failure(exc, resolved_catalog) from exc
+        except (AthenaTimeoutError, asyncio.CancelledError):
+            # Our deadline passed, or the caller stopped waiting: stop the query too,
+            # or it runs on to the DML timeout and holds a slot of the account-wide
+            # active-query quota that every namespace's queries share.
+            self._stop_in_background(query_id)
+            raise
         rows, columns, has_more = await self._get_results(query_id, max_rows)
 
         duration_ms = int((time.perf_counter() - start) * 1000)
@@ -286,6 +292,7 @@ class AthenaQueryExecutor:
             truncated=has_more,
             duration_ms=duration_ms,
             engine="athena",
+            sql=sql,
         )
 
     async def health_check(self) -> dict[str, Any]:
@@ -351,6 +358,20 @@ class AthenaQueryExecutor:
             lambda: self._athena.start_query_execution(**kwargs),
         )
         return response["QueryExecutionId"]
+
+    def _stop_in_background(self, query_id: str) -> None:
+        """Ask Athena to stop ``query_id`` without awaiting it.
+
+        A plain submit, not an await, so a cancelled caller cannot skip it.
+        """
+        _EXECUTOR.submit(self._stop_quietly, query_id)
+
+    def _stop_quietly(self, query_id: str) -> None:
+        """Best-effort stop; a failure here must not mask the timeout."""
+        try:
+            self._athena.stop_query_execution(QueryExecutionId=query_id)
+        except Exception:  # noqa: BLE001 - the timeout is the error worth raising
+            logger.warning("athena_stop_query_failed", query_execution_id=query_id, exc_info=True)
 
     async def _wait_for_completion(self, query_id: str, timeout_seconds: int) -> None:
         loop = asyncio.get_running_loop()

@@ -44,6 +44,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -277,9 +278,23 @@ def _list_operations() -> list[tuple[str, str, str]]:
 @pytest.fixture()
 def empty_table(monkeypatch):
     from coa_ontology import dynamo_store
+    from coa_ontology.abox import queries as abox_queries
+    from coa_ontology.studio import changes as studio_changes
+    from coa_ontology.studio import draft as studio_draft
 
     table = _FakeDynamoTable()
     monkeypatch.setattr(dynamo_store, "_get_table", lambda: table)
+    # ListDomainInstances reads the domain ABox from Neptune, not from the table: an empty graph.
+    monkeypatch.setattr(abox_queries, "list_instances", lambda namespace, **kwargs: ([], False))
+    # ListStudioHistory reads a draft's change records from S3: a draft with no history yet.
+    monkeypatch.setattr(
+        studio_changes,
+        "history",
+        lambda *args: {"revision": 0, "entries": [], "next": None, "canUndo": False, "canRedo": False},
+    )
+    # ListStudioEvents and ListStudioChangeSets first read the proposal's draft: an open one at revision 0.
+    monkeypatch.setattr(studio_draft, "get_proposal", lambda namespace, proposal_id: {"status": "pending"})
+    monkeypatch.setattr(studio_draft, "require_state", lambda item, editable: SimpleNamespace(revision=0))
     return table
 
 

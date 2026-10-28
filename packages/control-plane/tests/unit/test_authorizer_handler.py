@@ -97,12 +97,13 @@ class TestHandler:
 
         assert result["policyDocument"]["Statement"][0]["Effect"] == "Deny"
 
+    @pytest.mark.parametrize("principal", ["", "   ", "\t\n"], ids=["empty", "spaces", "whitespace"])
     @patch("coa_control_plane.authorization.handler._check_cache_version")
-    def test_deny_on_empty_principal(self, mock_cache_check, env_vars, apigw_event):
+    def test_deny_on_empty_principal(self, mock_cache_check, env_vars, apigw_event, principal):
         from coa_control_plane.authorization.handler import handler
 
         empty_result = TokenValidationResult(
-            principal_id="",
+            principal_id=principal,
             sub="",
             email="",
             groups=[],
@@ -651,9 +652,65 @@ CONTROL_PLANE_ROUTES: list[tuple[str, str, str]] = [
     ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/validate/jobs/{jobId}", "viewNamespace"),
     ("POST", "/namespaces/{namespaceId}/proposals/update", "manageOntology"),
     ("POST", "/namespaces/{namespaceId}/proposals/reject", "manageOntology"),
+    # Ontology designer
+    ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/studio", "manageOntology"),
+    ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio", "viewNamespace"),
+    ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/graph", "viewNamespace"),
+    ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/term", "viewNamespace"),
+    ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/terms", "viewNamespace"),
+    ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changes", "manageOntology"),
+    ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/undo", "manageOntology"),
+    ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/redo", "manageOntology"),
+    ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/history", "viewNamespace"),
+    ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/rebase", "manageOntology"),
+    ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/accept-preview", "viewNamespace"),
+    # Ontology designer assistant
+    ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/messages", "manageOntology"),
+    ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/events", "viewNamespace"),
+    ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets", "viewNamespace"),
+    (
+        "GET",
+        "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/preview",
+        "viewNamespace",
+    ),
+    (
+        "POST",
+        "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/apply",
+        "manageOntology",
+    ),
+    (
+        "POST",
+        "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/discard",
+        "manageOntology",
+    ),
+    # Ontology designer checks, queries and questions
+    ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/checks", "viewNamespace"),
+    ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/queries", "viewNamespace"),
+    (
+        "POST",
+        "/namespaces/{namespaceId}/proposals/{proposalId}/studio/questions/{questionId}/check",
+        "manageOntology",
+    ),
+    ("GET", "/namespaces/{namespaceId}/studio/questions", "viewNamespace"),
+    ("PUT", "/namespaces/{namespaceId}/studio/questions/{questionId}", "manageOntology"),
+    ("DELETE", "/namespaces/{namespaceId}/studio/questions/{questionId}", "manageOntology"),
+    ("POST", "/namespaces/{namespaceId}/sparql", "query"),
     # Ontology graph + catalog
     ("GET", "/namespaces/{namespaceId}/ontologies", "viewNamespace"),
     ("DELETE", "/namespaces/{namespaceId}/ontologies", "manageOntology"),
+    # Ontology versions
+    ("GET", "/namespaces/{namespaceId}/ontology/versions", "viewNamespace"),
+    ("GET", "/namespaces/{namespaceId}/ontology/versions/{version}", "viewNamespace"),
+    ("POST", "/namespaces/{namespaceId}/ontology/versions/{version}/deploy", "manageOntology"),
+    ("GET", "/namespaces/{namespaceId}/ontology/deployments/{deploymentId}", "viewNamespace"),
+    # Domain ABox
+    ("GET", "/namespaces/{namespaceId}/abox", "viewNamespace"),
+    ("GET", "/namespaces/{namespaceId}/abox/instances", "viewNamespace"),
+    ("GET", "/namespaces/{namespaceId}/abox/instance", "viewNamespace"),
+    ("GET", "/namespaces/{namespaceId}/abox/mappings", "viewNamespace"),
+    ("PUT", "/namespaces/{namespaceId}/abox/mappings/{mappingId}", "manageOntology"),
+    ("DELETE", "/namespaces/{namespaceId}/abox/mappings/{mappingId}", "manageOntology"),
+    ("POST", "/namespaces/{namespaceId}/abox/rebuild", "manageOntology"),
     ("GET", "/namespaces/{namespaceId}/graph/search", "viewNamespace"),
     ("GET", "/namespaces/{namespaceId}/graph/class", "viewNamespace"),
     ("GET", "/namespaces/{namespaceId}/graph/object-property", "viewNamespace"),
@@ -750,9 +807,25 @@ class TestMapRequestToCedar:
             ("GET", "/namespaces/{namespaceId}/metrics/{name}", "Metric"),
             ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/accept", "OntologyProposal"),
             ("GET", "/namespaces/{namespaceId}/proposals", "OntologyProposal"),
+            ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changes", "OntologyProposal"),
+            ("GET", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/graph", "OntologyProposal"),
+            ("POST", "/namespaces/{namespaceId}/proposals/{proposalId}/studio/messages", "OntologyProposal"),
+            (
+                "POST",
+                "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/apply",
+                "OntologyProposal",
+            ),
             ("POST", "/namespaces/{namespaceId}/induce", "Ontology"),
             ("GET", "/namespaces/{namespaceId}/graph/search", "Ontology"),
             ("GET", "/namespaces/{namespaceId}/ontologies", "Ontology"),
+            ("POST", "/namespaces/{namespaceId}/ontology/versions/{version}/deploy", "Ontology"),
+            ("GET", "/namespaces/{namespaceId}/abox", "Ontology"),
+            ("GET", "/namespaces/{namespaceId}/abox/instances", "Ontology"),
+            ("GET", "/namespaces/{namespaceId}/abox/instance", "Ontology"),
+            ("GET", "/namespaces/{namespaceId}/abox/mappings", "Ontology"),
+            ("PUT", "/namespaces/{namespaceId}/abox/mappings/{mappingId}", "Ontology"),
+            ("DELETE", "/namespaces/{namespaceId}/abox/mappings/{mappingId}", "Ontology"),
+            ("POST", "/namespaces/{namespaceId}/abox/rebuild", "Ontology"),
         ],
     )
     def test_routes_use_typed_resources(self, method: str, path: str, expected_type: str):
@@ -1077,19 +1150,24 @@ class TestAuthorizerMetrics:
 
         mock_emit.assert_called_once_with(reason="token_validation_error")
 
+    @pytest.mark.parametrize("principal", ["", "   "], ids=["empty", "blank"])
     @patch(f"{_H}._check_cache_version")
     @patch(f"{_H}.emit_authorizer_error")
-    def test_empty_principal_emits_authorizer_error(self, mock_emit, mock_cache_check, env_vars, apigw_event):
+    def test_empty_principal_emits_authorizer_error(
+        self, mock_emit, mock_cache_check, env_vars, apigw_event, principal
+    ):
+        """A blank principal is no principal: the API proxy would forward no X-Coa-Principal for it."""
         from coa_control_plane.authorization.handler import handler
 
         empty_result = TokenValidationResult(
-            principal_id="", sub="", email="", groups=[], token_type=TokenType.JWT, claims={}
+            principal_id=principal, sub="", email="", groups=[], token_type=TokenType.JWT, claims={}
         )
         with patch(f"{_H}._get_token_authorizer") as mock_get_auth:
             mock_get_auth.return_value.validate.return_value = empty_result
-            handler(apigw_event, None)
+            result = handler(apigw_event, None)
 
         mock_emit.assert_called_once_with(reason="no_principal")
+        assert result["principalId"] == "" and result["policyDocument"]["Statement"][0]["Effect"] == "Deny"
 
     @patch(f"{_H}._check_cache_version")
     @patch(f"{_H}.emit_authorizer_error")

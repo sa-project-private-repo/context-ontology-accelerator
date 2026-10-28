@@ -41,8 +41,9 @@ export function BreadcrumbProvider({
     setItems(next);
   }, []);
 
+  // Clearing an empty trail keeps it, so the shell does not render again.
   const clearBreadcrumbs = useCallback(() => {
-    setItems([]);
+    setItems((prev) => (prev.length === 0 ? prev : []));
   }, []);
 
   return (

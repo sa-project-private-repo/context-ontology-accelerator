@@ -22,11 +22,19 @@ an answer, only which tiers run.
 
 > **Mapped-only constraint (Tier 2):** the structured-query context is filtered
 > to **R2RML-mapped** classes — those backed by a real SQL table (marked
-> `coa:isMapped` at ingest). Unmapped classes (document/unstructured-induced,
-> foundational) are excluded so the translator never authors a query over a
-> class with no backing table. A namespace with zero mapped classes routes to
-> Tier 2 on a class vector hit but resolves no context, so it silently falls
-> back to Tier 3 (surfaced via the `tbox_context_no_mapped_classes` log).
+> `coa:isMapped` from the R2RML at deploy, and at ingest). Unmapped classes
+> (document/unstructured-induced, foundational) are excluded so the translator
+> never authors a query over a class with no backing table. A property that no
+> mapping maps although one of its domains, or for a relationship one of its
+> ranges, is mapped (for example one added in the Ontology designer) is marked
+> `coa:isMapped false` and left out the same way. Both writers are still told the
+> marked properties and the unmapped classes of the namespace's induced ontologies
+> (never those of a foundational one; *Tier 2 retrieval* says which), as terms the
+> schema does not hold, and decline a question about one instead of answering it
+> with a stand-in, so it goes on to Tier 3. A namespace with zero mapped
+> classes routes to Tier 2 on a class vector hit but resolves no context, so it
+> silently falls back to Tier 3 (surfaced via the `tbox_context_no_mapped_classes`
+> log).
 
 ## Routing Decision Flow
 
@@ -93,6 +101,76 @@ ontology classes/properties for the NL→SQL/SPARQL prompt. The generated SQL/SP
 is then translated (Ontop VKG) and executed. Tier 2 produces a result only over
 **R2RML-mapped** classes (those carrying a `data_source_id`); a query whose
 retrieved classes are all unmapped cannot yield SQL and falls through to Tier 3.
+
+A strategy result does not end Tier 2 when it cannot be an answer: a zero-row
+result below confidence 0.3, or Ontop's no-mapping placeholder (`SELECT 1 AS
+uselessVariable`, one dummy row at a confident score). Each records a
+`t2.sql.failed` / `t2.vkg.failed` step (`reason` `empty_low_confidence` or
+`degenerate_no_mapping`) and the chain moves on to the next strategy, then Tier 3.
+A pinned strategy (`ontop` or `nl_to_sql`) has no next strategy: the question goes
+on to Tier 3. When Tier 3 does not run either (`tierOverride` 2, or 1 with an
+explicit `strategy`), a sequential option (`nl_to_sql_first`, the default,
+`ontop_first` or `ontop`) returns the placeholder as the Tier 2 answer if no later
+strategy answered, as before this check, so a caller pinned to `ontop` still finds
+`uselessVariable` in `queryUsed`; from the last strategy it records no failed step.
+Under `tierOverride` 1 the placeholder must still clear the 0.3 confidence floor the
+orchestrator applies to every Tier 2 answer there. `best` never returns the
+placeholder. A question left with no answer gets no result (404).
+The Ontop strategy also stops, without a retry, when the VKG translated against
+another ontology version than the one Neptune serves (`owl:versionInfo`, read at
+most once a minute per namespace and read again before a mismatch is reported,
+because the VKG can finish reloading within that minute): while the VKG reloads
+after a deploy, or after a failed reload, its `t2.vkg.compile` step reports
+`vkg_version_skew` with both versions and no SQL runs. Both sides must name a
+`vN`, so a namespace from before versions is unaffected.
+
+A question about a term the namespace has but no table maps is declined rather than
+answered with a stand-in. Without this, the writers, which never saw such a term,
+answered with whatever looked closest: every client for "the gold loyalty tier" (an
+attribute added in the Ontology designer), a `lifetime_value > 10000` threshold for
+"premium customers" (a designer subclass), the first order date for a sign-up date the
+designer deleted. Both writers are now told the namespace's terms that no table maps
+(`tier2/unmapped_terms.py`: one `UnmappedTermsReader` per process, a read kept for 60 s
+per namespace and a failed one for 30 s, at most 3 s, at most 50 terms, classes under a
+mapped parent and marked properties first): every attribute or relationship marked
+`coa:isMapped false`, and every class of the namespace's induced ontologies
+(`ontology_type` `induced`, so not a foundational or uploaded one) without
+`coa:isMapped true` that is no parent or equivalent of a mapped class, at any depth
+(structured queries answer it through the mapped class), and is not named like a mapped
+class or like one of their attributes or relationships (a label, a synonym, a table or
+column, or a mapped class's IRI local name split into words, ignoring case, separators
+and English plurals: a class `Order` found in documents beside the table `orders`, or
+`Status` beside the column `orders.status`, is the same thing). NL-to-SQL names their
+classes by table, NL-to-SPARQL by label. The rule under the list: a question about one of
+these terms, or about anything else the schema does not hold, gets `CANNOT_ANSWER` on the
+reply's first line and no query, never a different table, column or filter that stands
+in for it; a question the schema does answer is answered as usual. A reply declines when
+it starts with `CANNOT_ANSWER`, when its first code block does, or when it has no code
+block and says it. A decline (on NL-to-SQL's first shot or its correction, which is told
+the same terms; on NL-to-SPARQL before validation, so no validation retry runs) ends that
+strategy with a `StrategyDeclined`: its `t2.sql.generate` step is `skipped` with the
+detail `cannot_answer` (`{correction_shot, error: cannot_answer}` on a correction), or its
+`t2.vkg.translate` step is, and the chain records `t2.sql.failed` / `t2.vkg.failed` with
+`reason` `cannot_answer` and moves on to the next strategy, then Tier 3, as for no result
+(`best` records it when no strategy answered). Two declines end otherwise: a correction
+asked for because a clean first shot returned zero rows keeps that empty result (a
+zero-row result is never downgraded to a miss), and a decline on Ontop's VKG retry is a
+plain no result that only its `t2.vkg.retry` step records (`reason` `cannot_answer`).
+Pinned with `tierOverride` 2, a declined question gets no result (404). A namespace
+without class markers lists nothing, and with nothing to list both prompts are
+byte-identical to before; a reply is read as a decline only when its prompt listed
+terms. A deleted term is not in the graph, so it is not listed; the rule's "anything
+else the schema does not hold" is what covers it. The `deep-reasoning` strategy is not
+told these terms: its `generate_sql` tool writes SQL as before. TranslateSPARQL uses the
+same NL-to-SPARQL writer, so a question it declines gets 400 `QueryTranslationError`
+("Could not generate SPARQL for this query").
+
+This is decided in the prompts, not by the unmapped-classes pruning below, for three
+reasons: the pruner runs only on the automatic path (a question pinned to Tier 2 or to a
+strategy never reaches it), it sees classes only (AOSS stamps provenance on class
+documents, not on attributes or relationships, and a deleted term has no document), and
+skipping Tier 2 when an unmapped class merely ranks first by some margin would rest on a
+similarity threshold rather than on proof, which its fail-open contract rules out.
 
 ## Tier pruning (deterministic, fail-open)
 

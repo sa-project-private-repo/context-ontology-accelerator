@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request as StarletteRequest
 
 from coa_ontology import induce_catalog
+from coa_ontology.abox import router as abox_router
 from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 
 # ── Catalog ─────────────────────────────────────────────────────────────
@@ -48,8 +49,14 @@ from coa_ontology.stores import build_stores
 from coa_ontology.stores.adapters import StoreOntologyCatalogAdapter
 from coa_ontology.stores.neptune_db_graph import NeptuneMemoryLimitError
 
+# ── Ontology designer ───────────────────────────────────────────────────
+from coa_ontology.studio import router as studio_router
+
 # ── Validation ──────────────────────────────────────────────────────────
 from coa_ontology.validation.routers import validate
+
+# ── Versions ────────────────────────────────────────────────────────────
+from coa_ontology.versions.router import router as versions_router
 
 # ── Security: XXE protection ────────────────────────────────────────────
 # Patch Python's XML parsers (xml.sax, xml.etree, xml.dom, xml.minidom)
@@ -72,6 +79,25 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     force=True,  # override any handler uvicorn/root already installed
 )
+
+
+class _NoQueryString(logging.Filter):
+    """Drop the query string from uvicorn's access log lines.
+
+    A query value can hold data the namespace's grants protect and its log group does not:
+    the Domain data search sends the entity name it looks for (a patient, say) as ``q``.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Cut the path at its ``?``; uvicorn logs (client, method, path, HTTP version, status)."""
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            record.args = (*args[:2], args[2].split("?", 1)[0], *args[3:])
+        return True
+
+
+# uvicorn configures its loggers before it imports this module, so the filter stays.
+logging.getLogger("uvicorn.access").addFilter(_NoQueryString())
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +280,11 @@ app.include_router(
     tags=["induction-unstructured"],
 )
 app.include_router(proposals_router, prefix="/ontology/proposals", tags=["proposals"])
+app.include_router(studio_router.router, prefix="/ontology/proposals/{proposal_id}/studio", tags=["studio"])
+app.include_router(studio_router.questions_router, prefix="/ontology/studio/questions", tags=["studio"])
+app.include_router(versions_router, prefix="/ontology", tags=["versions"])
+app.include_router(abox_router.router, prefix="/abox", tags=["abox"])
+app.include_router(abox_router.internal_router, prefix="/internal/abox", tags=["internal"])
 app.include_router(validate.router, prefix="/validate", tags=["validation"])
 
 

@@ -453,6 +453,14 @@ structure QueryResult {
 
     /// Whether the result is partial (incomplete).
     partial: Boolean
+
+    /// The execution mode that produced this result: "standard" or
+    /// "deep-reasoning". Deep Reasoning is a mode orthogonal to the tier
+    /// cascade, so a client labels an answer by this field rather than
+    /// inferring mode from `tier` (a Deep Reasoning answer resolves at tier 3
+    /// but is not Standard mode's Tier-3 result). Absent on responses that do
+    /// not set it.
+    executionMode: String
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -665,6 +673,87 @@ operation TranslateSPARQL {
         NamespaceNotFoundError
         OntologyNotPublishedError
         QueryTranslationError
+    ]
+}
+
+// ── RunSparqlQuery ───────────────────────────────────────────────────────────
+/// One result row of a SPARQL query over the VKG; an unbound variable is null.
+@sparse
+list SparqlResultRow {
+    member: Document
+}
+
+/// Result rows of a SPARQL query over the VKG.
+list SparqlResultRowList {
+    member: SparqlResultRow
+}
+
+/// Run the caller's own SPARQL `SELECT` or `ASK` over the namespace's virtual
+/// knowledge graph (the Ontology designer's query console). The VKG translates it to
+/// SQL, the SQL firewall applies the caller's grants, and the SQL runs: at most
+/// 1,000 rows within 20 seconds. The query may not name graphs (`FROM`,
+/// `FROM NAMED`, `GRAPH`) or call `SERVICE`. Before the VKG translates it, the
+/// classes and properties every answer of it needs are checked against the
+/// namespace's graph; one inside `OPTIONAL`, `MINUS`, a `FILTER` or a subquery,
+/// or in only one branch of a `UNION`, is left to the VKG.
+///
+/// Errors: 400 `ValidationError` for a query the guard refuses; for one whose
+/// answers need an IRI that is not a class or property of the deployed ontology,
+/// or a term with no table mapping (a class no table maps, or a property deploy
+/// marked unmapped), each named in the message; and for any other query that no
+/// table mapping matches. 400 `QueryTranslationError` when the VKG cannot
+/// translate it. 403 when the caller may not query the namespace or a table the
+/// SQL reads. 502 when the query cannot run. 503 when the namespace's VKG is not
+/// running or not ready (no version is deployed, or it is reloading), so the
+/// query never reached it, or when it still serves another ontology version than
+/// the deployed one (it is reloading after a deploy, or its reload failed); the
+/// message then names both versions. 504 when it does not finish in time.
+@http(method: "POST", uri: "/namespaces/{namespaceId}/sparql")
+operation RunSparqlQuery {
+    input := {
+        @required
+        @httpLabel
+        namespaceId: Uuid
+
+        /// The SPARQL query (at most 20,000 characters).
+        @required
+        @length(min: 1, max: 20000)
+        sparql: String
+    }
+
+    output := {
+        /// Column names; `result` for `ASK`.
+        @required
+        columns: StringList
+
+        /// At most 1,000 rows of plain values, in column order.
+        @required
+        rows: SparqlResultRowList
+
+        /// Rows returned.
+        @required
+        rowCount: Integer
+
+        /// True when the query had more rows than were returned.
+        @required
+        truncated: Boolean
+
+        /// The SQL that ran, as the engine ran it: after the firewall, source
+        /// qualification and the executor's row cap, which asks for more rows than
+        /// are returned to tell whether there were more. Only for a caller who may
+        /// see the physical schema, as with `includeDebugInfo`: a platform admin,
+        /// or the namespace's owner, maintainer or data steward, who also holds
+        /// `viewNamespace` on the namespace. Withheld when that policy cannot be
+        /// evaluated.
+        executedSql: String
+    }
+
+    errors: [
+        ValidationError
+        AccessDeniedError
+        NamespaceNotFoundError
+        QueryTranslationError
+        DataSourceUnavailableError
     ]
 }
 

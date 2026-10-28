@@ -34,6 +34,8 @@ import { bundlePython } from "../../utils/python-bundling";
 import {
   readOpenApiSpec,
   mergeOpenApiPaths,
+  stripOpenApiDescriptions,
+  stripOpenApiExamples,
   injectLambdaProxyIntegrations,
   fillAuthorizerParameters,
   PathLambdaMap,
@@ -363,6 +365,9 @@ export class ApiStack extends SCLStack {
         ...dataLayerSpec.components.schemas,
       };
     }
+    // Keep the inlined spec well under CloudFormation's 1 MB template cap.
+    stripOpenApiExamples(spec);
+    stripOpenApiDescriptions(spec);
     spec.info.description =
       "Context Ontology Accelerator REST API — namespace, ingestion, and query management.";
 

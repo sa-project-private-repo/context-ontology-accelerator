@@ -130,14 +130,28 @@ class AdditiveGraphStore:
         return True
 
     # -- additive projection writes ---------------------------------------
-    def store_class(self, ontology_uri, class_uri, labels=None, comments=None, super_classes=None, is_mapped=False):
+    def store_class(
+        self, ontology_uri, class_uri, labels=None, comments=None, super_classes=None, is_mapped=False, physical_name=""
+    ):
         c = URIRef(class_uri)
         self.g.add((c, RDF.type, OWL.Class))
         for cmt in comments or []:
             self.g.add((c, RDFS.comment, Literal(cmt)))
         return {"uri": class_uri}
 
-    def store_property(self, ontology_uri, prop_uri, label="", comment="", domains=None, ranges=None):
+    def store_property(
+        self,
+        ontology_uri,
+        prop_uri,
+        label="",
+        comment="",
+        domains=None,
+        ranges=None,
+        unmapped=False,
+        physical_name="",
+        mapped_domains=(),
+        mapped_ranges=(),
+    ):
         p = URIRef(prop_uri)
         if comment:
             self.g.add((p, RDFS.comment, Literal(comment)))

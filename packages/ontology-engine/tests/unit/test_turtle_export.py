@@ -120,6 +120,31 @@ class TestFormatGroupedTurtle:
         # Must not raise BadSyntax ("Prefix ... not bound").
         Graph().parse(data=result, format="turtle")
 
+    def test_the_download_keeps_the_property_marker_deploy_wrote(self):
+        """A property of a mapped class with no mapping carries ``coa:isMapped false`` in Neptune; the
+        download shows it like the class marker (an upload strips both, so it is never trusted back)."""
+        served = COA_VOCAB_TURTLE + (
+            "<https://example.org/onto#customer_tier> "
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#DatatypeProperty> ;\n"
+            f"    <{VOCAB_URI}isMapped> false .\n"
+        )
+        exported = Graph().parse(data=format_grouped_turtle(served), format="turtle")
+        assert set(exported) == set(Graph().parse(data=served, format="turtle"))
+
+    def test_the_download_keeps_the_physical_names_deploy_wrote(self):
+        """Deploy names a mapped class and attribute by their table and column (``coa:physicalName``); the
+        download shows them like the markers, and an upload strips them the same way."""
+        served = COA_VOCAB_TURTLE + (
+            "<https://example.org/onto#Customers> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> "
+            f'<http://www.w3.org/2002/07/owl#Class> ;\n    <{VOCAB_URI}physicalName> "customers" .\n'
+            "<https://example.org/onto#customers_email> "
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#DatatypeProperty> ;\n"
+            f'    <{VOCAB_URI}physicalName> "email" .\n'
+        )
+        result = format_grouped_turtle(served)
+        assert set(Graph().parse(data=result, format="turtle")) == set(Graph().parse(data=served, format="turtle"))
+        assert f'{VOCAB_PREFIX}:physicalName "customers"' in result
+
     def test_coa_vocab_uses_declared_prefix_not_automint(self):
         """The COA vocab renders with its real, DECLARED prefix — never an
         auto-minted ``ns1:``/``ns2:`` that would be undeclared in the output."""

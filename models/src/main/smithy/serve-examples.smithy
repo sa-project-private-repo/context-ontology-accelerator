@@ -55,6 +55,23 @@ apply TranslateSPARQL @examples([
     }
 ])
 
+apply RunSparqlQuery @examples([
+    {
+        title: "Query the database through the VKG"
+        input: { namespaceId: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", sparql: "PREFIX : <http://coa.amazon.com/namespace/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d/ontology/induced#> SELECT ?c ?name WHERE { ?c a :Customer ; :customer_name ?name } LIMIT 2" }
+        output: {
+            columns: ["c", "name"]
+            rows: [
+                ["c/1001", "Acme Corp"]
+                ["c/1002", "Globex"]
+            ]
+            rowCount: 2
+            truncated: false
+            executedSql: "SELECT v1.id AS c, v1.name AS name FROM customer v1 LIMIT 2"
+        }
+    }
+])
+
 apply KBSearch @examples([
     {
         title: "Search the knowledge base"

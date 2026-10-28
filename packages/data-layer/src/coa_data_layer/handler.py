@@ -428,6 +428,43 @@ def _handle_translate(namespace: str, event: dict) -> dict:
     )
 
 
+def _handle_sparql(namespace: str, event: dict) -> dict:
+    """Run the caller's own SPARQL over the namespace's VKG (the Ontology designer query console)."""
+    body = _parse_body(event) or {}
+    sparql = body.get("sparql")
+    if not isinstance(sparql, str) or not sparql.strip():
+        return _error_response(400, "Missing required field: sparql")
+    if len(sparql) > contract.RUN_SPARQL_QUERY_SPARQL_MAX_LENGTH:
+        return _error_response(400, f"A query is at most {contract.RUN_SPARQL_QUERY_SPARQL_MAX_LENGTH} characters")
+
+    payload = {
+        "action": "sparqlQuery",
+        "sparql": sparql,
+        "namespace": namespace,
+        "profile": _get_caller_profile(event),
+    }
+
+    result = _invoke_context_manager(payload, _get_bearer_token(event))
+
+    status_code = result.get("statusCode", 200)
+    if status_code >= 400:
+        error = result.get("error")
+        return _error_response(
+            status_code, result.get("message", "Internal error"), **({"error": error} if error else {})
+        )
+
+    return _success_response(
+        200,
+        {
+            "columns": result.get("columns", []),
+            "rows": result.get("rows", []),
+            "rowCount": result.get("rowCount", 0),
+            "truncated": result.get("truncated", False),
+            "executedSql": result.get("executedSql"),
+        },
+    )
+
+
 def _handle_kb_search(namespace: str, event: dict) -> dict:
     body = _parse_body(event) or {}
     try:
@@ -639,6 +676,7 @@ def _client_safe_upstream_error(resp_body: str, status_code: int) -> tuple[str, 
 _ROUTE_MAP = {
     ("POST", "/namespaces/{namespaceId}/query"): _handle_query,
     ("POST", "/namespaces/{namespaceId}/translate"): _handle_translate,
+    ("POST", "/namespaces/{namespaceId}/sparql"): _handle_sparql,
     ("POST", "/namespaces/{namespaceId}/kb/search"): _handle_kb_search,
     ("POST", "/namespaces/{namespaceId}/graph/traverse"): _handle_graph_traverse,
     ("GET", "/namespaces/{namespaceId}/schema"): _handle_describe_schema,

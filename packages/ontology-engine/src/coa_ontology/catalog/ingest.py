@@ -9,13 +9,17 @@ this module performs the full acceptance pipeline that is shared by:
 
   - ``POST /ontologies/import`` (file upload)
   - ``POST /ontologies/import-from-url`` (URL fetch)
-  - ``POST /ontology/proposals/{id}/accept`` (inducer output)
+  - foundational-ontology loads
+
+Proposal accept does not use it: accept publishes an ontology version, and a
+deployment (:mod:`coa_ontology.versions.deploy`) materializes it, reusing this
+module's projection and embedding helpers.
 
 Pipeline steps (see :func:`ingest_ontology` for details):
 
   1. Parse the payload with rdflib, resolving the actual format.
   2. Resolve the ontology's identifier (``ontology_id``) — the value
-     comes from the caller when known (proposal accept, explicit
+     comes from the caller when known (foundational load, explicit
      import with ``uri=...``) or is derived from the Turtle's
      ``owl:Ontology`` subject.
   3. (Optional) Run tier-1 validators on the parsed graph.
@@ -38,15 +42,15 @@ import logging
 import os
 import re
 import time
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Container, Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 import defusedxml
 import rdflib.plugins.parsers.rdfxml as _rdfxml_parser
 from coa_common import DEFAULT_EMBED_MODEL_ID
-from coa_common.constants import VOCAB_URI
+from coa_common.constants import VOCAB_URI, split_sql_ident_path
 from defusedxml.expatreader import DefusedExpatParser
 from rdflib import OWL, RDF, RDFS, Graph, Namespace, URIRef
 from rdflib.collection import Collection
@@ -344,7 +348,32 @@ class IngestMetadata:
     source: str = "import"  # import | import-from-url | proposal-accept
 
 
-def _class_datasource_map_from_r2rml(r2rml_content: bytes | str | None) -> dict[str, str]:
+_RR = Namespace("http://www.w3.org/ns/r2rml#")
+
+
+def _parse_r2rml(r2rml_content: bytes | str | Graph | None, what: str) -> Graph | None:
+    """Parse an R2RML mapping; None when there is none or it does not parse (logged, never raised).
+
+    A mapping that is already parsed is returned as it is, so a caller that derives several
+    things from one mapping parses it once and hands the graph to each helper below.
+    """
+    if isinstance(r2rml_content, Graph):
+        return r2rml_content
+    if not r2rml_content:
+        return None
+    text = r2rml_content.decode("utf-8") if isinstance(r2rml_content, bytes) else r2rml_content
+    if not text.strip():
+        return None
+    try:
+        rg = Graph()
+        rg.parse(data=text, format="turtle")
+    except Exception as e:  # noqa: BLE001 (malformed R2RML must not fail ingest)
+        log.warning("r2rml parse failed while deriving %s: %s", what, e)
+        return None
+    return rg
+
+
+def _class_datasource_map_from_r2rml(r2rml_content: bytes | str | Graph | None) -> dict[str, str]:
     """Map each R2RML-mapped class URI → its datasource-id, parsed from R2RML.
 
     Traversal (per the R2RML the inducer emits)::
@@ -385,21 +414,12 @@ def _class_datasource_map_from_r2rml(r2rml_content: bytes | str | None) -> dict[
     Returns an empty dict when ``r2rml_content`` is None/empty or unparseable
     (fail-soft: a class with no derivable mapping is simply treated as unmapped).
     """
-    if not r2rml_content:
-        return {}
-    text = r2rml_content.decode("utf-8") if isinstance(r2rml_content, bytes) else r2rml_content
-    if not text.strip():
+    rg = _parse_r2rml(r2rml_content, "class-to-datasource map")
+    if rg is None:
         return {}
 
-    rr = Namespace("http://www.w3.org/ns/r2rml#")
+    rr = _RR
     scl = Namespace(VOCAB_URI)
-    try:
-        rg = Graph()
-        rg.parse(data=text, format="turtle")
-    except Exception as e:  # noqa: BLE001 — malformed R2RML must not fail ingest
-        log.warning("r2rml parse failed while deriving class→datasource map: %s", e)
-        return {}
-
     mapping: dict[str, str] = {}
     for tmap in rg.subjects(RDF.type, rr.TriplesMap):
         ds_id = str(rg.value(tmap, scl.datasourceId) or "")
@@ -418,6 +438,257 @@ def _class_datasource_map_from_r2rml(r2rml_content: bytes | str | None) -> dict[
             elif ds_id:
                 mapping[key] = ds_id  # later non-empty id wins; id-less is ignored
     return mapping
+
+
+def _pom_predicates(rg: Graph, pom: Any) -> list[str]:
+    """The properties a PredicateObjectMap maps: ``rr:predicate``, and the ``rr:constant`` of ``rr:predicateMap``."""
+    named = [str(p) for p in rg.objects(pom, _RR.predicate)]
+    return named + [str(c) for pm in rg.objects(pom, _RR.predicateMap) for c in rg.objects(pm, _RR.constant)]
+
+
+def _mapped_predicates_from_r2rml(r2rml_content: bytes | str | Graph | None) -> set[str]:
+    """Return every property some PredicateObjectMap of the R2RML maps.
+
+    A property is mapped when an ``rr:predicateObjectMap`` names it with
+    ``rr:predicate``, or with an ``rr:predicateMap`` whose ``rr:constant`` is the
+    property. :func:`projection_specs` marks an attribute or relationship that is not
+    in this set when one of its domains (or, for a relationship, one of its ranges) is
+    mapped. Empty
+    when there is no R2RML or it does not parse.
+    """
+    rg = _parse_r2rml(r2rml_content, "mapped predicates")
+    if rg is None:
+        return set()
+    return {p for pom in set(rg.objects(None, _RR.predicateObjectMap)) for p in _pom_predicates(rg, pom)}
+
+
+def _bare_sql_name(literal: Any) -> str:
+    """The unquoted last segment of an ``rr:tableName`` or ``rr:column`` (``"sales"."orders"`` gives ``orders``)."""
+    return split_sql_ident_path(str(literal))[-1]
+
+
+@dataclass(frozen=True)
+class PhysicalNames:
+    """The tables and columns an R2RML mapping reads, keyed by the class each TriplesMap maps.
+
+    ``tables`` holds, per class IRI, the table of each of its TriplesMaps: the
+    unquoted last segment of ``rr:tableName`` (the form ``logical_table_names``
+    writes), or ``""`` for a map with no ``rr:tableName``. ``columns`` holds, per
+    class IRI, every property its TriplesMaps map, with the unquoted ``rr:column``
+    of the object map, or ``""`` when the object map reads no column (a join, an
+    IRI template). ``property_columns`` holds, per property IRI, the unquoted
+    column of every PredicateObjectMap that maps it, with ``""`` for one whose
+    object reads no column. ``joins`` holds, per class IRI, every relationship its
+    TriplesMaps map through a join (``rr:parentTriplesMap``), with the classes of
+    the joined maps, and ``property_classes``, per property IRI, the classes whose
+    TriplesMaps map it: where the mapping puts a property, which a domain or range
+    moved up to a parent no longer says.
+    """
+
+    tables: dict[str, set[str]] = field(default_factory=dict)
+    columns: dict[str, dict[str, str]] = field(default_factory=dict)
+    property_columns: dict[str, set[str]] = field(default_factory=dict)
+    joins: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    property_classes: dict[str, set[str]] = field(default_factory=dict)
+
+    def table_of(self, class_iri: str) -> str:
+        """The table of a class read from exactly one table, else ``""``."""
+        tables = self.tables.get(class_iri, set())
+        return next(iter(tables)) if len(tables) == 1 else ""
+
+    def column_of(self, property_iri: str) -> str:
+        """The column of a property all of whose PredicateObjectMaps read that one column, else ``""``."""
+        columns = self.property_columns.get(property_iri, set())
+        return next(iter(columns)) if len(columns) == 1 else ""
+
+    def joined_classes(self, property_iri: str) -> set[str]:
+        """The classes of the maps the joins of a relationship reach, from every class that maps it."""
+        return {
+            target
+            for cls in self.property_classes.get(property_iri, ())
+            for target in self.joins.get(cls, {}).get(property_iri, ())
+        }
+
+
+def _physical_names_from_r2rml(r2rml_content: bytes | str | Graph | None) -> PhysicalNames:
+    """Read the physical table and column names of every mapped class from the R2RML.
+
+    The NL-to-SQL class documents (:func:`_accumulate_embeddings`) name tables and
+    columns this way, so a label edit cannot rename the table or column the SQL
+    writer uses, and deploy writes the same names into the graph as
+    ``coa:physicalName`` (:func:`projection_specs`). Empty when there is no R2RML or
+    it does not parse.
+    """
+    names = PhysicalNames()
+    rg = _parse_r2rml(r2rml_content, "physical names")
+    if rg is None:
+        return names
+    reads: dict[Any, tuple[set[str], list[str]]] = {}
+
+    def read_by(pom: Any) -> tuple[set[str], list[str]]:
+        """The columns a PredicateObjectMap's object reads (``""`` for one that reads none) and what it maps."""
+        if pom not in reads:
+            read: set[str] = set()
+            for om in rg.objects(pom, _RR.objectMap):
+                read |= {_bare_sql_name(c) for c in rg.objects(om, _RR.column)} or {""}
+            if not read or (pom, _RR.object, None) in rg:
+                read.add("")  # a constant object reads no column
+            reads[pom] = (read, _pom_predicates(rg, pom))
+        return reads[pom]
+
+    for tmap in rg.subjects(RDF.type, _RR.TriplesMap):
+        classes = {str(c) for sm in rg.objects(tmap, _RR.subjectMap) for c in rg.objects(sm, _RR["class"])}
+        if not classes:
+            continue
+        tables = sorted(
+            _bare_sql_name(t) for lt in rg.objects(tmap, _RR.logicalTable) for t in rg.objects(lt, _RR.tableName)
+        )
+        columns: dict[str, str] = {}
+        joined: dict[str, set[str]] = {}
+        for pom in sorted(rg.objects(tmap, _RR.predicateObjectMap), key=str):
+            read, predicates = read_by(pom)
+            column = min(read - {""}, default="")
+            targets = {
+                str(c)
+                for om in rg.objects(pom, _RR.objectMap)
+                for parent in rg.objects(om, _RR.parentTriplesMap)
+                for sm in rg.objects(parent, _RR.subjectMap)
+                for c in rg.objects(sm, _RR["class"])
+            }
+            for predicate in predicates:
+                if not columns.get(predicate):
+                    columns[predicate] = column
+                if targets:
+                    joined.setdefault(predicate, set()).update(targets)
+        for cls in classes:
+            names.tables.setdefault(cls, set()).add(tables[0] if tables else "")
+            mapped = names.columns.setdefault(cls, {})
+            for predicate, column in columns.items():
+                if not mapped.get(predicate):
+                    mapped[predicate] = column
+                names.property_classes.setdefault(predicate, set()).add(cls)
+            for predicate, targets in joined.items():
+                names.joins.setdefault(cls, {}).setdefault(predicate, set()).update(targets)
+    for pom in set(rg.objects(None, _RR.predicateObjectMap)):
+        read, predicates = read_by(pom)
+        for predicate in predicates:
+            names.property_columns.setdefault(predicate, set()).update(read)
+    return names
+
+
+def schema_subjects(g: Graph) -> tuple[set[URIRef], set[URIRef], set[URIRef]]:
+    """Return the named classes, object properties and datatype properties of ``g``.
+
+    Only NAMED subjects count. Foundational ontologies like FIBO declare
+    anonymous (blank-node) class expressions (anonymous owl:Restriction /
+    owl:unionOf constructs typed as owl:Class), which have no IRI to catalog or
+    ground against; projecting them aborted whole module ingests.
+    """
+
+    def _named(subjects: Iterable[Any]) -> set[URIRef]:
+        return {s for s in subjects if isinstance(s, URIRef)}
+
+    classes = _named(g.subjects(RDF.type, OWL.Class)) | _named(g.subjects(RDF.type, RDFS.Class))
+    dt_props = _named(g.subjects(RDF.type, OWL.DatatypeProperty))
+    obj_props = (
+        _named(g.subjects(RDF.type, OWL.ObjectProperty))
+        | _named(g.subjects(RDF.type, RDF.Property))
+        | _named(g.subjects(RDF.type, OWL.AnnotationProperty))
+        | _named(g.subjects(RDF.type, OWL.FunctionalProperty))
+    ) - dt_props
+    return classes, obj_props, dt_props
+
+
+def projection_specs(
+    g: Graph,
+    classes: set[URIRef],
+    obj_props: set[URIRef],
+    dt_props: set[URIRef],
+    class_to_datasource: dict[str, str],
+    *,
+    mapped_predicates: Container[str],
+    physical_names: PhysicalNames | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build the ``store_classes_batch`` / ``store_properties_batch`` payloads for ``g``.
+
+    A class is ``is_mapped`` when it is a key of ``class_to_datasource``: R2RML
+    map membership, see :func:`_class_datasource_map_from_r2rml`. An attribute
+    (``owl:DatatypeProperty``) or relationship (``owl:ObjectProperty``) is
+    ``unmapped`` when no PredicateObjectMap maps it (it is not in
+    ``mapped_predicates``, see :func:`_mapped_predicates_from_r2rml`) although one
+    of its ``rdfs:domain`` classes is mapped or, for a relationship, one of its
+    ``rdfs:range`` classes: an attribute or relationship added to a mapped class, or
+    a relationship into one, without a column or join behind it, which Tier 2 must
+    not offer. The range counts because the NL-to-SQL foreign-key walk follows a
+    relationship from both ends. Other property kinds (a term typed only
+    ``rdf:Property``, ``owl:AnnotationProperty`` or ``owl:FunctionalProperty``) are
+    never offered to Tier 2 and are not marked, as the designer's check does not
+    list them.
+
+    ``physical_name`` is the name ``physical_names`` (:func:`_physical_names_from_r2rml`)
+    gives a class read from exactly one table (that table) or a datatype property
+    all of whose PredicateObjectMaps read one column (that column); ``""`` for every
+    other term, and for every term without ``physical_names``.
+
+    ``mapped_domains`` and ``mapped_ranges`` say where the mapping puts a mapped
+    attribute or relationship when its ``rdfs:domain`` or ``rdfs:range`` says
+    otherwise, as after the designer moved one up to a parent of its mapped class:
+    the classes whose TriplesMaps map it, and for a relationship the classes of the
+    maps its joins reach (``rr:parentTriplesMap``; an IRI template names none). Both
+    are empty when the domains (or ranges) are exactly those classes, so an unedited
+    induction records none. Serve's NL-to-SQL foreign-key walk places the property
+    by them, since a parent's table does not hold that column or join.
+    """
+    names = physical_names or PhysicalNames()
+
+    def any_mapped(prop_uri: URIRef, axis: URIRef) -> bool:
+        return any(str(o) in class_to_datasource for o in g.objects(prop_uri, axis))
+
+    def placed(declared: list[str], by_mapping: set[str]) -> list[str]:
+        """The classes the mapping puts a property on (or joins it to), when its domain (or range) says otherwise."""
+        among = sorted(c for c in by_mapping if URIRef(c) in classes)
+        return among if among and set(declared) != set(among) else []
+
+    class_specs: list[dict[str, Any]] = [
+        {
+            "class_uri": str(cls_uri),
+            "labels": [str(o) for o in g.objects(cls_uri, RDFS.label)],
+            "comments": _definitions(g, cls_uri),
+            "super_classes": [str(o) for o in g.objects(cls_uri, RDFS.subClassOf) if o in classes],
+            "is_mapped": str(cls_uri) in class_to_datasource,
+            "physical_name": names.table_of(str(cls_uri)),
+        }
+        for cls_uri in classes
+    ]
+    prop_specs: list[dict[str, Any]] = []
+    for prop_uri in obj_props | dt_props:
+        prop_defs = _definitions(g, prop_uri)
+        # Attributes and relationships only: the kinds serve offers and the designer's check lists.
+        relationship = prop_uri in obj_props and (prop_uri, RDF.type, OWL.ObjectProperty) in g
+        on_mapped_class = (prop_uri in dt_props or relationship) and (
+            any_mapped(prop_uri, RDFS.domain) or (relationship and any_mapped(prop_uri, RDFS.range))
+        )
+        domains = [str(o) for o in g.objects(prop_uri, RDFS.domain) if o in classes]
+        ranges = [str(o) for o in g.objects(prop_uri, RDFS.range) if o in classes]
+        attribute_or_relationship = prop_uri in dt_props or relationship
+        prop_specs.append(
+            {
+                "prop_uri": str(prop_uri),
+                "label": str(next(g.objects(prop_uri, RDFS.label), "")),
+                "comment": prop_defs[0] if prop_defs else "",
+                "domains": domains,
+                "ranges": ranges,
+                "unmapped": str(prop_uri) not in mapped_predicates and on_mapped_class,
+                "physical_name": names.column_of(str(prop_uri)) if prop_uri in dt_props else "",
+                "mapped_domains": (
+                    placed(domains, names.property_classes.get(str(prop_uri), set()))
+                    if attribute_or_relationship
+                    else []
+                ),
+                "mapped_ranges": placed(ranges, names.joined_classes(str(prop_uri))) if relationship else [],
+            }
+        )
+    return class_specs, prop_specs
 
 
 def ingest_ontology(
@@ -445,9 +716,9 @@ def ingest_ontology(
 
     - **Append** (``allow_append=True``): the ontology is allowed to
       already exist; the incoming payload is merged into the existing
-      per-ontology named graph. This is the mode the proposal-accept
-      flow uses so multiple induced proposals can be merged under a
-      single user-chosen target ontology URI. Specifically:
+      per-ontology named graph. The foundational-ontology load uses this
+      mode, and the pre-versioning proposal accept used it to merge
+      several induced proposals under one target ontology URI. Specifically:
 
         * ``create_ontology`` is skipped when the target already
           exists (otherwise it would duplicate the ``dct:created``
@@ -523,11 +794,14 @@ def ingest_ontology(
     # forged triple would be queryable by the serve filter and force an
     # unmapped/unbacked class into the structured-query prompt. Strip every
     # ``(?, coa:isMapped, ?)`` here so only store_class can (re)emit it.
-    stripped_markers = _strip_ismapped_triples(g)
+    # ``coa:physicalName``, the table or column serve's foreign-key walk names a
+    # mapped term by, and ``coa:mappedDomain`` / ``coa:mappedRange``, where it places
+    # one, are derived from the R2RML the same way and stripped with it.
+    stripped_markers = _strip_derived_markers(g)
     if stripped_markers:
         log.warning(
-            "ingest: stripped %d caller-supplied coa:isMapped triple(s) — the marker is "
-            "server-derived from R2RML only (ontology_id=%s namespace=%s)",
+            "ingest: stripped %d caller-supplied coa:isMapped, coa:physicalName, coa:mappedDomain or "
+            "coa:mappedRange triple(s); the markers are server-derived from R2RML only (ontology_id=%s namespace=%s)",
             stripped_markers,
             md.ontology_id or "?",
             namespace,
@@ -541,23 +815,7 @@ def ingest_ontology(
             "payload and no ontology_id supplied by the caller."
         )
 
-    # Only project NAMED classes/properties. Foundational ontologies like
-    # FIBO declare anonymous (blank-node) class expressions — anonymous
-    # owl:Restriction / owl:unionOf constructs typed as owl:Class — which
-    # have no IRI to catalog or ground against. Including them caused
-    # store_class to throw on the blank-node id and abort the entire
-    # module ingest (FIBO Contracts / ClientsAndAccounts loaded 0 classes).
-    def _named(subjects):
-        return {s for s in subjects if isinstance(s, URIRef)}
-
-    classes = _named(g.subjects(RDF.type, OWL.Class)) | _named(g.subjects(RDF.type, RDFS.Class))
-    dt_props = _named(g.subjects(RDF.type, OWL.DatatypeProperty))
-    obj_props = (
-        _named(g.subjects(RDF.type, OWL.ObjectProperty))
-        | _named(g.subjects(RDF.type, RDF.Property))
-        | _named(g.subjects(RDF.type, OWL.AnnotationProperty))
-        | _named(g.subjects(RDF.type, OWL.FunctionalProperty))
-    ) - dt_props
+    classes, obj_props, dt_props = schema_subjects(g)
 
     title = md.title or _first_literal(g, ontology_id, RDFS.label) or _local_name(ontology_id)
     description = md.description or _first_literal(g, ontology_id, RDFS.comment)
@@ -581,7 +839,14 @@ def ingest_ontology(
     # such a class. That is sufficient for the current use (membership = mapped;
     # presence of any ds-id = answerable). Multi-source routing (federate instead
     # of pinning one source) is a planned follow-up — widen to dict[str, set[str]].
-    class_to_datasource: dict[str, str] = _class_datasource_map_from_r2rml(r2rml_content)
+    # The same mapping, parsed once, also decides which properties of a mapped
+    # class carry the ``coa:isMapped false`` marker (no PredicateObjectMap behind
+    # them), and gives the NL-to-SQL class documents, and the ``coa:physicalName``
+    # markers, their table and column names.
+    mapping = _parse_r2rml(r2rml_content, "class markers, property markers and table names")
+    class_to_datasource: dict[str, str] = _class_datasource_map_from_r2rml(mapping)
+    mapped_predicates = _mapped_predicates_from_r2rml(mapping)
+    physical_names = _physical_names_from_r2rml(mapping)
 
     # ── 3. Tier-1 validators (optional) ─────────────────────────────────
     if validate:
@@ -665,16 +930,15 @@ def ingest_ontology(
     # Batch the class projection into a few chunked INSERTs when the backend
     # supports it (Neptune DB), instead of one HTTP round-trip per class. Falls
     # back to per-class store_class for backends without the batch method (NA).
-    class_specs: list[dict[str, Any]] = [
-        {
-            "class_uri": str(cls_uri),
-            "labels": [str(o) for o in g.objects(cls_uri, RDFS.label)],
-            "comments": _definitions(g, cls_uri),
-            "super_classes": [str(o) for o in g.objects(cls_uri, RDFS.subClassOf) if o in classes],
-            "is_mapped": str(cls_uri) in class_to_datasource,
-        }
-        for cls_uri in classes
-    ]
+    class_specs, prop_specs = projection_specs(
+        g,
+        classes,
+        obj_props,
+        dt_props,
+        class_to_datasource,
+        mapped_predicates=mapped_predicates,
+        physical_names=physical_names,
+    )
     # Roll back the ontology on any class/property projection failure — but ONLY
     # on a fresh ingest (an append's pre-existing state is live and must not be
     # wiped on a transient failure). Neptune DB has no multi-statement
@@ -724,18 +988,6 @@ def ingest_ontology(
             namespace,
         )
 
-    prop_specs: list[dict[str, Any]] = []
-    for prop_uri in obj_props | dt_props:
-        prop_defs = _definitions(g, prop_uri)
-        prop_specs.append(
-            {
-                "prop_uri": str(prop_uri),
-                "label": str(next(g.objects(prop_uri, RDFS.label), "")),
-                "comment": prop_defs[0] if prop_defs else "",
-                "domains": [str(o) for o in g.objects(prop_uri, RDFS.domain) if o in classes],
-                "ranges": [str(o) for o in g.objects(prop_uri, RDFS.range) if o in classes],
-            }
-        )
     # Same fresh-ingest rollback as the class projection above: a partial
     # property write (batch chunk or per-item loop failing partway) must not
     # leave a half-projected ontology behind.
@@ -810,6 +1062,7 @@ def ingest_ontology(
         dt_props=dt_props,
         namespace=namespace,
         class_to_datasource=class_to_datasource,
+        physical_names=physical_names,
     )
     log.info(
         "ingest: step3 accumulate_embeddings %.0fms (%s)",
@@ -963,10 +1216,10 @@ def wait_for_embeddings_searchable(
 
     ``on_progress(searchable, total)`` — optional, called once per iteration that
     observes FORWARD PROGRESS. Because this wait has no total wall-clock cap, a
-    large-but-healthy sync can outlive the proposal stale-sweep's window; the
-    accept worker passes a callback that heartbeats the proposal so a live sync is
-    never mistaken for a dead worker and swept out from under itself. Callback
-    errors are swallowed: a failed heartbeat must not abort a healthy wait.
+    large-but-healthy sync can outlive a stale-sweep's window; the deployment
+    passes a callback that checkpoints it (refreshing its deploy lock) so a live
+    sync is never mistaken for a dead worker and swept out from under itself.
+    Callback errors are swallowed: a failed heartbeat must not abort a healthy wait.
 
     Never raises — a probe error is treated as "no progress this iteration"
     and retried until the stall deadline. Returns ``False`` on a genuine stall.
@@ -979,10 +1232,10 @@ def wait_for_embeddings_searchable(
     STILL not searchable, that is an index that will not converge (a dropped
     write that slipped past acknowledgement, or an index-health problem), NOT a
     write that simply hasn't happened yet. Callers on a correctness-critical
-    path (proposal accept) MUST treat ``False`` as fatal rather than "lagged"
-    (see :func:`_run_accept_proposal`). The bool return is retained because
-    non-critical callers legitimately proceed on a slow index, but the meaning
-    of ``False`` is "did not converge", not "fine, just slow".
+    path (deploying an ontology version) MUST treat ``False`` as fatal rather
+    than "lagged" (see :mod:`coa_ontology.versions.deploy`). The bool return is
+    retained because non-critical callers legitimately proceed on a slow index,
+    but the meaning of ``False`` is "did not converge", not "fine, just slow".
     ``expected_uris`` is the exact list returned under ``embeddings.entity_uris``
     by :func:`ingest_ontology`.
     """
@@ -1177,9 +1430,9 @@ def ingest_ontology_and_wait(
     Returns the :func:`ingest_ontology` result dict unchanged, so callers keep
     reading ``result["registry"]`` / ``result["embeddings"]`` exactly as before.
 
-    Note: proposal acceptance deliberately does NOT route through here — it
-    owns its own status machine (``accepting`` → ``embeddings_sync`` →
-    ``accepted``) and calls :func:`wait_for_embeddings_searchable` directly.
+    Note: deploying an ontology version deliberately does NOT route through
+    here: it computes and replaces the embeddings itself and calls
+    :func:`wait_for_embeddings_searchable` directly.
     """
     result = ingest_ontology(
         graph_store=graph_store,
@@ -1267,6 +1520,7 @@ def _accumulate_embeddings(
     dt_props: set,
     namespace: str,
     class_to_datasource: dict[str, str] | None = None,
+    physical_names: PhysicalNames | None = None,
 ) -> dict:
     """Embed every class + property and upsert into the namespace's vector index.
 
@@ -1274,6 +1528,10 @@ def _accumulate_embeddings(
     ``store_embeddings_batch`` carries ``namespace`` on each item so
     backends that shard by namespace (OpenSearch index, Neptune
     Analytics namespace-scoped vertex) write into the correct bucket.
+
+    ``physical_names`` (:func:`_physical_names_from_r2rml`) makes the document of
+    each mapped class follow its R2RML; see ``_class_text_for``. Without it every
+    class document is built from the TBox alone.
     """
     from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 
@@ -1312,8 +1570,43 @@ def _accumulate_embeddings(
     # string is written to ``data_source_id`` for the serve NL->SQL filter.
     ds_map = class_to_datasource or {}
 
+    def _mapped_columns(cls_uri) -> dict[str, str] | None:
+        """Property IRI -> physical column ("" for none) for every property a mapped class's TriplesMaps map.
+
+        None when no mapping was given or the class is unmapped: its document then
+        lists every property of the class, as before mappings were read here.
+        """
+        if physical_names is None or str(cls_uri) not in ds_map:
+            return None
+        return physical_names.columns.get(str(cls_uri), {})
+
+    def _table_of(cls_uri) -> str:
+        """The physical table of a mapped class read from exactly one table, else ""."""
+        if physical_names is None or str(cls_uri) not in ds_map:
+            return ""
+        return physical_names.table_of(str(cls_uri))
+
+    def _join_target(cls_uri, prop_uri, prop_range) -> str:
+        """The table (else label) a relationship of a mapped class joins to, by its mapping.
+
+        A join names the class it reaches (``rr:parentTriplesMap``), which a range moved
+        up to a parent no longer is; the range is used when it is one of them. Without
+        a join (an IRI template) only a mapped range names a table.
+        """
+        targets = physical_names.joins.get(str(cls_uri), {}).get(str(prop_uri), set()) if physical_names else set()
+        if targets:
+            target = URIRef(str(prop_range) if prop_range is not None and str(prop_range) in targets else min(targets))
+            return _table_of(target) or _label_of(target)
+        if prop_range is not None and str(prop_range) in ds_map:
+            return _table_of(prop_range) or _label_of(prop_range)
+        return ""  # an unmapped range is no table to join to
+
+    def _other_labels(uri, name: str) -> list[str]:
+        """The term's labels that differ from its physical ``name``, sorted."""
+        return sorted({str(o) for o in graph.objects(uri, RDFS.label)} - {name})
+
     def _mapped_parents(cls_uri) -> list[str]:
-        """Labels of this class's ``rdfs:subClassOf`` parents that are mapped tables.
+        """Tables of this class's ``rdfs:subClassOf`` parents that are mapped tables.
 
         Mirrors the Ontop context's mapped-parent gate: a grounded class's
         foundational parent (FIBO, Schema.org) has no table behind it, and naming
@@ -1321,22 +1614,27 @@ def _accumulate_embeddings(
         Restriction blank nodes (cardinality axioms) are not parents and are skipped.
         """
         return sorted(
-            _label_of(parent)
+            _table_of(parent) or _label_of(parent)
             for parent in graph.objects(cls_uri, RDFS.subClassOf)
             if isinstance(parent, URIRef) and str(parent) in ds_map and parent != cls_uri
         )
 
-    def _primary_key(cls_uri) -> list[str]:
+    def _primary_key(cls_uri, columns: dict[str, str]) -> list[str]:
         """Column names of the class's ``owl:hasKey`` — the key Ontop's mapping uses."""
         key_list = graph.value(cls_uri, OWL.hasKey)
         if key_list is None:
             return []
-        return [_label_of(prop) for prop in Collection(graph, key_list)]
+        return [columns.get(str(prop)) or _label_of(prop) for prop in Collection(graph, key_list)]
 
-    def _term_hints(subject) -> str:
-        """Bracketed synonyms / glossary terms / tags for one column or relationship."""
+    def _term_hints(subject, labels: Iterable[str] = ()) -> str:
+        """Bracketed label / synonyms / glossary terms / tags for one column or relationship.
+
+        ``labels`` are the column's TBox labels where they differ from its physical
+        name, so the user's words reach the SQL writer without renaming the column.
+        """
         hints = []
         for title, values in (
+            ("label", list(labels)),
             ("synonyms", _literals(subject, SKOS.altLabel)),
             ("glossary", _literals(subject, GLOSSARY_TERM)),
             ("tags", _literals(subject, TAG)),
@@ -1359,34 +1657,63 @@ def _accumulate_embeddings(
         adds everything the Ontop context also carries: tags, the mapped parent
         class, the primary key, per-column synonyms / glossary terms / tags, and
         each column's type and ``allowed values: [...]``.
+
+        For a mapped class, with ``physical_names`` given, the document follows the
+        R2RML: it lists only the attributes and relationships one of the class's
+        TriplesMaps maps, also those whose domain is another class (a parent the
+        designer moved one up to), and names a relationship's target by the class
+        its join reaches, else by its range when that class is mapped. When the
+        class reads exactly one table, tables and columns carry
+        their physical names; a label that differs goes into ``Synonyms`` (the
+        table) or a ``label:`` hint (a column), and the ``Table:`` head stays when
+        the class lists no column or relationship. A class read from several
+        tables keeps its labels.
         """
-        name = _label_of(cls_uri)
+        table = _table_of(cls_uri)
+        mapped = _mapped_columns(cls_uri)
+        columns = mapped if table and mapped else {}
+        name = table or _label_of(cls_uri)
         description = str(graph.value(cls_uri, RDFS.comment) or "")
         synonyms = [str(o) for o in graph.objects(cls_uri, SKOS.altLabel)]
+        if table:
+            synonyms = [lbl for lbl in _other_labels(cls_uri, table) if lbl not in synonyms] + synonyms
         glossary_terms = _literals(cls_uri, GLOSSARY_TERM)
         tags = _literals(cls_uri, TAG)
         parents = _mapped_parents(cls_uri)
-        primary_key = _primary_key(cls_uri)
+        primary_key = _primary_key(cls_uri, columns)
 
         # (label, target, comment, hints)
         obj_props_list: list[tuple[str, str, str, str]] = []
         # (label, dtype, comment, distinct_values, hints)
         data_props_list: list[tuple[str, str, str, list[str], str]] = []
 
-        for prop_uri in graph.subjects(RDFS.domain, cls_uri):
+        props = list(graph.subjects(RDFS.domain, cls_uri))
+        if mapped is not None:
+            # Placed by the mapping: what the class's maps map is a column or join of its table even when its
+            # domain is another class (a parent it was moved up to, say), listed after the others.
+            listed = set(props)
+            props += sorted((URIRef(p) for p in mapped if URIRef(p) not in listed), key=str)
+        for prop_uri in props:
+            if mapped is not None and str(prop_uri) not in mapped:
+                continue  # no column or join behind it, so structured queries cannot use it
             prop_label = _label_of(prop_uri)
             prop_comment = str(graph.value(prop_uri, RDFS.comment) or "")
             prop_range = graph.value(prop_uri, RDFS.range)
 
             if (prop_uri, RDF.type, OWL.ObjectProperty) in graph:
-                range_label = _label_of(prop_range) if prop_range else ""
+                if mapped is None:
+                    range_label = _label_of(prop_range) if prop_range else ""
+                else:
+                    range_label = _join_target(cls_uri, prop_uri, prop_range)
                 obj_props_list.append((prop_label, range_label, prop_comment, _term_hints(prop_uri)))
             elif (prop_uri, RDF.type, OWL.DatatypeProperty) in graph:
                 dtype = str(prop_range).split("#")[-1] if prop_range else "string"
                 distinct_vals = [str(o) for o in graph.objects(prop_uri, _SCL_NS.distinctValues)]
-                data_props_list.append((prop_label, dtype, prop_comment, distinct_vals, _term_hints(prop_uri)))
+                column = columns.get(str(prop_uri), "")
+                hints = _term_hints(prop_uri, _other_labels(prop_uri, column) if column else ())
+                data_props_list.append((column or prop_label, dtype, prop_comment, distinct_vals, hints))
 
-        if not data_props_list and not obj_props_list:
+        if not data_props_list and not obj_props_list and not table:
             thin = _text_for(cls_uri)
             return thin, thin
 
@@ -1527,8 +1854,8 @@ def _accumulate_embeddings(
             "index": index_name,
             # Exact list of entity URIs the store ACKNOWLEDGED writing to the
             # vector index in this call (not merely submitted). Callers (notably
-            # proposal-accept) use it to block until every one is searchable,
-            # closing the AOSS consistency window.
+            # the version deployment) use it to block until every one is
+            # searchable, closing the AOSS consistency window.
             "entity_uris": acked_uris,
         }
     except Exception as e:
@@ -1590,16 +1917,29 @@ def _strip_dangling_bnode_objects(g: Graph) -> int:
     return removed
 
 
-def _strip_ismapped_triples(g: Graph) -> int:
-    """Remove every ``(?, coa:isMapped, ?)`` triple from a parsed payload graph.
+# The markers only the projection from the R2RML writes (see :func:`projection_specs`).
+_DERIVED_MARKERS = tuple(
+    URIRef(f"{VOCAB_URI}{name}") for name in ("isMapped", "physicalName", "mappedDomain", "mappedRange")
+)
+
+
+def _strip_derived_markers(g: Graph) -> int:
+    """Remove every ``coa:isMapped``, ``coa:physicalName``, ``coa:mappedDomain`` and ``coa:mappedRange`` triple.
 
     ``coa:isMapped`` is a server-derived TRUST-BOUNDARY marker (see the caller):
-    the serve Tier-2 filter matches it to decide a class is SQL-answerable, and
-    it must be emitted ONLY by ``store_class`` from the R2RML mapping — never
-    accepted from caller-supplied Turtle. Returns the number of triples removed.
+    the serve Tier-2 filter matches it to decide a class is SQL-answerable, or that
+    a property is not. It must be emitted ONLY by the projection from the R2RML
+    mapping (``store_class`` writes "true" on a mapped class, ``store_property``
+    writes "false" on a property that no PredicateObjectMap maps although one of its
+    domains, or for a relationship one of its ranges, is mapped), and never accepted
+    from caller-supplied Turtle.
+    ``coa:physicalName`` (the table of a mapped class, the column of a mapped
+    attribute) names what serve's foreign-key walk tells the SQL writer, and
+    ``coa:mappedDomain`` / ``coa:mappedRange`` (the classes a mapping puts a property
+    on and joins it to) place what it lists, so they are derived the same way.
+    Returns the number of triples removed.
     """
-    is_mapped_pred = URIRef(f"{VOCAB_URI}isMapped")
-    triples = list(g.triples((None, is_mapped_pred, None)))
+    triples = [t for predicate in _DERIVED_MARKERS for t in g.triples((None, predicate, None))]
     for triple in triples:
         g.remove(triple)
     return len(triples)

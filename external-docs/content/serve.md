@@ -45,8 +45,10 @@ Options:
   `sparqlGenerated` fields in the response. **Off by default.** ⚠️ Security:
   these fields expose internal schema (table and column names, joins), so the
   flag is honoured only for a platform admin or a namespace owner, maintainer
-  or data steward of the queried namespace. For any other caller the query
-  still succeeds, with both fields omitted.
+  or data steward of the queried namespace who also holds the `viewNamespace`
+  Cedar right on it (when the policy cannot be evaluated, the fields are
+  withheld). For any other caller the query still succeeds, with both fields
+  omitted.
 - `dimensions` — dimension filters, a list of up to 100 `{name, value}`
   objects (`name` 1–256 characters and unique case-insensitively, `value` up
   to 4000 characters, `operator` only `=`)
@@ -125,6 +127,38 @@ Notes:
   falling back to the default.
 - `ontop` requires the namespace to have an accepted ontology with published R2RML
   mappings; without them the pinned engine fails rather than falling back.
+- **A result that answers nothing does not end Tier 2 while something can run after
+  it.** Ontop answers SPARQL that matches no mapping with a placeholder row
+  (`SELECT 1 AS uselessVariable`), and a low-confidence query can return no rows.
+  Either way the next engine in the chain runs, then Tier 3. A pinned engine has no
+  next one, so the question goes on to Tier 3. With `tierOverride: 2` nothing runs
+  after Tier 2. When no engine after Ontop answered, the placeholder row is then the
+  answer (its one column is `uselessVariable`), except with `best`, which never
+  returns it. A question left with no answer gets no result (404).
+- **A question about a term no table holds is declined, not answered with a stand-in.**
+  Both engines are told the namespace's terms that no table maps: the attributes and
+  relationships of mapped classes that no column or join maps (such as one added in
+  the Ontology designer), and the classes of its induced ontologies that no table maps
+  (a class added in the designer, or one found only in documents), except a parent of
+  a mapped class and a class named like one or like one of its columns (a class `Order`
+  from documents beside the table `orders`, or `Status` beside the column
+  `orders.status`). Asked about one of them, or about anything else the tables do not
+  hold (an attribute deleted in the designer, say), the engine replies that the schema
+  cannot answer it instead of writing a query that stands in for it, such as a
+  threshold on another column for "premium customers" or the first order date for a
+  sign-up date. That engine then gives no result: the next engine runs, then Tier 3,
+  which reads your documents, and the trace step `t2.sql.failed` or `t2.vkg.failed`
+  gives the reason `cannot_answer`. With `tierOverride: 2` such a question gets no
+  result (404). At most 50 terms are listed, and a deploy is seen within a minute. A
+  namespace from before deploys marked mapped classes (`coa:isMapped`), or with no
+  such term, is answered as before. The `deep-reasoning` engine is not told these terms
+  and answers as before.
+- **Ontop does not answer from a VKG that serves another ontology version.** After a
+  deploy, until the namespace's VKG has loaded the deployed version (for good, if its
+  reload failed), the Ontop engine gives no result as above, and its
+  `t2.vkg.compile` trace step names both versions, for example "The VKG still serves
+  v1; the ontology is v2." The Playground's execution plan shows the same sentence
+  for that step.
 
 #### Standard vs Deep Reasoning — `mode`
 
@@ -195,7 +229,7 @@ before the cascade. These are separate controls: `standard` is not a valid
 
 | `TIER3_STRATEGY` / path | Routing and evidence | Published RDF/OWL ontology use | Cost / latency shape | How it is selected |
 |---|---|---|---|---|
-| `lexical-baseline` (**default**) | The Standard cascade runs. If it reaches Tier 3, graphrag reads the document lexical graph in Neptune and its OpenSearch indexes; `LEXICAL_RETRIEVER_STRATEGY` defaults to `topic_beam` | **No formal ontology.** It does not read OWL classes, domain/range, or the namespace's published ontology graph. It does read concept-like nodes in the lexical KG itself — `topic_beam` navigates Source → Chunk → Topic → Statement → Fact → Entity — but those Topic/Entity nodes are extracted from documents at ingestion, not the accepted, formally-typed ontology | One configured lexical retrieval followed by answer synthesis | CDK context `-c tier3_strategy=lexical-baseline` (the default). Under Standard execution, request `retrieverStrategy` selects the graphrag strategy; otherwise `-c lexical_retriever_strategy=...` supplies its deployment default |
+| `lexical-baseline` (**default**) | The Standard cascade runs. If it reaches Tier 3, graphrag reads the document lexical graph in Neptune and its OpenSearch indexes; `LEXICAL_RETRIEVER_STRATEGY` defaults to `topic_beam` | **No formal ontology.** It does not read OWL classes, domain/range, or the namespace's published ontology graph. It does read concept-like nodes in the lexical KG itself (`topic_beam` navigates Source, Chunk, Topic, Statement, Fact, then Entity), but those Topic/Entity nodes are extracted from documents at ingestion, not the accepted, formally-typed ontology. The exception is the [domain facts](#domain-facts) step, which adds typed facts from the namespace's domain data once that data conforms to the deployed version | One configured lexical retrieval followed by answer synthesis | CDK context `-c tier3_strategy=lexical-baseline` (the default). Under Standard execution, request `retrieverStrategy` selects the graphrag strategy; otherwise `-c lexical_retriever_strategy=...` supplies its deployment default |
 | `hand-rolled` | The Standard cascade runs. At Tier 3, OpenSearch document-vector retrieval runs in parallel with `GraphTraverser` over the namespace-scoped published RDF graphs | **Yes.** Traversal is seeded from matched ontology concept URIs when available, then follows the published graph; otherwise it falls back to a label search in that graph | Parallel vector + graph retrieval followed by answer synthesis | CDK context `-c tier3_strategy=hand-rolled`, with no request `retrieverStrategy` |
 | `deep-reasoning` | Without `tierOverride`, a bounded planner/tool loop owns the request before the Standard cascade and can call structured-query, document, graph-traversal, and ontology-lookup tools | **Available and normally resolved first.** The planner is instructed to call ontology lookup before entity traversal, but the request trace remains the authority for whether lookup succeeded | Multiple model/tool calls; highest and most variable latency/cost | CDK context `-c tier3_strategy=deep-reasoning`, or request `mode: "deep-reasoning"` |
 
@@ -361,6 +395,10 @@ Two sub-strategies:
 
 The SQL Firewall validates all generated SQL before execution (only SELECT allowed, table/column access controls enforced).
 
+Neither strategy answers a question about a term that no table maps, such as a class or
+attribute added in the Ontology designer: it declines, and the question goes on to
+Tier 3 (see the `strategy` notes above).
+
 ### Query execution paths (Tier 1 & Tier 2)
 
 Once SQL is validated, the serve layer routes it to the cheapest correct engine —
@@ -407,6 +445,33 @@ need no re-induction.
 > Tier 3 over the [streaming endpoint](#streaming-recommended-for-interactive-query),
 > not the synchronous REST endpoint, or it will return `rest_deadline_exceeded`.
 
+#### Domain facts
+
+On the `lexical-baseline` path, a Tier 3 answer can include **domain facts**
+from the namespace's [domain data](ontologies.md#domain-data): typed relations
+between instances of the ontology, each with the document it came from, such as
+`Customer "ACME" -placedOrder-> Order "PO-123" [source: contract.pdf]`. They
+reach the answer's context as a separate "Domain facts (ontology vN)" section.
+
+- **Only for the deployed version.** Domain facts are used once the domain data
+  conforms to the ontology version deployed in Neptune. After a deploy they
+  stop until the domain data is rebuilt for the new version.
+- **How they are found.** The lexical entities that retrieval returned are
+  linked to domain instances, by lexical entity id and then by normalized name.
+  When retrieval returns no entities, as the default `topic_beam` strategy does,
+  the instances read from the retrieved document chunks are linked instead, those
+  of the best-ranked chunk first. Either way, up to 10 instances. Their relations
+  are followed one hop, or two when one hop gives fewer than 10 facts, up to 30
+  facts.
+- **Never at the cost of the answer.** The step has a 2 s budget. On a timeout,
+  an error, or no usable domain data it is skipped and the answer goes on
+  without it.
+- **Trace.** The `domain_abox` trace step reports `success` with the number of
+  linked instances and facts and the version, or `skipped`, `timeout` or `error`
+  with the reason.
+- **Turning it off.** Set `ABOX_CONTEXT_ENABLED=false` on the serve service.
+  It defaults to `true`, and the serve stack sets `true`.
+
 ## Access Control on Queries
 
 Authorization runs at **two** points, so that surfaces which never generate SQL are
@@ -450,9 +515,15 @@ The Playground maintains conversation sessions:
 In addition to full query resolution:
 
 - `POST /namespaces/{namespaceId}/translate` — translate NL to SPARQL without executing (**TranslateSPARQL**)
+- `POST /namespaces/{namespaceId}/sparql`: run your own SPARQL `SELECT` or `ASK` over the VKG with your table grants, at most 1,000 rows in 20 seconds (**RunSparqlQuery**; the Ontology designer's query console uses it). A query whose answers need an IRI that is not a class or property of the deployed ontology, a class no table maps, or an attribute or relationship added to a mapped class in the Ontology designer gets 400 `ValidationError` naming each one; any other query that no table mapping matches gets 400 `ValidationError` "No table mapping matches this query, so the VKG cannot answer it." The executed SQL comes back only to a caller who would get it with `includeDebugInfo`: a platform admin or a namespace owner, maintainer or data steward who also holds `viewNamespace` on the namespace. While the VKG still serves another ontology version than the deployed one (right after a deploy, or after a failed reload), it answers 503 with a message that names both versions
 - `POST /namespaces/{namespaceId}/kb/search` — semantic search across the knowledge base (**KBSearch**)
 - `POST /namespaces/{namespaceId}/graph/traverse` — traverse the knowledge graph (**GraphTraverse**)
 - `GET /namespaces/{namespaceId}/schema` — discover the queryable schema (**DescribeSchema**)
+
+`TranslateSPARQL` answers a question about a term no table maps with 400
+`QueryTranslationError` "Could not generate SPARQL for this query": its SPARQL writer
+declines such a question, as the `strategy` notes above describe, instead of writing a
+query that stands in for the term.
 
 `KBSearch` identifies a document in two different ways. `sourceDocumentId` is
 the opaque, unique source identity; use it to correlate chunks from the same

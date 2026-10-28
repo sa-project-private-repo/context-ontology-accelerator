@@ -5,9 +5,11 @@
 
 Orchestrates:
 1. T-Box context assembly (from routing's vector hits)
-2. Prompt assembly with system instructions + few-shot + context
+2. Prompt assembly with system instructions + few-shot + context, and the namespace's
+   terms that no table maps (``unmapped_terms``)
 3. LLM call via Bedrock Converse API
-4. SPARQL extraction from response (handles markdown code blocks)
+4. SPARQL extraction from response (handles markdown code blocks); a reply of
+   ``CANNOT_ANSWER`` to a question about a term no table maps ends the translation
 5. SPARQL validation (syntax + URI existence)
 
 Returns TranslationResult with the generated SPARQL, confidence, and validity.
@@ -27,6 +29,8 @@ from typing import Any
 import structlog
 
 from ...clients.base import GraphClient, LLMClient
+from ...served_version import ServedVersionReader
+from ..unmapped_terms import UnmappedTerms, UnmappedTermsReader, declined, sparql_prompt_block
 from .sparql_validator import SPARQLValidator, ValidationResult
 from .tbox_context import TBoxContext, TBoxContextBuilder
 from .types import VectorHit
@@ -371,6 +375,8 @@ class TranslationError(StrEnum):
     LLM_EMPTY = "llm_returned_empty_response"
     VALIDATION_FAILED = "sparql_validation_failed"
     STEP_FAILED = "pipeline_step_failed"
+    # The writer replied that the schema cannot answer the question (see ``unmapped_terms``).
+    CANNOT_ANSWER = "cannot_answer"
 
 
 @dataclass
@@ -422,6 +428,8 @@ class NLtoSPARQL:
         few_shot_loader=None,
         *,
         guardrail_id_provider: Callable[[], str] | None = None,
+        served_versions: ServedVersionReader | None = None,
+        unmapped_terms: UnmappedTermsReader | None = None,
     ):
         """Assemble the T-Box builder, validator, and few-shot loader for translation.
 
@@ -441,10 +449,19 @@ class NLtoSPARQL:
                 full metric definitions.
             few_shot_loader: Optional loader of namespace-scoped few-shot examples;
                 falls back to generic examples when absent.
+            served_versions: Optional shared reader of the versions Neptune serves,
+                which the T-Box builder's legacy-bridge probe asks.
+            unmapped_terms: Optional shared reader of the namespace's terms that no
+                table maps. They are listed after the schema, and the writer replies
+                ``CANNOT_ANSWER`` to a question about one of them instead of writing
+                SPARQL that stands in for it. Without it, or with nothing to list, the
+                prompt is as before.
         """
         # pass the Tier-1 MetricResolver to the T-Box builder so metric
         # hits are enriched with full Neptune metric definitions in the prompt.
-        self._tbox_builder = TBoxContextBuilder(graph_client, graph_uri_template, metric_resolver=metric_resolver)
+        self._tbox_builder = TBoxContextBuilder(
+            graph_client, graph_uri_template, metric_resolver=metric_resolver, served_versions=served_versions
+        )
         self._llm = llm_client
         self._guardrail_id = guardrail_id
         self._guardrail_id_provider = guardrail_id_provider
@@ -454,6 +471,7 @@ class NLtoSPARQL:
         # examples from S3 are injected into the prompt, replacing the generic
         # hardcoded examples. None / no file → generic examples (graceful fallback).
         self._few_shot_loader = few_shot_loader
+        self._unmapped_terms = unmapped_terms
 
     def _effective_guardrail_id(self) -> str | None:
         """Resolve the guardrail id LIVE via the provider when injected.
@@ -586,6 +604,9 @@ class NLtoSPARQL:
             except Exception as e:
                 logger.warning("few_shot_injection_skipped", error=str(e))
 
+        # The terms no table maps, listed after the schema (none: the prompt is as before).
+        unmapped = await self._unmapped_terms.read(namespace) if self._unmapped_terms else UnmappedTerms()
+
         # Steps 2-3: LLM call + validation with retry loop.
         # On validation failure, feed the specific error back and retry (max 2).
         max_validation_retries = 2
@@ -598,7 +619,7 @@ class NLtoSPARQL:
 
         for attempt in range(max_validation_retries + 1):
             # Step 2: LLM call
-            user_prompt = self._build_user_prompt(query, tbox, namespace, few_shot_block)
+            user_prompt = self._build_user_prompt(query, tbox, namespace, few_shot_block, unmapped)
             if validation_feedback:
                 user_prompt += (
                     "\n\n⚠️ CORRECTION REQUIRED — your previous SPARQL had errors:\n"
@@ -666,6 +687,21 @@ class NLtoSPARQL:
                     duration_ms=self._elapsed_ms(start),
                     tbox_context=tbox,
                     guardrail_blocked=True,
+                )
+
+            if unmapped and declined(llm_response.text):
+                # No SPARQL to validate or retry: the writer says the schema cannot answer it.
+                trace_steps[-1]["status"] = "skipped"
+                trace_steps[-1]["detail"] = TranslationError.CANNOT_ANSWER
+                logger.info("nl_to_sparql_declined", namespace=namespace, attempt=attempt + 1)
+                return TranslationResult(
+                    sparql=None,
+                    confidence=0.0,
+                    valid=False,
+                    error=TranslationError.CANNOT_ANSWER,
+                    trace_steps=trace_steps,
+                    duration_ms=self._elapsed_ms(start),
+                    tbox_context=tbox,
                 )
 
             sparql = self._extract_sparql(llm_response.text)
@@ -805,8 +841,15 @@ class NLtoSPARQL:
     def _elapsed_ms(self, start: float) -> int:
         return int((time.perf_counter() - start) * 1000)
 
-    def _build_user_prompt(self, query: str, tbox: TBoxContext, namespace: str, few_shot_block: str = "") -> str:
-        """Build the LLM user prompt: ontology schema (+ optional few-shot) + NL question."""
+    def _build_user_prompt(
+        self,
+        query: str,
+        tbox: TBoxContext,
+        namespace: str,
+        few_shot_block: str = "",
+        unmapped: UnmappedTerms | None = None,
+    ) -> str:
+        """Build the LLM user prompt: ontology schema (+ the terms no table maps, + optional few-shot) + NL question."""
         context_text = self._tbox_builder.format_for_prompt(tbox, namespace)
         # Log the actual schema context handed to the LLM so the NL→SPARQL INPUT
         # is observable (previously only the output SPARQL was logged).
@@ -820,6 +863,8 @@ class NLtoSPARQL:
             context_preview=context_text[:2000],
         )
         parts = [context_text]
+        if unmapped:
+            parts.append(sparql_prompt_block(unmapped))
         if few_shot_block:
             parts.append(few_shot_block)
         # Prompt-injection scoping via Bedrock guardContent (tier3 pattern):
@@ -832,7 +877,10 @@ class NLtoSPARQL:
         # guardrail-exempt. Duplicating the query here would double the
         # token cost with no additional protection, since the guardrail
         # can only score the guardContent copy.
-        parts.append("Generate a SPARQL query for the user question.")
+        if unmapped:
+            parts.append("Generate a SPARQL query for the user question, or reply CANNOT_ANSWER as described above.")
+        else:
+            parts.append("Generate a SPARQL query for the user question.")
         return "\n\n".join(parts)
 
     def _extract_sparql(self, response: str) -> str:

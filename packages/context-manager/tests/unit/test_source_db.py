@@ -100,6 +100,8 @@ class TestSourceDBQueryExecutor:
         assert run_args[1] == "SELECT a FROM t LIMIT 1000"
         assert result.rows == [{"a": 1}]
         assert result.columns == ["a"]
+        # The statement that ran, with its row cap, for the query console's "SQL that ran".
+        assert result.sql == "SELECT a FROM t LIMIT 1000"
 
     @patch("coa_serve.clients.source_db.boto3")
     def test_resolve_credentials_rejects_invalid_arn(self, mock_boto3, _reg):

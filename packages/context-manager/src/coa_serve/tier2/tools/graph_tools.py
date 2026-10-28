@@ -45,6 +45,21 @@ namespace-language preference picks a different label it is added alongside as
 ``table_label`` / ``column_label``. Grouping is by IRI, so a table with several
 labels is still one node, and a language never hides a table.
 
+Physical names. Deploy names a mapped class read from one table, and a mapped
+attribute read from one column, by that table or column (``coa:physicalName``,
+from the version's R2RML). The identifier is that name when the graph has it, so
+a label edited in the Ontology designer does not rename the table or column the
+SQL writer is told to use; the edited label is then the ``table_label`` /
+``column_label`` hint. A term without the triple (a namespace deployed before it
+existed, a class read from several tables) is named by its label, as before. The
+edge query brings each end's name along, so naming a reached table costs no query.
+
+Placement. The Ontology designer may move a mapped property's domain or range up to
+a parent of its mapped class; the parent's table, if it has one, holds neither the
+column nor the join. Deploy then records the classes the mapping reads the property
+from and joins it to (``coa:mappedDomain`` / ``coa:mappedRange``), and the walk
+places the edge and the column on those classes instead of the domain and range.
+
 Every query here is bound to the namespace's named graphs, which a cheap probe
 resolves once per request (:meth:`OntologyGraphTool._resolve_graph_iris`). The
 scoping matters for cost, not just correctness — see
@@ -68,12 +83,16 @@ from coa_common.label_language import LabelPreference
 from ...clients.base import GraphClient
 from ...namespace_language import current_label_preference, lang_projection, row_label
 from ...query_utils import (
+    MAPPED_DOMAIN_IRI,
+    PHYSICAL_NAME_IRI,
     SPARQL_PREFIXES,
     get_graph_uri_template,
     graph_scoped_body,
     named_graphs_sparql,
     namespace_graph_prefix,
     object_properties_sparql,
+    placed_by_mapping,
+    unmapped_property_filter,
     validate_namespace,
 )
 from ..nl_to_sql.sql_generator import hit_class_iri
@@ -159,6 +178,7 @@ class OntologyGraphTool:
         self._fk_edges: list[dict[str, str]] | None = None
         self._label_iris: dict[str, list[str]] = {}
         self._graph_iris: list[str] | None = None
+        self._table_names: dict[str, str] = {}  # class IRI -> coa:physicalName ("" for none)
 
     @property
     def available(self) -> bool:
@@ -225,11 +245,18 @@ class OntologyGraphTool:
         # class Ontop cannot resolve, since it returns facts rather than authoring
         # SQL), a higher limit, ``?comment`` for the FK provenance string, and the
         # resolved named graphs (the T-Box builder now resolves them too, so both
-        # callers are on the scoped form). NOT anchored on ``domain_iris``: this
-        # caller wants the whole FK graph to walk, so it is unaffected by the
+        # callers are on the scoped form). For both callers the query drops a
+        # relationship deploy marked unmapped, so the walk never reaches a class
+        # through a join that does not exist. This caller also asks for the physical
+        # form: a relationship deploy placed by its mapping (its range moved up to a
+        # parent, say) joins the classes the mapping joins, and each end comes with
+        # the table name :func:`_build_adjacency` names it by. NOT anchored on ``domain_iris``:
+        # this caller wants the whole FK graph to walk, so it is unaffected by the
         # one-sided ?domain narrowing described in ``object_properties_sparql``.
         graphs = await self._resolve_graph_iris(prefix)
-        sparql = object_properties_sparql(prefix, limit=_EDGE_QUERY_LIMIT, with_comment=True, graph_iris=graphs)
+        sparql = object_properties_sparql(
+            prefix, limit=_EDGE_QUERY_LIMIT, with_comment=True, graph_iris=graphs, physical=True
+        )
         rows = await self._query(sparql, what="fk_edges")
         # Log the count so an empty traversal is attributable: "this namespace has
         # no induced FKs" reads differently from a query that failed or timed out.
@@ -238,6 +265,41 @@ class OntologyGraphTool:
         logger.debug("fk_edges_loaded", namespace=self._namespace, graphs=len(graphs), edge_count=len(rows))
         self._fk_edges = rows
         return rows
+
+    async def _load_table_names(self, prefix: str, class_iris: list[str]) -> dict[str, str]:
+        """The ``coa:physicalName`` of each of the given classes that has one, by IRI.
+
+        The edge query names every end of an edge, so this is for a seed no edge
+        reaches: a flat ``VALUES ?class`` lookup, as for the columns. Each class is looked
+        up once per request, and no query is sent when every class is already known (or
+        none is given). Best-effort: when the lookup fails, those classes keep their
+        labels, as they did before deploy wrote the names.
+        """
+        wanted = [u for u in dict.fromkeys(class_iris) if u not in self._table_names and _SAFE_URI_RE.match(u)]
+        if wanted:
+            values = " ".join(f"<{u}>" for u in wanted)
+            graphs = await self._resolve_graph_iris(prefix)
+            body = f"""            VALUES ?class {{ {values} }}
+            ?class <{PHYSICAL_NAME_IRI}> ?name ."""
+            sparql = f"""{SPARQL_PREFIXES}
+        SELECT ?class ?name WHERE {{
+{graph_scoped_body(body, prefix, graphs)}
+        }}"""
+            try:
+                rows = await self._query(sparql, what="table_names")
+            except Exception as e:
+                logger.info(
+                    "fk_table_names_failed", namespace=self._namespace, error=f"{type(e).__name__}: {str(e)[:120]}"
+                )
+                return {}
+            names: dict[str, set[str]] = {}
+            for r in rows:
+                if r.get("class") and str(r.get("name") or "").strip():
+                    names.setdefault(r["class"], set()).add(str(r["name"]))
+            for iri in wanted:
+                # Deploy writes one name per class; min() keeps a stray second one deterministic.
+                self._table_names[iri] = min(names.get(iri, ()), default="")
+        return {u: self._table_names[u] for u in class_iris if self._table_names.get(u)}
 
     async def _load_columns(self, prefix: str, class_iris: list[str]) -> dict[str, list[dict[str, str]]]:
         """Load datatype-property columns for the given (already-safe) class IRIs.
@@ -248,19 +310,28 @@ class OntologyGraphTool:
         classes, while this is a flat ``VALUES ?class`` lookup of column + label +
         range. A common builder would have to carry both shapes, so they are kept
         apart deliberately — unlike the FK query above, which really was a copy.
+        A column deploy named after its table column (``coa:physicalName``) is
+        named by it; any other by its label, as before. An attribute deploy placed
+        by its mapping (``coa:mappedDomain``, written when its domain was moved up
+        to a parent) is a column of the classes the mapping reads it from, not of
+        its domain.
         """
         safe = [u for u in class_iris if _SAFE_URI_RE.match(u)]
         if not safe:
             return {}
         values = " ".join(f"<{u}>" for u in safe)
         graphs = await self._resolve_graph_iris(prefix)
+        # A column deploy marked unmapped has no table column behind it: left out.
         body = f"""            VALUES ?class {{ {values} }}
-            ?col a owl:DatatypeProperty ; rdfs:domain ?class .
+            ?col a owl:DatatypeProperty .
+            {placed_by_mapping("?col", "domain", MAPPED_DOMAIN_IRI, "?class")}
+            {unmapped_property_filter("?col")}
             OPTIONAL {{ ?col rdfs:label ?colLabel }}
+            OPTIONAL {{ ?col <{PHYSICAL_NAME_IRI}> ?colName }}
             OPTIONAL {{ ?col rdfs:range ?range }}
             OPTIONAL {{ ?col rdfs:comment ?colComment }}"""
         sparql = f"""{SPARQL_PREFIXES}
-        SELECT ?class ?col ?colLabel {lang_projection("colLabel")} ?range
+        SELECT ?class ?col ?colLabel {lang_projection("colLabel")} ?colName ?range
                ?colComment {lang_projection("colComment")} WHERE {{
 {graph_scoped_body(body, prefix, graphs)}
         }}"""
@@ -275,10 +346,14 @@ class OntologyGraphTool:
             # ``?col`` is always bound by the query; a row without one (a
             # hand-built fixture) is keyed by its label so it stays its own column.
             col_key = r.get("col", "") or f"label:{r.get('colLabel', '')}"
-            entry = grouped.setdefault((cls, col_key), {"labels": [], "comments": [], "range": r.get("range", "")})
+            entry = grouped.setdefault(
+                (cls, col_key), {"labels": [], "comments": [], "range": r.get("range", ""), "names": set()}
+            )
             label = row_label(r, "colLabel")
             if label[0]:
                 entry["labels"].append(label)
+            if str(r.get("colName") or "").strip():
+                entry["names"].add(str(r["colName"]))
             comment = row_label(r, "colComment")
             if comment[0].strip():
                 entry["comments"].append((comment[0].strip(), comment[1]))
@@ -287,7 +362,11 @@ class OntologyGraphTool:
         preference = current_label_preference()
         by_class: dict[str, list[dict[str, str]]] = {}
         for (cls, col_iri), entry in grouped.items():
-            column = _IDENTIFIER_PREFERENCE.pick(entry["labels"]) or _localname(_col_key_iri(col_iri))
+            column = (
+                min(entry["names"], default="")
+                or _IDENTIFIER_PREFERENCE.pick(entry["labels"])
+                or _localname(_col_key_iri(col_iri))
+            )
             item = {
                 "column": column,
                 "type": _localname(entry["range"]),
@@ -306,6 +385,12 @@ class OntologyGraphTool:
     async def _resolve_label_to_iris(self, prefix: str, label: str) -> list[str]:
         """Resolve a bare table label to its class IRI(s) (may be >1 across DBs).
 
+        A class matches by a label, as it always has, or by the table deploy named it
+        after (``coa:physicalName``): that is the name the walk and the NL-to-SQL
+        documents give a relabelled table, so an agent seeding from one finds it. A
+        class matched by its name that a label did not match is added after the
+        label matches, which keep their order.
+
         Raises:
             ValueError: If ``label`` is not a safe literal. Callers already gate with
                 :func:`_is_safe_label`; re-checking here keeps the interpolation safe
@@ -322,14 +407,18 @@ class OntologyGraphTool:
         if key in self._label_iris:
             return self._label_iris[key]
         graphs = await self._resolve_graph_iris(prefix)
-        body = f"""            ?class a owl:Class ; rdfs:label ?label .
+        body = f"""            {{ ?class a owl:Class ; rdfs:label ?label . }}
+            UNION
+            {{ ?class a owl:Class ; <{PHYSICAL_NAME_IRI}> ?label . BIND(true AS ?byName) }}
             FILTER(LCASE(STR(?label)) = "{_escape_literal(key)}")"""
         sparql = f"""{SPARQL_PREFIXES}
-        SELECT ?class WHERE {{
+        SELECT ?class ?byName WHERE {{
 {graph_scoped_body(body, prefix, graphs)}
         }}"""
         rows = await self._query(sparql, what="label_to_iris")
-        iris = [r["class"] for r in rows if r.get("class") and _SAFE_URI_RE.match(r["class"])]
+        safe = [r for r in rows if r.get("class") and _SAFE_URI_RE.match(r["class"])]
+        iris = [r["class"] for r in safe if not r.get("byName")]
+        iris += [iri for iri in dict.fromkeys(r["class"] for r in safe if r.get("byName")) if iri not in iris]
         self._label_iris[key] = iris
         return iris
 
@@ -381,7 +470,8 @@ class OntologyGraphTool:
 
         Returns:
             One dict per reached table (``iri``, ``table``, ``hop``, ``direction``,
-            ``via``, ``schema``), nearest hop first then by label. ``[]`` for every
+            ``via``, ``schema``), nearest hop first then by table name (the
+            ``coa:physicalName`` deploy wrote, else the label). ``[]`` for every
             degenerate case — no graph template, no safe seed, nothing reached — so a
             walk that finds nothing leaves the caller's prompt byte-identical to
             baseline. Load failures propagate: the caller decides whether a slow
@@ -399,10 +489,11 @@ class OntologyGraphTool:
         prefix = namespace_graph_prefix(self._graph_uri_template, self._namespace)
         edges = await self._load_fk_edges(prefix)
         adjacency, label_of = _build_adjacency(edges)
-        display_of = _display_labels(edges, label_of, current_label_preference())
         reached = _bfs(seeds, adjacency, hops)
 
         seed_set = set(seeds)
+        # Every table reached past the seeds is an end of an edge, so the edges named it.
+        display_of = _display_labels(edges, label_of, current_label_preference())
         # Same order explore_graph reports, and it matters more here: the caller
         # takes a fixed prefix of this list rather than showing an agent all of it,
         # so the ranking — not the hop bound — decides which tables reach the
@@ -444,7 +535,8 @@ class OntologyGraphTool:
 
         The seed is resolved to an exact class IRI through the catalog when the
         table was already retrieved (avoiding a cross-database label collision),
-        otherwise by its label.
+        otherwise by its label or by the table name deploy recorded
+        (``coa:physicalName``).
 
         Args:
             table_name: Seed table name, ideally one ``search_tables`` returned.
@@ -484,11 +576,13 @@ class OntologyGraphTool:
 
         edges = await self._load_fk_edges(prefix)
         adjacency, label_of = _build_adjacency(edges)
-        display_of = _display_labels(edges, label_of, current_label_preference())
         reached = _bfs(seed_iris, adjacency, hops)  # iri -> (hop, via, direction)
+        # Only a seed no edge reaches is not named by the edges.
+        label_of |= await self._load_table_names(prefix, [iri for iri in reached if iri not in label_of])
+        display_of = _display_labels(edges, label_of, current_label_preference())
         ordered = sorted(reached.items(), key=lambda kv: (kv[1][0], label_of.get(kv[0], kv[0])))
 
-        # Tables: nearest hop first, then label; the seed(s) at hop 0 are included
+        # Tables: nearest hop first, then table name; the seed(s) at hop 0 are included
         # so the consumer sees where the walk started.
         table_nodes: list[dict[str, Any]] = []
         if "table" in types:
@@ -606,21 +700,25 @@ def _build_adjacency(edges: list[dict[str, str]]) -> tuple[dict[str, list[dict[s
     directions (a query may join parent→child or child→parent).
 
     A table or FK with several labels arrives as one row per label combination.
-    Rows are grouped by IRI: each table gets one physical identifier (see
-    :data:`_IDENTIFIER_PREFERENCE`) and each ``(op, domain, range)`` edge appears
-    once, in first-seen order.
+    Rows are grouped by IRI: each table gets one physical identifier, the table
+    name deploy recorded (``?domainName`` / ``?rangeName``) when the row has one,
+    else its label (see :data:`_IDENTIFIER_PREFERENCE`), and each
+    ``(op, domain, range)`` edge appears once, in first-seen order.
     """
     labels_of: dict[str, list[tuple[str, str]]] = {}
+    names: dict[str, set[str]] = {}
     edge_rows: dict[tuple[str, str, str], dict[str, list[tuple[str, str]]]] = {}
     for e in edges:
         dom, rng = e.get("domain", ""), e.get("range", "")
         if not dom or not rng:
             continue
-        for iri, var in ((dom, "domainLabel"), (rng, "rangeLabel")):
+        for iri, end in ((dom, "domain"), (rng, "range")):
             candidates = labels_of.setdefault(iri, [])
-            label = row_label(e, var)
+            label = row_label(e, f"{end}Label")
             if label[0]:
                 candidates.append(label)
+            if str(e.get(f"{end}Name") or "").strip():
+                names.setdefault(iri, set()).add(str(e[f"{end}Name"]))
         # A self-referential FK (employee.manager_id → employee) adds two adjacency
         # entries that BFS can never use: the node is already reached at hop 0 by
         # the time its own neighbours are scanned. Keep its label, drop the edges.
@@ -633,7 +731,11 @@ def _build_adjacency(edges: list[dict[str, str]]) -> tuple[dict[str, list[dict[s
         if op_label[0]:
             edge["labels"].append(op_label)
 
-    label_of = {iri: _IDENTIFIER_PREFERENCE.pick(c) or _localname(iri) for iri, c in labels_of.items()}
+    # Deploy writes one name per class; min() keeps a stray second one deterministic.
+    label_of = {
+        iri: min(names.get(iri, ()), default="") or _IDENTIFIER_PREFERENCE.pick(c) or _localname(iri)
+        for iri, c in labels_of.items()
+    }
     adjacency: dict[str, list[dict[str, str]]] = {}
     for (op, dom, rng), edge in edge_rows.items():
         via = (

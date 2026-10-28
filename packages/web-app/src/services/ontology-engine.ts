@@ -16,6 +16,13 @@ import type { ApiClient } from "../components/ApiClientProvider";
 import { collectAllPages } from "../utils/pagination";
 
 export { LIST_ALL_MAX_PAGES } from "../utils/pagination";
+import type { DeployStep } from "./ontology-versions-types";
+import type {
+  AboxMappingDirection,
+  AboxMappingKind,
+  AboxMappingStatus,
+  DomainAboxStatus,
+} from "./abox-types";
 
 // ─── Types ─────────────────────────────────────────────────────────────
 
@@ -86,6 +93,28 @@ export interface Proposal {
    * next successful accept. Legacy failures may instead carry it on
    * status === "pending". */
   accept_error?: string;
+  /** The accept's last step. ``code`` is "RebaseRequired" when a newer version beat a designer
+   * draft's publish; read it only while status === "accept_failed" (a later rebase leaves it). */
+  accept_progress?: { step: string; state: string; code?: string };
+  /** Version this proposal's accept published; set once status === "accepted". */
+  published_version?: number;
+  /** Why the automatic deployment after accept did not start (absent when it started or was not requested).
+   * Also briefly absent right after status flips to "accepted": the accept
+   * worker records the deploy outcome (this or auto_deploy_id) only afterwards. */
+  auto_deploy_held?: AutoDeployHeld;
+  /** Id of the deployment that accept started automatically (absent when none was started). */
+  auto_deploy_id?: string;
+  /** Ontology designer draft state; absent until the proposal is opened in the designer.
+   * Its Turtle editors are then read-only and accept needs ``expectedRevision``. */
+  studio?: ProposalStudio | null;
+}
+
+/** The ``studio`` field of a proposal open in the Ontology designer. */
+export interface ProposalStudio {
+  base_version: number | null;
+  revision: number;
+  opened_at: string;
+  opened_by: string;
 }
 
 /** Response from POST /accept (202 Accepted).
@@ -430,14 +459,21 @@ export async function acceptProposal(
   apiClient: ApiClient,
   namespace: string,
   proposalId: string,
-  opts?: { ontology_id?: string },
+  opts?: { ontology_id?: string; deploy?: boolean; expectedRevision?: number },
 ): Promise<AcceptResult> {
-  const body = opts?.ontology_id
-    ? { ontology_id: opts.ontology_id }
-    : undefined;
+  const body: Record<string, unknown> = {};
+  if (opts?.ontology_id) body.ontology_id = opts.ontology_id;
+  if (opts?.deploy !== undefined) body.deploy = opts.deploy;
+  // Required by the engine for a proposal open in the Ontology designer: the reviewed revision.
+  // Errors then: 422 ExpectedRevisionRequired, 409 DraftConflict, 409 RebaseRequired. A newer
+  // version landing after those checks fails the accept later: status "accept_failed" with
+  // accept_progress.code "RebaseRequired". That code is only meaningful while the status is
+  // "accept_failed": the row can keep the old one after a successful rebase.
+  if (opts?.expectedRevision !== undefined)
+    body.expectedRevision = opts.expectedRevision;
   return apiClient.post<AcceptResult>(
     `/namespaces/${encodeURIComponent(namespace)}/proposals/${encodeURIComponent(proposalId)}/accept`,
-    body ?? {},
+    body,
   );
 }
 
@@ -530,6 +566,8 @@ export interface DatatypeRepairResult {
   repaired_count: number;
   changes: Array<{ found: string; canonical: string }>;
   dry_run?: boolean;
+  /** The draft's revision after a repair of a proposal open in the Ontology designer (not on a preview). */
+  revision?: number;
 }
 
 /**
@@ -544,11 +582,18 @@ export async function repairProposalDatatypes(
   apiClient: ApiClient,
   namespace: string,
   proposalId: string,
-  opts?: { dryRun?: boolean },
+  opts?: { dryRun?: boolean; expectedRevision?: number },
 ): Promise<DatatypeRepairResult> {
+  const body: Record<string, unknown> = {};
+  if (opts?.dryRun) body.dry_run = true;
+  // Required to repair (not to preview) a proposal open in the Ontology designer, whose draft is
+  // changed instead of the stored Turtle. Errors: 422 ExpectedRevisionRequired, 409 DraftConflict,
+  // ProposalNotEditable and InvalidChange.
+  if (opts?.expectedRevision !== undefined)
+    body.expectedRevision = opts.expectedRevision;
   return apiClient.post<DatatypeRepairResult>(
     `/namespaces/${encodeURIComponent(namespace)}/proposals/${encodeURIComponent(proposalId)}/repair-datatypes`,
-    opts?.dryRun ? { dry_run: true } : {},
+    body,
   );
 }
 
@@ -1038,5 +1083,363 @@ export async function uploadOntologyFile(
   return apiClient.post(
     `/namespaces/${encodeURIComponent(namespace)}/ontologies/${encodeURIComponent(ontologyId)}/ingest-from-s3`,
     { s3_key: s3Key, title, format, ontology_type: "user_uploaded" },
+  );
+}
+
+// ─── Ontology versions ─────────────────────────────────────────────────
+
+export type OntologyVersionStatus =
+  | "PUBLISHING"
+  | "PUBLISHED"
+  | "PUBLISH_FAILED";
+export type OntologyDeploymentStatus =
+  | "DEPLOYING"
+  | "DEPLOYED"
+  | "DEPLOY_FAILED";
+export type SchemaKind = "classes" | "objectProperties" | "datatypeProperties";
+
+export interface DiffCounts {
+  added: number;
+  removed: number;
+  changed: number;
+}
+
+export interface OntologyVersion {
+  version: number;
+  status: OntologyVersionStatus;
+  parentVersion?: number | null;
+  ontologyId: string;
+  source: "PROPOSAL" | "BOOTSTRAP";
+  sourceProposalId?: string | null;
+  createdBy?: string | null;
+  createdAt?: string | null;
+  diffSummary?: Partial<Record<SchemaKind, DiffCounts>> | null;
+  error?: string | null;
+}
+
+export interface OntologyDeployment {
+  deploymentId: string;
+  version: number;
+  status: OntologyDeploymentStatus;
+  partial: boolean;
+  /** Finished steps only; a step still running has no entry yet. */
+  progress: Partial<Record<DeployStep, "done" | "failed">>;
+  requestedBy?: string | null;
+  error?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface BreakingMetric {
+  metricId: string;
+  name: string;
+  missingClassIri: string;
+}
+
+export interface AutoDeployHeld {
+  reason: "BREAKING_METRICS" | "DEPLOY_IN_PROGRESS" | "DEPLOY_FAILED_TO_START";
+  metrics?: BreakingMetric[];
+  error?: string;
+}
+
+export interface OntologyVersionList {
+  versions: OntologyVersion[];
+  /** Set on a single page when more versions follow; absent once all pages are collected. */
+  nextToken?: string;
+  activeVersion?: number | null;
+  latestDeployment?: OntologyDeployment | null;
+  /**
+   * The latest deployment that may have changed what is served: attempts that failed
+   * before their swap left serving untouched and are skipped. `partial` here means
+   * serving is still half-swapped, whatever the latest attempt did.
+   */
+  servingDeployment?: OntologyDeployment | null;
+  /** Versions at or below this belong to a deleted ontology and cannot be deployed. */
+  resetAfterVersion?: number | null;
+}
+
+export interface OntologyVersionDetail {
+  version: OntologyVersion;
+  /** Snapshot manifest (snapshot.build_manifest); `{}` unless the version is PUBLISHED. */
+  manifest: {
+    formatVersion?: number;
+    tripleCount?: number;
+    files?: Record<string, { sha256: string; bytes: number }>;
+  } & Record<string, unknown>;
+  diff: Partial<
+    Record<
+      SchemaKind,
+      { added: string[]; removed: string[]; changed: string[] }
+    >
+  >;
+  downloadUrls: Record<string, string>;
+  breakingMetrics: BreakingMetric[];
+}
+
+function ontologyPath(namespace: string): string {
+  return `/namespaces/${encodeURIComponent(namespace)}/ontology`;
+}
+
+/** One page of ListOntologyVersions; the namespace-wide fields are on every page. */
+export async function listOntologyVersionsPage(
+  apiClient: ApiClient,
+  namespace: string,
+  opts?: { nextToken?: string; maxResults?: number },
+): Promise<OntologyVersionList> {
+  const page = await apiClient.get<Partial<OntologyVersionList> | undefined>(
+    `${ontologyPath(namespace)}/versions${qs(opts ?? {})}`,
+  );
+  return { ...page, versions: page?.versions ?? [] };
+}
+
+/**
+ * Every version of the namespace, newest first, by following ``nextToken`` to
+ * the end. The namespace-wide fields come from the last page read, the most
+ * recent answer.
+ */
+export async function listOntologyVersions(
+  apiClient: ApiClient,
+  namespace: string,
+): Promise<OntologyVersionList> {
+  let last: OntologyVersionList = { versions: [] };
+  const versions = await collectAllPages(
+    "ListOntologyVersions",
+    async (nextToken) => {
+      last = await listOntologyVersionsPage(apiClient, namespace, {
+        nextToken,
+      });
+      return { items: last.versions, nextToken: last.nextToken };
+    },
+  );
+  return {
+    activeVersion: last.activeVersion,
+    latestDeployment: last.latestDeployment,
+    servingDeployment: last.servingDeployment,
+    resetAfterVersion: last.resetAfterVersion,
+    versions,
+  };
+}
+
+export async function getOntologyVersion(
+  apiClient: ApiClient,
+  namespace: string,
+  version: number,
+): Promise<OntologyVersionDetail> {
+  return apiClient.get<OntologyVersionDetail>(
+    `${ontologyPath(namespace)}/versions/${version}`,
+  );
+}
+
+export async function deployOntologyVersion(
+  apiClient: ApiClient,
+  namespace: string,
+  version: number,
+  acknowledgedBreakingMetrics: string[] = [],
+): Promise<{ deploymentId: string }> {
+  return apiClient.post<{ deploymentId: string }>(
+    `${ontologyPath(namespace)}/versions/${version}/deploy`,
+    { acknowledgedBreakingMetrics },
+  );
+}
+
+export async function getOntologyDeployment(
+  apiClient: ApiClient,
+  namespace: string,
+  deploymentId: string,
+): Promise<OntologyDeployment> {
+  return apiClient.get<OntologyDeployment>(
+    `${ontologyPath(namespace)}/deployments/${encodeURIComponent(deploymentId)}`,
+  );
+}
+
+// ─── Domain ABox ───────────────────────────────────────────────────────
+
+export interface DomainAboxCounts {
+  instances: number;
+  relations: number;
+  attributes: number;
+  evidence: number;
+}
+
+export interface DomainAbox {
+  status: DomainAboxStatus;
+  /** Whether the ABox was built for the active ontology version. */
+  current: boolean;
+  conformsToVersion?: number | null;
+  activeVersion?: number | null;
+  buildId?: string | null;
+  builtAt?: string | null;
+  counts: DomainAboxCounts;
+  classCounts: { classIri: string; label: string; count: number }[];
+  mappingRevision?: string | null;
+  /** A rebuild is queued. */
+  pending: boolean;
+  lastError?: string | null;
+}
+
+export interface DomainInstanceSummary {
+  iri: string;
+  classIri: string;
+  classLabel: string;
+  label: string;
+  altLabels: string[];
+  evidenceCount: number;
+}
+
+export interface DomainInstanceList {
+  instances: DomainInstanceSummary[];
+  nextToken?: string | null;
+}
+
+/** The other end of an instance's link. */
+export interface DomainLinked {
+  iri: string;
+  label: string;
+  classIri: string;
+}
+
+export interface DomainInstance {
+  iri: string;
+  classes: { iri: string; label: string }[];
+  label: string;
+  altLabels: string[];
+  /** `free` marks a value kept under its lexical predicate, not a TBox property. `evidence` holds chunk ids. */
+  attributes: {
+    property: string;
+    label: string;
+    value: string;
+    free: boolean;
+    evidence: string[];
+  }[];
+  outgoing: {
+    property: string;
+    label: string;
+    target: DomainLinked;
+    evidence: string[];
+  }[];
+  incoming: { property: string; label: string; source: DomainLinked }[];
+  evidence: {
+    chunkId: string;
+    docSourceId: string;
+    sourceKey: string;
+    text: string;
+  }[];
+  /** Which lists the engine cut at its cap. Optional: older engines do not send it. */
+  truncated?: { incoming: boolean; evidence: boolean };
+}
+
+export interface AboxMapping {
+  id: string;
+  kind: AboxMappingKind;
+  /** class: [lexical class]; relation: [lexical relation, subject class IRI, object class IRI]; attribute: [subject class IRI, lexical predicate]. */
+  key: string[];
+  /** A TBox term IRI, or `ignore` (class and relation rows) / `free` (attribute rows). */
+  target: string;
+  targetLabel: string;
+  direction: AboxMappingDirection;
+  origin: "auto" | "manual";
+  status: AboxMappingStatus;
+  rationale: string;
+  decidedForVersion?: number | null;
+  updatedBy: string;
+  updatedAt: string;
+}
+
+function aboxPath(namespace: string): string {
+  return `/namespaces/${encodeURIComponent(namespace)}/abox`;
+}
+
+export async function getDomainAbox(
+  apiClient: ApiClient,
+  namespace: string,
+): Promise<DomainAbox> {
+  return apiClient.get<DomainAbox>(aboxPath(namespace));
+}
+
+export async function listDomainInstances(
+  apiClient: ApiClient,
+  namespace: string,
+  opts: {
+    classIri?: string;
+    q?: string;
+    maxResults?: number;
+    nextToken?: string;
+  } = {},
+): Promise<DomainInstanceList> {
+  return apiClient.get<DomainInstanceList>(
+    `${aboxPath(namespace)}/instances${qs(opts)}`,
+  );
+}
+
+/** The IRI goes in the query string: a `#` in a path segment is refused by API Gateway. */
+export async function getDomainInstance(
+  apiClient: ApiClient,
+  namespace: string,
+  iri: string,
+): Promise<DomainInstance> {
+  return apiClient.get<DomainInstance>(
+    `${aboxPath(namespace)}/instance${qs({ iri })}`,
+  );
+}
+
+/** Page size for {@link listAboxMappings}: the contract's maximum, so a table needs few calls. */
+const ABOX_MAPPINGS_PAGE_SIZE = 200;
+
+/** List every mapping row of the filter by following ``nextToken`` to the end. */
+export async function listAboxMappings(
+  apiClient: ApiClient,
+  namespace: string,
+  opts: { kind?: AboxMappingKind; status?: AboxMappingStatus } = {},
+): Promise<{ mappings: AboxMapping[] }> {
+  const mappings = await collectAllPages(
+    "ListAboxMappings",
+    async (nextToken) => {
+      const page = await apiClient.get<{
+        mappings: AboxMapping[];
+        nextToken?: string;
+      }>(
+        `${aboxPath(namespace)}/mappings${qs({
+          ...opts,
+          maxResults: ABOX_MAPPINGS_PAGE_SIZE,
+          nextToken,
+        })}`,
+      );
+      return { items: page.mappings, nextToken: page.nextToken };
+    },
+  );
+  return { mappings };
+}
+
+/** Pin a mapping row to a human decision; the engine queues a rebuild. */
+export async function updateAboxMapping(
+  apiClient: ApiClient,
+  namespace: string,
+  mappingId: string,
+  body: { target: string; direction?: AboxMappingDirection },
+): Promise<AboxMapping> {
+  return apiClient.put<AboxMapping>(
+    `${aboxPath(namespace)}/mappings/${encodeURIComponent(mappingId)}`,
+    body,
+  );
+}
+
+/** Hand a manual mapping row back to the matcher; the engine queues a rebuild. */
+export async function resetAboxMapping(
+  apiClient: ApiClient,
+  namespace: string,
+  mappingId: string,
+): Promise<AboxMapping> {
+  return apiClient.del<AboxMapping>(
+    `${aboxPath(namespace)}/mappings/${encodeURIComponent(mappingId)}`,
+  );
+}
+
+export async function rebuildDomainAbox(
+  apiClient: ApiClient,
+  namespace: string,
+): Promise<{ requested: boolean }> {
+  return apiClient.post<{ requested: boolean }>(
+    `${aboxPath(namespace)}/rebuild`,
+    {},
   );
 }

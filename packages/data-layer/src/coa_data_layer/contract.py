@@ -82,6 +82,12 @@ GRAPH_TRAVERSE_DIRECTIONS: frozenset[str] = frozenset({"outgoing", "incoming", "
 GRAPH_TRAVERSE_DIRECTION_DEFAULT = "both"
 # ``relationshipFilter``: FilterValueList (bounds above).
 
+# ── RunSparqlQuery ───────────────────────────────────────────────────────────
+# ``sparql``: @length(min: 1, max: 20000). The Context Manager checks the same
+# bound again (its guard parses the query; this one only measures it).
+RUN_SPARQL_QUERY_SPARQL_MIN_LENGTH = 1
+RUN_SPARQL_QUERY_SPARQL_MAX_LENGTH = 20_000
+
 # ── DescribeSchema ───────────────────────────────────────────────────────────
 # ``maxResults`` (query string): @range(min: 1, max: 1000)
 DESCRIBE_SCHEMA_MAX_RESULTS_MIN = 1

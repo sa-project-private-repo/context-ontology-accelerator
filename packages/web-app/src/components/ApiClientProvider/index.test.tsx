@@ -3,7 +3,7 @@
 
 import React from "react";
 import { render } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientProvider, ApiError, useApiClient } from "./index";
 import { RuntimeConfigContext } from "../RuntimeContext";
 import { OIDCProvider } from "@auth";
@@ -142,5 +142,168 @@ describe("ApiClientProvider error envelopes", () => {
     expect(error.status).toBe(403);
     expect(error.code).toBe("FORBIDDEN");
     expect(error.message).toContain("not authorized");
+  });
+});
+
+function respondWith(status: number, body: string) {
+  vi.mocked(fetch).mockResolvedValue(
+    new Response(body, {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+}
+
+async function rejection(promise: Promise<unknown>): Promise<ApiError> {
+  const err = await promise.then(
+    () => {
+      throw new Error("expected the request to reject");
+    },
+    (e: unknown) => e,
+  );
+  if (!(err instanceof ApiError)) throw new Error("expected an ApiError");
+  return err;
+}
+
+describe("ApiClientProvider request errors", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    vi.mocked(OIDCProvider.build).mockReturnValue({
+      getIdToken: vi.fn().mockResolvedValue("id-token"),
+    } as unknown as OIDCProvider);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps a top-level code and message", async () => {
+    respondWith(400, JSON.stringify({ code: "BAD", message: "Nope" }));
+    const err = await rejection(renderClient().get("/x"));
+    expect(err.status).toBe(400);
+    expect(err.code).toBe("BAD");
+    expect(err.message).toBe("Nope");
+  });
+
+  it("uses a string `detail` as the message", async () => {
+    respondWith(
+      409,
+      JSON.stringify({ detail: "Another deployment is running" }),
+    );
+    const err = await rejection(renderClient().post("/deploy", {}));
+    expect(err.status).toBe(409);
+    expect(err.code).toBe("UNKNOWN_ERROR");
+    expect(err.message).toBe("Another deployment is running");
+    expect(err.body).toEqual({ detail: "Another deployment is running" });
+  });
+
+  it("uses `detail.message` and exposes the structured body", async () => {
+    const breakingMetrics = [
+      {
+        metricId: "revenue",
+        name: "revenue",
+        missingClassIri: "https://e/o#Order",
+      },
+    ];
+    respondWith(
+      409,
+      JSON.stringify({
+        detail: { message: "Deploying breaks 1 metric", breakingMetrics },
+      }),
+    );
+    const err = await rejection(renderClient().post("/deploy", {}));
+    expect(err.message).toBe("Deploying breaks 1 metric");
+    expect(err.body).toEqual({
+      detail: { message: "Deploying breaks 1 metric", breakingMetrics },
+    });
+  });
+
+  it("carries the body on a 403 too", async () => {
+    respondWith(403, JSON.stringify({ detail: "Forbidden by policy" }));
+    const err = await rejection(renderClient().get("/x"));
+    expect(err.status).toBe(403);
+    expect(err.code).toBe("FORBIDDEN");
+    expect(err.message).toBe("Forbidden by policy");
+    expect(err.body).toEqual({ detail: "Forbidden by policy" });
+  });
+
+  it("leaves the body undefined for a non-JSON error", async () => {
+    respondWith(502, "Bad gateway");
+    const err = await rejection(renderClient().get("/x"));
+    expect(err.message).toBe("API GET /x failed (502): Bad gateway");
+    expect(err.body).toBeUndefined();
+  });
+
+  it("uses `detail.code` when there is no top-level code", async () => {
+    respondWith(
+      409,
+      JSON.stringify({ detail: { code: "LOCKED", message: "Busy" } }),
+    );
+    const err = await rejection(renderClient().post("/deploy", {}));
+    expect(err.code).toBe("LOCKED");
+    expect(err.message).toBe("Busy");
+  });
+
+  it("prefers a top-level code over `detail.code`", async () => {
+    respondWith(
+      409,
+      JSON.stringify({ code: "TOP", detail: { code: "NESTED", message: "m" } }),
+    );
+    const err = await rejection(renderClient().post("/deploy", {}));
+    expect(err.code).toBe("TOP");
+  });
+});
+
+/** The client's optional `getText`, which this provider always supplies. */
+function getText(path: string): Promise<string> {
+  const { getText: fetchText } = renderClient();
+  if (!fetchText) throw new Error("provider did not supply getText");
+  return fetchText(path);
+}
+
+describe("ApiClientProvider getText errors", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    vi.mocked(OIDCProvider.build).mockReturnValue({
+      getIdToken: vi.fn().mockResolvedValue("id-token"),
+    } as unknown as OIDCProvider);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps a top-level code and message", async () => {
+    respondWith(400, JSON.stringify({ code: "BAD", message: "Nope" }));
+    const err = await rejection(getText("/download"));
+    expect(err.code).toBe("BAD");
+    expect(err.message).toBe("Nope");
+  });
+
+  it("uses a string `detail` as the message", async () => {
+    respondWith(404, JSON.stringify({ detail: "Version 9 not found" }));
+    const err = await rejection(getText("/download"));
+    expect(err.status).toBe(404);
+    expect(err.message).toBe("Version 9 not found");
+    expect(err.body).toEqual({ detail: "Version 9 not found" });
+  });
+
+  it("uses `detail.code` and `detail.message`", async () => {
+    respondWith(
+      409,
+      JSON.stringify({
+        detail: { code: "INCOMPLETE", message: "No manifest" },
+      }),
+    );
+    const err = await rejection(getText("/download"));
+    expect(err.code).toBe("INCOMPLETE");
+    expect(err.message).toBe("No manifest");
+  });
+
+  it("falls back to the raw text for a non-JSON error", async () => {
+    respondWith(502, "Bad gateway");
+    const err = await rejection(getText("/download"));
+    expect(err.message).toBe("API GET /download failed (502): Bad gateway");
+    expect(err.body).toBeUndefined();
   });
 });

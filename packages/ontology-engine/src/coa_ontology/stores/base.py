@@ -17,7 +17,7 @@ Two golden rules:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -229,6 +229,7 @@ class GraphStore(Protocol):
         comments: list[str] | None = None,
         super_classes: list[str] | None = None,
         is_mapped: bool = False,
+        physical_name: str = "",
     ) -> dict:
         """Persist a class into an ontology's named graph.
 
@@ -239,6 +240,8 @@ class GraphStore(Protocol):
             comments: Definitions/comments for the class.
             super_classes: Parent class URIs (``rdfs:subClassOf`` targets).
             is_mapped: Whether the class is R2RML-mapped (SQL-backed, Tier-2).
+            physical_name: The one table the R2RML mapping reads the class from, or
+                ``""`` (unmapped, or read from several tables).
 
         Returns:
             The stored class as a dict.
@@ -253,6 +256,10 @@ class GraphStore(Protocol):
         comment: str = "",
         domains: list[str] | None = None,
         ranges: list[str] | None = None,
+        unmapped: bool = False,
+        physical_name: str = "",
+        mapped_domains: Sequence[str] = (),
+        mapped_ranges: Sequence[str] = (),
     ) -> dict:
         """Persist a property into an ontology's named graph.
 
@@ -263,6 +270,15 @@ class GraphStore(Protocol):
             comment: Definition/comment for the property.
             domains: Domain class URIs for the property.
             ranges: Range URIs (class IRIs for object properties, datatypes otherwise).
+            unmapped: Whether no R2RML mapping maps the property although one of its
+                domains (or, for a relationship, one of its ranges) is mapped (so Tier 2
+                must not offer it).
+            physical_name: The one column the R2RML mapping reads the property from,
+                or ``""``.
+            mapped_domains: The classes whose TriplesMaps map the property, when its
+                domains are not those classes (empty otherwise).
+            mapped_ranges: The classes a join of the relationship reaches, when its
+                ranges are not those classes (empty otherwise).
 
         Returns:
             The stored property as a dict.

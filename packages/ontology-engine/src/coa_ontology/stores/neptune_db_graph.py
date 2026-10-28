@@ -227,7 +227,12 @@ def _sparql_query(query: str) -> dict:
     return _with_oom_retry("neptune sparql query", _once)
 
 
-def _sparql_update(update: str) -> None:
+def _sparql_update(update: str, *, retry_oom: bool = True) -> None:
+    """Run a SPARQL update, retrying a ``MemoryLimitExceededException``.
+
+    ``retry_oom=False`` sends it once, for a caller whose own retry must check something
+    before each attempt (an ABox build checks its lock).
+    """
     if not NDB_ENDPOINT:
         raise RuntimeError("NDB_ENDPOINT not set — configure your Neptune DB endpoint")
     import time as _t
@@ -254,10 +259,13 @@ def _sparql_update(update: str) -> None:
                 _raise_for_neptune_status(r)
             log.info("SPARQL update %.0fms  (body=%d bytes)", elapsed_ms, len(body))
 
-    _with_oom_retry("neptune sparql update", _once)
+    if retry_oom:
+        _with_oom_retry("neptune sparql update", _once)
+    else:
+        _once()
 
 
-def _gsp_post_turtle(graph_uri: str, turtle: str) -> dict:
+def _gsp_post_turtle(graph_uri: str, turtle: str, *, retry_oom: bool = True) -> dict:
     """POST a Turtle document into a named graph via Neptune's GSP endpoint.
 
     Uses the SPARQL Graph Store Protocol (``/sparql/gsp``). Neptune DB
@@ -266,7 +274,8 @@ def _gsp_post_turtle(graph_uri: str, turtle: str) -> dict:
     into SPARQL INSERT DATA batches (which hit an 8 KB query size limit).
 
     ``graph_uri`` goes into the ``?graph=`` query parameter. The special
-    value ``"default"`` writes to the default graph.
+    value ``"default"`` writes to the default graph. ``retry_oom=False`` sends
+    it once, as for ``_sparql_update``.
     """
     if not NDB_ENDPOINT:
         raise RuntimeError("NDB_ENDPOINT not set — configure your Neptune DB endpoint")
@@ -293,7 +302,7 @@ def _gsp_post_turtle(graph_uri: str, turtle: str) -> dict:
                 _raise_for_neptune_status(r)
         return elapsed_ms
 
-    elapsed_ms = _with_oom_retry("neptune gsp post", _once)
+    elapsed_ms = _with_oom_retry("neptune gsp post", _once) if retry_oom else _once()
     log.info("GSP POST %.0fms  (turtle=%d bytes, graph=%s)", elapsed_ms, len(body_bytes), graph_uri)
     return {
         "graph_uri": graph_uri,
@@ -391,6 +400,16 @@ def _is_storable_iri(s) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _physical_name_triple(subject: str, name: str) -> str:
+    """``<subject> coa:physicalName "name"``: the table or column a mapped term is read from.
+
+    Derived from the R2RML at projection time (see ``catalog.ingest.projection_specs``),
+    like ``coa:isMapped``. Serve's NL-to-SQL foreign-key walk names a table or column by
+    it, so a relabelled term keeps its physical name there.
+    """
+    return f'{_iri(subject)} {_iri(_SCL + "physicalName")} "{_esc(name)}" .'
 
 
 def _local_name(uri: str) -> str:
@@ -647,7 +666,9 @@ class NeptuneDBGraphStore(GraphStore):
     _INSERT_BATCH_TRIPLES = 5000
     _INSERT_BATCH_BYTES = 40 * 1024 * 1024
 
-    def _class_triples(self, ontology_uri, class_uri, labels, comments, super_classes, is_mapped) -> list[str]:
+    def _class_triples(
+        self, ontology_uri, class_uri, labels, comments, super_classes, is_mapped, physical_name=""
+    ) -> list[str]:
         """Serialize one class's projected triples (no I/O).
 
         Shared by :meth:`store_class` and :meth:`store_classes_batch` so the two
@@ -668,6 +689,8 @@ class NeptuneDBGraphStore(GraphStore):
                 f"{_iri(class_uri)} {_iri(_SCL + 'isMapped')} "
                 f'"true"^^{_iri("http://www.w3.org/2001/XMLSchema#boolean")} .'
             )
+        if physical_name:
+            triples.append(_physical_name_triple(class_uri, physical_name))
         for lbl in labels or []:
             triples.append(f'{_iri(class_uri)} {_iri(RDFS + "label")} "{_esc(lbl)}" .')
         for cmt in comments or []:
@@ -684,7 +707,19 @@ class NeptuneDBGraphStore(GraphStore):
             triples.append(f"{_iri(class_uri)} {_iri(RDFS + 'subClassOf')} {_iri(sup)} .")
         return triples
 
-    def _property_triples(self, ontology_uri, prop_uri, label, comment, domains, ranges) -> list[str]:
+    def _property_triples(
+        self,
+        ontology_uri,
+        prop_uri,
+        label,
+        comment,
+        domains,
+        ranges,
+        unmapped=False,
+        physical_name="",
+        mapped_domains=(),
+        mapped_ranges=(),
+    ) -> list[str]:
         """Serialize one property's projected triples (no I/O).
 
         Shared by :meth:`store_property` and :meth:`store_properties_batch`.
@@ -692,6 +727,25 @@ class NeptuneDBGraphStore(GraphStore):
         triples = [
             f"{_iri(prop_uri)} {_iri(WB + 'definedBy')} {_iri(ontology_uri)} .",
         ]
+        # Tier-2 marker on a property that no R2RML predicate-object map maps
+        # although one of its domains (or, for a relationship, one of its ranges) is
+        # mapped (see catalog.ingest.projection_specs): serve leaves it out of the
+        # structured prompts. Only "false" is ever written on a property; one without
+        # the triple is served as before, which keeps namespaces deployed before this
+        # marker existed unchanged.
+        if unmapped:
+            triples.append(
+                f"{_iri(prop_uri)} {_iri(_SCL + 'isMapped')} "
+                f'"false"^^{_iri("http://www.w3.org/2001/XMLSchema#boolean")} .'
+            )
+        if physical_name:
+            triples.append(_physical_name_triple(prop_uri, physical_name))
+        # Where the mapping puts a property whose domain or range says otherwise (see
+        # catalog.ingest.projection_specs): serve's NL-to-SQL foreign-key walk places it by these.
+        for predicate, placed in (("mappedDomain", mapped_domains), ("mappedRange", mapped_ranges)):
+            for c in placed or ():
+                if _is_storable_iri(c):
+                    triples.append(f"{_iri(prop_uri)} {_iri(_SCL + predicate)} {_iri(c)} .")
         if label:
             triples.append(f'{_iri(prop_uri)} {_iri(RDFS + "label")} "{_esc(label)}" .')
         if comment:
@@ -819,6 +873,7 @@ class NeptuneDBGraphStore(GraphStore):
         comments=None,
         super_classes=None,
         is_mapped=False,
+        physical_name="",
     ):
         """Project a class (and its labels, comments, superclasses) into a graph.
 
@@ -830,12 +885,16 @@ class NeptuneDBGraphStore(GraphStore):
             super_classes: Parent class URIs; blank-node superclasses are skipped.
             is_mapped: When True, emit the ``coa:isMapped`` Tier-2 answerability
                 marker (SQL-backed class); never emitted as false.
+            physical_name: When set, emit ``coa:physicalName``: the one table the
+                class is read from.
 
         Returns:
             A dict with the stored class URI and owning ontology id.
         """
         graph_uri = self._graph_for(ontology_uri)
-        triples = self._class_triples(ontology_uri, class_uri, labels, comments, super_classes, is_mapped)
+        triples = self._class_triples(
+            ontology_uri, class_uri, labels, comments, super_classes, is_mapped, physical_name
+        )
         self._emit_insert(graph_uri, triples)
         return {"uri": class_uri, "ontology_id": ontology_uri}
 
@@ -846,7 +905,7 @@ class NeptuneDBGraphStore(GraphStore):
         are accumulated and flushed in a few SPARQL UPDATEs instead of one HTTP
         round-trip per class. Each ``classes`` item is a dict with keys
         ``class_uri`` and optional ``labels``/``comments``/``super_classes``/
-        ``is_mapped`` (same semantics as :meth:`store_class`).
+        ``is_mapped``/``physical_name`` (same semantics as :meth:`store_class`).
 
         Returns the number of classes projected.
         """
@@ -859,6 +918,7 @@ class NeptuneDBGraphStore(GraphStore):
                 c.get("comments"),
                 c.get("super_classes"),
                 c.get("is_mapped", False),
+                c.get("physical_name", ""),
             )
             for c in classes
         ]
@@ -873,6 +933,10 @@ class NeptuneDBGraphStore(GraphStore):
         comment="",
         domains=None,
         ranges=None,
+        unmapped=False,
+        physical_name="",
+        mapped_domains=(),
+        mapped_ranges=(),
     ):
         """Project a property (label, comment, domains, ranges) into a graph.
 
@@ -883,12 +947,32 @@ class NeptuneDBGraphStore(GraphStore):
             comment: ``rdfs:comment`` value for the property.
             domains: Domain class URIs; blank-node domains are skipped.
             ranges: Range URIs (class IRIs or datatypes); blank-node ranges are skipped.
+            unmapped: When True, emit ``coa:isMapped false``: no R2RML mapping maps the
+                property although one of its domains (or, for a relationship, one of its
+                ranges) is mapped. Never emitted as true.
+            physical_name: When set, emit ``coa:physicalName``: the one column the
+                property is read from.
+            mapped_domains: Emit ``coa:mappedDomain`` for each: a class whose TriplesMaps
+                map the property, given when the property's domains are not those classes.
+            mapped_ranges: Emit ``coa:mappedRange`` for each: a class a join of the
+                relationship reaches, given when its ranges are not those classes.
 
         Returns:
             A dict with the stored property URI and owning ontology id.
         """
         graph_uri = self._graph_for(ontology_uri)
-        triples = self._property_triples(ontology_uri, prop_uri, label, comment, domains, ranges)
+        triples = self._property_triples(
+            ontology_uri,
+            prop_uri,
+            label,
+            comment,
+            domains,
+            ranges,
+            unmapped,
+            physical_name,
+            mapped_domains,
+            mapped_ranges,
+        )
         self._emit_insert(graph_uri, triples)
         return {"uri": prop_uri, "ontology_id": ontology_uri}
 
@@ -897,8 +981,9 @@ class NeptuneDBGraphStore(GraphStore):
 
         The property counterpart to :meth:`store_classes_batch`. Each
         ``properties`` item is a dict with key ``prop_uri`` and optional
-        ``label``/``comment``/``domains``/``ranges`` (same semantics as
-        :meth:`store_property`). Returns the number of properties projected.
+        ``label``/``comment``/``domains``/``ranges``/``unmapped``/``physical_name``/
+        ``mapped_domains``/``mapped_ranges`` (same semantics as :meth:`store_property`).
+        Returns the number of properties projected.
         """
         graph_uri = self._graph_for(ontology_uri)
         groups = [
@@ -909,6 +994,10 @@ class NeptuneDBGraphStore(GraphStore):
                 p.get("comment", ""),
                 p.get("domains"),
                 p.get("ranges"),
+                p.get("unmapped", False),
+                p.get("physical_name", ""),
+                p.get("mapped_domains", ()),
+                p.get("mapped_ranges", ()),
             )
             for p in properties
         ]
@@ -1129,9 +1218,11 @@ class NeptuneDBGraphStore(GraphStore):
                     bucket.append(o_value)
             elif p == scl_is_mapped:
                 # Tier-2 R2RML-answerability marker (written by store_class as
-                # ``"true"^^xsd:boolean``). Surfaced as a first-class boolean so
-                # callers/tests can assert answerability without parsing edges.
-                # Absent triple == unmapped == False (structured classes only).
+                # ``"true"^^xsd:boolean``, and by store_property as ``"false"`` on a
+                # property no mapping maps although one of its domains, or for a
+                # relationship one of its ranges, is mapped). Surfaced as a first-class
+                # boolean so callers/tests can assert answerability without parsing
+                # edges. Absent triple == unmapped == False (structured classes only).
                 is_mapped = str(o_value).lower() == "true"
             else:
                 edges.append({"p": p, "o": o_value, "o_type": o_type, "direction": "outgoing"})

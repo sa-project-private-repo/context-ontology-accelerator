@@ -16,10 +16,14 @@ export type ButtonWithHintProps = ButtonProps & { hint: ReactNode };
  *
  * Extracted from the scan flow (SourceDetail) so the induction flow can use the
  * same idiom for its action buttons (Save changes, Validate, Accept, etc.).
+ *
+ * A button that is off with a `disabledReason` shows that reason (the Button's
+ * own tooltip) instead of the hint, so the two never show at once.
  */
 export function ButtonWithHint({ hint, ...buttonProps }: ButtonWithHintProps) {
   const [showHint, setShowHint] = useState(false);
   const wrapperRef = useRef<HTMLSpanElement>(null);
+  const saysWhyOff = !!buttonProps.disabled && !!buttonProps.disabledReason;
   return (
     <span
       ref={wrapperRef}
@@ -29,7 +33,7 @@ export function ButtonWithHint({ hint, ...buttonProps }: ButtonWithHintProps) {
       onBlur={() => setShowHint(false)}
     >
       <Button {...buttonProps} />
-      {showHint && (
+      {showHint && !saysWhyOff && (
         <Tooltip
           content={hint}
           position="bottom"

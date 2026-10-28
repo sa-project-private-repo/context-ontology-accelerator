@@ -1,11 +1,16 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""VKG Reload Lambda — provisions or redeploys per-namespace VKG service on ontology publish.
+"""VKG Reload Lambda: provisions, redeploys or scales to zero a per-namespace VKG service on ontology deploy.
 
 On every reload, registers a new task definition revision with the latest container
 image (from SSM, written by CDK deploy) before forcing a new deployment. This ensures
 ontology reloads always pick up the latest VKG image, not a stale one from provision time.
+
+What to do is decided by the VKG files in ``latest/``, not by the event's
+``version``: events are async and retried, so a delete's and a deploy's can land in
+either order. Without loadable files the service is scaled to zero (never
+provisioned); with them it is reloaded, and scaled back to one if it was at zero.
 """
 
 import json
@@ -13,12 +18,15 @@ import os
 import re
 
 import boto3
+from botocore.exceptions import ClientError
 
 ecs = boto3.client("ecs")
 sd = boto3.client("servicediscovery")
 ssm = boto3.client("ssm")
 autoscaling = boto3.client("application-autoscaling")
 cloudwatch = boto3.client("cloudwatch")
+s3 = boto3.client("s3")
+lambda_client = boto3.client("lambda")
 
 _NS_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
@@ -32,6 +40,12 @@ _DEPLOY_CONFIG = {
     "maximumPercent": 200,
     "deploymentCircuitBreaker": {"enable": True, "rollback": True},
 }
+
+# Where VKG reads a namespace's files: ``{bucket}/{_ONTOLOGY_PREFIX}{ns}/latest/``.
+_ONTOLOGY_PREFIX = "ontologies/"
+
+# Actions _reconcile takes before giving up on a latest/ that keeps changing.
+_MAX_RECONCILE_ROUNDS = 4
 
 
 def _emit_metric(name, namespace):
@@ -68,33 +82,39 @@ def _emit_metric(name, namespace):
 def handler(event, context):
     """Provision or redeploy per-namespace VKG service(s).
 
-    Two entry modes:
+    Three entry modes:
 
-    * **Per-namespace** (EventBridge ``ontology.published``): the event carries
-      ``detail.namespace`` / ``detail.version`` and only that namespace's VKG
-      service is reconciled.
-    * **Sweep** (scheduled rule with constant input ``{"sweep": true}``): every
-      ``<prefix>-vkg-*`` service in the cluster is reconciled against the latest
-      SSM image. This keeps long-lived namespaces current even when their
-      ontology is never republished — otherwise a base-image digest bump never
-      reaches a running task, which is how stale VKG images accumulate.
+    * **Per-namespace** (EventBridge ``ontology.deployed``, or the legacy
+      ``ontology.published``): the event carries ``detail.namespace`` and only
+      that namespace's VKG service is reconciled with its ``latest/`` files
+      (see ``_reconcile``). ``detail.version`` is only logged.
+    * **Sweep** (scheduled rule with constant input ``{"sweep": true}``): lists
+      every ``<prefix>-vkg-*`` service in the cluster and asynchronously invokes
+      this function once per namespace (see ``_sweep``). This keeps long-lived
+      namespaces current even when their ontology is never redeployed
+      (otherwise a base-image digest bump never reaches a running task, which is
+      how stale VKG images accumulate), and corrects a lost or late event.
+    * **Sweep namespace** (``{"sweep_namespace": ns}``, sent by the sweep): one
+      namespace is reconciled exactly like an event, reloaded ones against the
+      latest SSM image.
 
     Args:
-        event: EventBridge event. ``{"sweep": true}`` selects sweep mode;
-            otherwise ``detail.namespace`` / ``detail.version`` select the
-            per-namespace reload.
+        event: EventBridge event or sweep payload. ``{"sweep": true}`` selects
+            sweep mode, ``sweep_namespace`` or ``detail.namespace`` the namespace
+            to reconcile.
         context: Lambda runtime context (unused).
 
     Returns:
         Per-namespace: a status dict (``reload_triggered`` / ``provisioned`` /
-        ``skipped`` / ``failed``). Sweep: ``{"status": "sweep_complete", ...}``
+        ``scaled_to_zero`` / ``skipped`` / ``failed``). Sweep: ``{"status": "sweep_dispatched", ...}``
         with a per-namespace ``results`` list, or ``failed`` if the image cannot
-        be resolved at all.
+        be resolved or the services cannot be listed.
 
     Raises:
-        Exception: In per-namespace mode, re-raised after emitting
-            ``ReloadFailed`` on an unexpected error. The sweep isolates
-            per-namespace failures and never raises for a single bad namespace.
+        Exception: In per-namespace modes, re-raised after emitting
+            ``ReloadFailed`` on an unexpected error, so Lambda retries that
+            namespace alone. The sweep isolates per-namespace dispatch failures
+            and never raises for a single bad namespace.
     """
     cluster = os.environ["CLUSTER_ARN"]
     prefix = os.environ["RESOURCE_PREFIX"]
@@ -102,22 +122,28 @@ def handler(event, context):
     if event.get("sweep") is True:
         return _sweep(cluster, prefix)
 
-    ns = event.get("detail", {}).get("namespace", "unknown")
-    version = event.get("detail", {}).get("version", "unknown")
+    if "sweep_namespace" in event:
+        ns, version = event["sweep_namespace"], None
+    else:
+        ns = event.get("detail", {}).get("namespace", "unknown")
+        version = event.get("detail", {}).get("version", "unknown")
 
-    if ns == "unknown" or not _NS_PATTERN.match(ns):
+    if not isinstance(ns, str) or ns == "unknown" or not _NS_PATTERN.match(ns):
         print(json.dumps({"action": "reload_skipped", "reason": "missing or invalid namespace"}))
         return {"status": "skipped", "reason": "missing or invalid namespace"}
 
-    return _reload_one(ns, version, cluster, prefix)
+    return _reconcile(ns, version, cluster, prefix)
 
 
 def _sweep(cluster, prefix):
-    """Reconcile every per-namespace VKG service in the cluster to the SSM image.
+    """Fan out one async ``{"sweep_namespace": ns}`` invocation per ``<prefix>-vkg-*`` service.
 
-    Resolves the target image once, then reloads each ``<prefix>-vkg-*`` service.
-    A single namespace's failure is recorded and the sweep continues — one broken
-    service must not stop the rest from being patched.
+    Reconciling every namespace inside this invocation outgrew the function timeout,
+    and a timed-out sweep is retried from the first namespace, so the tail was
+    never reached. Each namespace now runs (and is retried) in its own invocation.
+    The image is resolved first only to fail fast before dispatching anything.
+    A namespace whose Invoke fails gets ``ReloadFailed`` and the sweep continues:
+    raising would make Lambda retry the whole sweep and re-dispatch the rest.
     """
     print(json.dumps({"action": "sweep_start", "cluster": cluster}))
     container_image = _resolve_container_image()
@@ -136,18 +162,24 @@ def _sweep(cluster, prefix):
         _emit_metric("ReloadFailed", "sweep")
         return {"status": "failed", "reason": f"list services failed: {e}"}
 
+    function_name = os.environ["AWS_LAMBDA_FUNCTION_NAME"]
     results = []
     for ns in namespaces:
         try:
-            outcome = _reload_one(ns, "scheduled-sweep", cluster, prefix, container_image)
-            results.append({"namespace": ns, "status": outcome.get("status")})
+            lambda_client.invoke(
+                FunctionName=function_name,
+                InvocationType="Event",
+                Payload=json.dumps({"sweep_namespace": ns}),
+            )
+            results.append({"namespace": ns, "status": "dispatched"})
         except Exception as e:  # one bad namespace must not abort the sweep
-            print(json.dumps({"action": "sweep_item_failed", "namespace": ns, "error": str(e)}))
+            print(json.dumps({"action": "sweep_dispatch_failed", "namespace": ns, "error": str(e)}))
+            _emit_metric("ReloadFailed", ns)
             results.append({"namespace": ns, "status": "failed", "error": str(e)})
 
-    triggered = sum(1 for r in results if r["status"] in ("reload_triggered", "provisioned"))
-    print(json.dumps({"action": "sweep_complete", "total": len(results), "triggered": triggered}))
-    return {"status": "sweep_complete", "total": len(results), "triggered": triggered, "results": results}
+    dispatched = sum(1 for r in results if r["status"] == "dispatched")
+    print(json.dumps({"action": "sweep_dispatched", "total": len(results), "dispatched": dispatched}))
+    return {"status": "sweep_dispatched", "total": len(results), "dispatched": dispatched, "results": results}
 
 
 def _list_vkg_namespaces(cluster, prefix):
@@ -163,15 +195,73 @@ def _list_vkg_namespaces(cluster, prefix):
     return namespaces
 
 
-def _reload_one(ns, version, cluster, prefix, container_image=None):
+def _reconcile(ns, version, cluster, prefix):
+    """Make a namespace's VKG serving match the VKG files in its ``latest/``.
+
+    Servable files: reload (``_reload_one`` provisions a missing service and scales
+    one at zero back up). None: scale to zero (``_scale_to_zero`` never provisions).
+    ``version`` is only logged: retried events arrive out of order. A deploy or
+    delete (and its own invocation) can land while this acts, so ``latest/`` is read
+    again after every action until it matches the last one: whichever invocation
+    writes last also reads last.
+
+    Raises:
+        RuntimeError: After emitting ``ReloadFailed`` when ``latest/`` still differs
+            from the last action after ``_MAX_RECONCILE_ROUNDS`` actions; the async
+            retry reads it again later.
+    """
+    servable = _latest_servable(ns)
+    print(json.dumps({"action": "reconcile_start", "namespace": ns, "version": version, "servable": servable}))
+    for _ in range(_MAX_RECONCILE_ROUNDS):
+        result = _reload_one(ns, version, cluster, prefix) if servable else _scale_to_zero(ns, version, cluster, prefix)
+        now = _latest_servable(ns)
+        if now == servable:
+            return result
+        print(json.dumps({"action": "latest_changed", "namespace": ns, "servable": now}))
+        servable = now
+    print(json.dumps({"action": "reconcile_failed", "namespace": ns, "reason": "latest/ kept changing"}))
+    _emit_metric("ReloadFailed", ns)
+    raise RuntimeError(f"latest/ kept changing for {ns} over {_MAX_RECONCILE_ROUNDS} rounds")
+
+
+def _latest_servable(ns):
+    """Whether ``latest/`` holds the files ``packages/vkg/entrypoint.sh`` needs to load.
+
+    Mirrors the entrypoint: a depth-1 ``*.ttl``/``*.owl`` ontology AND a depth-1
+    ``*.obda``/``*.r2rml`` mappings file. A non-empty prefix is not enough:
+    ``clear_latest`` deletes only the VKG files and leaves ``examples.json``.
+
+    Raises:
+        Exception: Re-raised after emitting ``ReloadFailed`` when ``latest/`` cannot
+            be listed, so the event is retried instead of acted on blind.
+    """
+    try:
+        pages = s3.get_paginator("list_objects_v2").paginate(
+            Bucket=os.environ["ONTOLOGY_BUCKET"], Prefix=f"{_ONTOLOGY_PREFIX}{ns}/latest/", Delimiter="/"
+        )
+        names = [obj["Key"].rsplit("/", 1)[-1] for page in pages for obj in page.get("Contents", [])]
+    except Exception as e:
+        print(
+            json.dumps(
+                {"action": "latest_list_failed", "namespace": ns, "error_type": type(e).__name__, "error": str(e)}
+            )
+        )
+        _emit_metric("ReloadFailed", ns)
+        raise
+    has_ontology = any(n.endswith((".ttl", ".owl")) for n in names)
+    has_mappings = any(n.endswith((".obda", ".r2rml")) for n in names)
+    return has_ontology and has_mappings
+
+
+def _reload_one(ns, version, cluster, prefix):
     """Reconcile a single namespace's VKG service to the latest image.
 
-    Resolves the target image from SSM when not supplied (the sweep resolves it
-    once and passes it in for every namespace). If the running service already
-    uses that image, forces a new deployment; otherwise registers a fresh
+    Resolves the target image from SSM. If the running service already uses that
+    image, forces a new deployment; otherwise registers a fresh
     task-definition revision first. If the service does not yet exist, provisions
-    it. Reload outcomes are published as ``ReloadTriggered``/``ReloadFailed``
-    CloudWatch metrics.
+    it. An ACTIVE service at zero (see ``_scale_to_zero``) is scaled back to one,
+    MinCapacity first. Reload outcomes are published as
+    ``ReloadTriggered``/``ReloadFailed`` CloudWatch metrics.
 
     Raises:
         Exception: Re-raised after emitting ``ReloadFailed`` when an unexpected
@@ -182,14 +272,19 @@ def _reload_one(ns, version, cluster, prefix, container_image=None):
     print(json.dumps(log))
 
     try:
-        if container_image is None:
-            container_image = _resolve_container_image()
+        container_image = _resolve_container_image()
         if not container_image:
             print(json.dumps({"action": "reload_failed", "namespace": ns, "reason": "cannot resolve container image"}))
             _emit_metric("ReloadFailed", ns)
             return {"status": "failed", "reason": "cannot resolve container image"}
 
-        current_image = _get_current_service_image(cluster, service_name)
+        current_image, desired_count = _get_current_service_state(cluster, service_name)
+
+        scale_up = {}
+        if desired_count == 0:
+            # MinCapacity first, mirroring _scale_to_zero.
+            _configure_auto_scaling(cluster, service_name)
+            scale_up = {"desiredCount": 1}
 
         if current_image == container_image:
             print(json.dumps({"action": "image_unchanged", "namespace": ns, "image": container_image}))
@@ -198,6 +293,7 @@ def _reload_one(ns, version, cluster, prefix, container_image=None):
                 service=service_name,
                 forceNewDeployment=True,
                 deploymentConfiguration=_DEPLOY_CONFIG,
+                **scale_up,
             )
         else:
             print(
@@ -217,6 +313,7 @@ def _reload_one(ns, version, cluster, prefix, container_image=None):
                 taskDefinition=task_def_arn,
                 forceNewDeployment=True,
                 deploymentConfiguration=_DEPLOY_CONFIG,
+                **scale_up,
             )
 
         deployment_id = resp["service"].get("deployments", [{}])[0].get("id", "unknown")
@@ -230,6 +327,7 @@ def _reload_one(ns, version, cluster, prefix, container_image=None):
                     "deployment_id": deployment_id,
                     "image": container_image,
                     "image_changed": current_image != container_image,
+                    "scaled_up_from_zero": bool(scale_up),
                 }
             )
         )
@@ -254,22 +352,87 @@ def _reload_one(ns, version, cluster, prefix, container_image=None):
         raise
 
 
-def _get_current_service_image(cluster, service_name):
-    """Get the container image currently used by the service's task definition."""
+def _scale_to_zero(ns, version, cluster, prefix):
+    """Stop serving a namespace whose ``latest/`` has no loadable files (domain ontology deleted).
+
+    A redeploy would boot a task that fails its ``/health`` check and rolls back,
+    leaving the old task serving the deleted ontology. Lowers MinCapacity to 0
+    first so auto scaling cannot undo the new desired count, then scales the
+    service to zero. A missing, INACTIVE or DRAINING service is left alone (never
+    provisioned from an empty ``latest/``), and so is one already at zero.
+
+    Raises:
+        Exception: Re-raised after emitting ``ReloadFailed`` on an unexpected error.
+    """
+    service_name = f"{prefix}-vkg-{ns}"
+    log = {
+        "action": "scale_to_zero_start",
+        "namespace": ns,
+        "version": version,
+        "cluster": cluster,
+        "service": service_name,
+    }
+    print(json.dumps(log))
+
     try:
-        svc_resp = ecs.describe_services(cluster=cluster, services=[service_name])
-        services = svc_resp.get("services", [])
-        if not services:
-            return ""
-        task_def_arn = services[0]["taskDefinition"]
-        td_resp = ecs.describe_task_definition(taskDefinition=task_def_arn)
-        containers = td_resp["taskDefinition"].get("containerDefinitions", [])
-        return containers[0].get("image", "") if containers else ""
+        # A missing service comes back under ``failures``; a deleted one as INACTIVE/DRAINING.
+        services = ecs.describe_services(cluster=cluster, services=[service_name]).get("services", [])
+        active = [svc for svc in services if svc.get("status") == "ACTIVE"]
+        if not active:
+            reason = "nothing to serve"
+        elif active[0].get("desiredCount") == 0:
+            reason = "already scaled to zero"
+        else:
+            reason = None
+        if reason:
+            print(json.dumps({"action": "scale_to_zero_skipped", "namespace": ns, "reason": reason}))
+            return {"status": "skipped", "namespace": ns, "reason": reason}
+        _configure_auto_scaling(cluster, service_name, min_capacity=0)
+        ecs.update_service(cluster=cluster, service=service_name, desiredCount=0)
+    except Exception as e:
+        print(
+            json.dumps(
+                {
+                    "action": "scale_to_zero_failed",
+                    "namespace": ns,
+                    "service": service_name,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                }
+            )
+        )
+        _emit_metric("ReloadFailed", ns)
+        raise
+
+    print(json.dumps({"action": "scaled_to_zero", "namespace": ns, "service": service_name}))
+    return {"status": "scaled_to_zero", "namespace": ns, "service": service_name}
+
+
+def _get_current_service_state(cluster, service_name):
+    """Return ``(image, desired_count)`` for the service and its current task definition.
+
+    ``image`` is ``""`` when it cannot be read; ``desired_count`` is ``None`` unless
+    the service is ACTIVE (an INACTIVE one also reports 0 but is not scaled down).
+
+    Raises:
+        Exception: DescribeServices failed other than NotFound/NotActive. Guessing
+            would force-deploy a zero-count service and leave it at zero.
+    """
+    try:
+        services = ecs.describe_services(cluster=cluster, services=[service_name]).get("services", [])
     except (ecs.exceptions.ServiceNotFoundException, ecs.exceptions.ServiceNotActiveException):
-        return ""
+        return "", None
+    if not services:
+        return "", None
+    desired_count = services[0].get("desiredCount") if services[0].get("status") == "ACTIVE" else None
+    try:
+        td_resp = ecs.describe_task_definition(taskDefinition=services[0]["taskDefinition"])
+        containers = td_resp["taskDefinition"].get("containerDefinitions", [])
+        image = containers[0].get("image", "") if containers else ""
     except Exception as e:
         print(json.dumps({"action": "get_image_failed", "service": service_name, "error_type": type(e).__name__}))
-        return ""
+        image = ""
+    return image, desired_count
 
 
 def _resolve_container_image():
@@ -336,7 +499,7 @@ def _register_task_definition(ns, prefix, container_image):
                 "essential": True,
                 "environment": [
                     {"name": "ONTOLOGY_BUCKET", "value": ontology_bucket},
-                    {"name": "ONTOLOGY_PREFIX", "value": "ontologies/"},
+                    {"name": "ONTOLOGY_PREFIX", "value": _ONTOLOGY_PREFIX},
                     {"name": "NAMESPACE", "value": ns},
                     {"name": "NAMESPACE_ID", "value": ns},
                     {"name": "ENDPOINT_PORT", "value": "8080"},
@@ -446,8 +609,13 @@ def _provision_and_deploy(ns, service_name, cluster, prefix, version, container_
         raise
 
 
-def _configure_auto_scaling(cluster, service_name):
-    """Register auto-scaling for a per-namespace VKG service (min=1, max=3, CPU 70%)."""
+def _configure_auto_scaling(cluster, service_name, min_capacity=1):
+    """Register auto-scaling for a per-namespace VKG service (min=min_capacity, max=3, CPU 70%).
+
+    ``min_capacity`` is 0 only for a service scaled to zero. The CPU target-tracking
+    policy cannot scale out from zero tasks (no CPUUtilization datapoints), so the
+    service stays at zero until a deploy restores it.
+    """
     cluster_name = cluster.split("/")[-1]
     resource_id = f"service/{cluster_name}/{service_name}"
     try:
@@ -455,7 +623,7 @@ def _configure_auto_scaling(cluster, service_name):
             ServiceNamespace="ecs",
             ResourceId=resource_id,
             ScalableDimension="ecs:service:DesiredCount",
-            MinCapacity=1,
+            MinCapacity=min_capacity,
             MaxCapacity=3,
         )
         autoscaling.put_scaling_policy(
@@ -471,9 +639,21 @@ def _configure_auto_scaling(cluster, service_name):
                 "ScaleOutCooldown": 60,
             },
         )
-        print(json.dumps({"action": "autoscaling_configured", "service": service_name}))
+        print(json.dumps({"action": "autoscaling_configured", "service": service_name, "min_capacity": min_capacity}))
     except Exception as e:
-        print(json.dumps({"action": "autoscaling_failed", "service": service_name, "error": str(e)}))
+        # Non-fatal, but an IAM gap here leaves the service silently unscaled.
+        error_code = e.response.get("Error", {}).get("Code") if isinstance(e, ClientError) else None
+        print(
+            json.dumps(
+                {
+                    "action": "autoscaling_failed",
+                    "level": "WARNING",
+                    "service": service_name,
+                    "error_code": error_code,
+                    "error": str(e),
+                }
+            )
+        )
 
 
 def _ensure_cloud_map(ns, cloud_map_ns_id):

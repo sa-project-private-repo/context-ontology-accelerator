@@ -12,17 +12,21 @@ import {
   act,
 } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { ProposalStatus } from "@coa/control-plane-client";
 import {
   OntologyPage,
   ontologyIngestState,
   ONTOLOGY_INGEST_STATUS,
   ONTOLOGY_INGEST_TERMINAL,
   proposalStatusDisplay,
+  proposalStatusText,
   resolveCompletedInductionAction,
 } from "./OntologyPage";
 import { deleteOntologyCopy } from "@utils/ontology-display";
 import type { OntologyRecord } from "../services/ontology-engine";
+import { formatAppMessage } from "../i18n/appMessages";
+import { LocaleProvider, type AppTranslate } from "../i18n/LocaleProvider";
 
 function record(overrides: Partial<OntologyRecord>): OntologyRecord {
   return {
@@ -159,6 +163,12 @@ describe("deleteOntologyCopy", () => {
 
 // ── Rendered Actions cell ──
 
+// The caller's role: true for one that can change the ontology (a data steward).
+const access = vi.hoisted(() => ({ canManage: true }));
+vi.mock("@api-hooks/use-can-manage-ontology", () => ({
+  useCanManageOntology: () => access.canManage,
+}));
+
 const listOntologies = vi.fn();
 const listFoundationalOntologies = vi.fn();
 const loadFoundationalOntology = vi.fn();
@@ -215,6 +225,12 @@ vi.mock("@components/ApiClientProvider", () => {
 
 vi.mock("./ontology/induce/InductionStages", () => ({
   InductionStages: () => null,
+}));
+
+vi.mock("./ontology/abox/DomainDataTab", () => ({
+  DomainDataTab: ({ namespace }: { namespace?: string }) => (
+    <div>Domain data of {namespace}</div>
+  ),
 }));
 
 function renderPage() {
@@ -458,6 +474,66 @@ describe("OntologiesTab Actions cell", () => {
     await waitFor(() =>
       expect(view.getByRole("button", { name: "Delete" })).toBeDisabled(),
     );
+  });
+
+  it("shows a failed delete as retryable and keeps its Delete action enabled", async () => {
+    listOntologies.mockResolvedValue([
+      record({
+        ontologyId: "http://ex.org/mine",
+        uri: "http://ex.org/mine",
+        title: "My Uploaded Onto",
+        ontologyType: "user_uploaded",
+        parseStatus: "ok",
+        embeddingCount: 10,
+        status: "deleting",
+        deleteError: "Neptune DROP timed out",
+      }),
+    ]);
+    listFoundationalOntologies.mockResolvedValue({ items: [] });
+
+    const view = await renderReferenceOntologiesTab();
+
+    await view.findByText("Delete failed");
+    expect(view.queryByText("Delete in progress")).toBeNull();
+    await waitFor(() =>
+      expect(view.getByRole("button", { name: "Delete" })).toBeEnabled(),
+    );
+  });
+
+  it.each([
+    ["keeps polling while a delete runs", undefined, true],
+    ["stops polling once a delete failed", "Neptune DROP timed out", false],
+  ])("%s", async (_name, deleteError, polls) => {
+    listOntologies.mockResolvedValue([
+      record({
+        ontologyId: "http://ex.org/mine",
+        uri: "http://ex.org/mine",
+        title: "My Uploaded Onto",
+        ontologyType: "user_uploaded",
+        parseStatus: "ok",
+        embeddingCount: 10,
+        status: "deleting",
+        deleteError,
+      }),
+    ]);
+    listFoundationalOntologies.mockResolvedValue({ items: [] });
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const view = await renderReferenceOntologiesTab();
+      await view.findByText(polls ? "Delete in progress" : "Delete failed");
+      const callsBefore = listOntologies.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(8200);
+      if (polls) {
+        await waitFor(() =>
+          expect(listOntologies.mock.calls.length).toBeGreaterThan(callsBefore),
+        );
+      } else {
+        expect(listOntologies.mock.calls.length).toBe(callsBefore);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("deletes an uploaded ontology after the user types 'delete' to confirm", async () => {
@@ -1202,5 +1278,216 @@ describe("Ontology page — re-scanned-source warning", () => {
     renderPage();
     await screen.findByText(WARNING);
     await screen.findByText(/Orders DB/);
+  });
+});
+
+describe("Ontology page: Domain data tab", () => {
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    listOntologies.mockResolvedValue([]);
+    listFoundationalOntologies.mockResolvedValue({ items: [] });
+    listAllProposals.mockResolvedValue([]);
+    mockApiGet.mockResolvedValue({ items: [] });
+  });
+
+  it("follows the Versions tab and shows the namespace's domain data", async () => {
+    const view = within(renderPage().container);
+    const tabs = (await view.findAllByRole("tab")).map((t) => t.textContent);
+    expect(tabs.indexOf("Domain data")).toBe(tabs.indexOf("Versions") + 1);
+
+    fireEvent.click(view.getByRole("tab", { name: "Domain data" }));
+    expect(await view.findByText("Domain data of ns")).toBeInTheDocument();
+  });
+});
+
+describe("Proposals tab in Japanese", () => {
+  const ja: AppTranslate = (m, v) => formatAppMessage("ja", m, v);
+  const en: AppTranslate = (m, v) => formatAppMessage("en", m, v);
+  const CREATED = "2026-07-10T00:00:00Z";
+
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    listOntologies.mockResolvedValue([]);
+    listFoundationalOntologies.mockResolvedValue({ items: [] });
+    mockApiGet.mockResolvedValue({ items: [] });
+  });
+
+  it("words every proposal status from the catalogue", () => {
+    for (const status of Object.values(ProposalStatus)) {
+      // Japanese text, not the raw value, for each status the API defines.
+      expect(proposalStatusText(status, ja)).toMatch(
+        /[\u3040-\u30ff\u4e00-\u9fff]/,
+      );
+    }
+    expect(proposalStatusText("cancelled", ja)).toBe("キャンセル済み");
+    expect(proposalStatusText("cancelled", en)).toBe("cancelled");
+    expect(proposalStatusText("accept_failed", en)).toBe("accept failed");
+    // A status this console does not know yet is shown as it is.
+    expect(proposalStatusText("archived", ja)).toBe("archived");
+  });
+
+  it("shows a cancelled proposal's status and creation date in Japanese", async () => {
+    window.localStorage.setItem("scl.locale", "ja");
+    try {
+      listAllProposals.mockResolvedValue([
+        {
+          proposal_id: "p1",
+          job_id: "p1",
+          namespace: "ns",
+          ontology_id: "http://ex.org/namespace/ns/ontology/induced#",
+          proposal_type: "induction",
+          status: "cancelled",
+          created_at: CREATED,
+          updated_at: CREATED,
+        },
+      ]);
+      const view = within(
+        render(
+          <LocaleProvider>
+            <MemoryRouter initialEntries={["/namespaces/ns/ontology"]}>
+              <Routes>
+                <Route
+                  path="/namespaces/:namespaceId/ontology"
+                  element={<OntologyPage />}
+                />
+              </Routes>
+            </MemoryRouter>
+          </LocaleProvider>,
+        ).container,
+      );
+      expect(await view.findByText("キャンセル済み")).toBeInTheDocument();
+      expect(
+        view.getByText(new Date(CREATED).toLocaleString("ja")),
+      ).toBeInTheDocument();
+      expect(
+        view.queryByText(new Date(CREATED).toLocaleString("en")),
+      ).toBeNull();
+    } finally {
+      window.localStorage.removeItem("scl.locale");
+    }
+  });
+});
+
+describe("Induction page by role", () => {
+  const DENIED = "Your role on this namespace does not allow this.";
+  const CANNOT_CHANGE_REFERENCES =
+    "Ontologies available for grounding. Your role on this namespace cannot load, upload or delete them.";
+
+  /** The Induction page, built anew for each render so it can be rendered again. */
+  const inductionPage = () => (
+    <MemoryRouter initialEntries={["/namespaces/ns/ontology"]}>
+      <Routes>
+        <Route
+          path="/namespaces/:namespaceId/ontology"
+          element={<OntologyPage />}
+        />
+      </Routes>
+    </MemoryRouter>
+  );
+
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    access.canManage = true;
+    listAllProposals.mockResolvedValue([]);
+    mockApiGet.mockResolvedValue({ items: [] });
+    // One uploaded ontology (Delete) and one curated one not loaded yet (Load).
+    listOntologies.mockResolvedValue([
+      record({
+        ontologyId: "http://ex.org/mine",
+        uri: "http://ex.org/mine",
+        title: "My Uploaded Onto",
+        ontologyType: "user_uploaded",
+        parseStatus: "ok",
+        embeddingCount: 10,
+      }),
+    ]);
+    listFoundationalOntologies.mockResolvedValue({
+      items: [
+        {
+          key: "fibo",
+          uri: "http://ex.org/fibo",
+          title: "FIBO",
+          description: "",
+          format: "turtle",
+          domainTags: [],
+        },
+      ],
+    });
+  });
+
+  afterEach(() => {
+    access.canManage = true;
+  });
+
+  it("offers a role that only reads no induction, and says why", async () => {
+    access.canManage = false;
+    const view = within(renderPage().container);
+    const start = await view.findByRole("button", { name: "Start induction" });
+    expect(start).toHaveAttribute("aria-disabled", "true");
+    expect(start).toHaveAccessibleDescription(DENIED);
+    fireEvent.click(start);
+    expect(screen.queryByText("Strategy")).toBeNull();
+    // Reading stays offered.
+    expect(view.getByRole("button", { name: "Open Explorer" })).toBeEnabled();
+  });
+
+  it("turns off the induction dialog's Start induction too, when the role is known only after it opened", async () => {
+    // The grants load after the page: until then every action is offered.
+    const { rerender } = render(inductionPage());
+    fireEvent.click(await screen.findByText("Start induction"));
+    await screen.findByText("Strategy");
+    access.canManage = false;
+    rerender(inductionPage());
+    const dialog = screen.getByRole("dialog");
+    const start = within(dialog).getByRole("button", {
+      name: "Start induction",
+    });
+    expect(start).toHaveAttribute("aria-disabled", "true");
+    expect(start).toHaveAccessibleDescription(DENIED);
+  });
+
+  it("offers a role that only reads no upload, load or delete of a reference ontology, and says why", async () => {
+    access.canManage = false;
+    const view = await renderReferenceOntologiesTab();
+    await view.findByText("My Uploaded Onto");
+    expect(view.getByText(CANNOT_CHANGE_REFERENCES)).toBeInTheDocument();
+    const upload = view.getByRole("button", {
+      name: "Upload your own ontology",
+    });
+    expect(upload).toHaveAttribute("aria-disabled", "true");
+    expect(upload).toHaveAccessibleDescription(DENIED);
+    // Inline links take no reason of their own: the table header gives it.
+    await waitFor(() => {
+      expect(view.getByRole("button", { name: "Load" })).toBeDisabled();
+      expect(view.getByRole("button", { name: "Delete" })).toBeDisabled();
+    });
+    fireEvent.click(view.getByRole("button", { name: "Load" }));
+    fireEvent.click(view.getByRole("button", { name: "Delete" }));
+    expect(loadFoundationalOntology).not.toHaveBeenCalled();
+    expect(screen.queryByPlaceholderText("delete")).toBeNull();
+  });
+
+  it("offers induction and every reference ontology change to a role that can change the ontology", async () => {
+    const view = await renderReferenceOntologiesTab();
+    await view.findByText("My Uploaded Onto");
+    expect(view.queryByText(CANNOT_CHANGE_REFERENCES)).toBeNull();
+    expect(
+      view.getByText(
+        "Ontologies available for grounding. Load one from the catalog, or upload your own.",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(view.getByRole("button", { name: "Load" })).toBeEnabled();
+      expect(view.getByRole("button", { name: "Delete" })).toBeEnabled();
+    });
+    for (const name of ["Upload your own ontology", "Start induction"]) {
+      expect(view.getByRole("button", { name })).not.toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+    }
   });
 });

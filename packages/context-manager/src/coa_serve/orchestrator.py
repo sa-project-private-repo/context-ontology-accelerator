@@ -186,6 +186,10 @@ class Orchestrator:
             raise ValueError("tier1_metric_timeout_s must be in the range 1..300")
         self._tier1_metric_timeout_s = tier1_metric_timeout_s
 
+    def set_agentic_retriever(self, agentic_retriever: AgenticRetriever | None) -> None:
+        """Set the deep-reasoning retriever, which ``main`` builds for the query path after the rest of serve."""
+        self._agentic_retriever = agentic_retriever
+
     async def resolve(
         self,
         request: InvokeRequest,
@@ -382,6 +386,32 @@ class Orchestrator:
         keeps its own firewall.evaluate() gate; this runs upstream of dispatch.
         """
         return self._firewall.authorize_namespace(namespace, profile)
+
+    def can_view_namespace(self, namespace: str, profile: dict) -> bool:
+        """Whether the principal holds ``viewNamespace`` on ``namespace``; False on error.
+
+        The gate on the generated SQL/SPARQL, shared with the query console's
+        executed SQL so both answer from the same policy source.
+        """
+        return self._firewall.can_view_namespace(namespace, profile)
+
+    def _resolve_include_debug_info(self, options: dict | None, namespace: str, profile: dict | None) -> bool:
+        """Effective includeDebugInfo = caller opt-in AND viewNamespace right (#1166).
+
+        The SQL/SPARQL artifacts are returned only when the caller BOTH asked for
+        them (``includeDebugInfo=true``) AND holds ``viewNamespace`` on the
+        namespace — the SAME Cedar right that gates reading a source's
+        table/column schema in the Sources/Tables view. A caller who can already
+        see the schema gains no new disclosure from the query that touches it; a
+        caller who cannot is denied the artifacts even when they pass the flag.
+        Fails CLOSED (the firewall returns False on evaluator error), so a policy
+        failure withholds artifacts rather than leaking them. Decoupling the
+        default (hidden) from this gate keeps the AppSec default-withhold posture.
+        """
+        requested = (options or {}).get("includeDebugInfo", False) is True
+        if not requested:
+            return False
+        return self._firewall.can_view_namespace(namespace, profile)
 
     # ── Tier run/skip decisions ──────────────────────────────────────
     # Each tier's guard is a named predicate so resolve() reads as a plain
@@ -685,7 +715,13 @@ class Orchestrator:
             declined_metric=declined_metric,
         )
 
-        result = await self._structured_query_tier.resolve(query, namespace, context, option=strategy_selection)
+        result = await self._structured_query_tier.resolve(
+            query,
+            namespace,
+            context,
+            option=strategy_selection,
+            tier3_follows=self._should_run_tier3(tier_override),
+        )
 
         if result is not None:
             max_rows = capped_max_rows(options)
@@ -745,7 +781,7 @@ class Orchestrator:
             namespace,
             profile,
             model_id=model_id,
-            include_debug_info=options.get("includeDebugInfo", False) is True,
+            include_debug_info=self._resolve_include_debug_info(options, namespace, profile),
         )
         return response, result.sparql or None
 
@@ -1121,7 +1157,7 @@ class Orchestrator:
                     match_confidence=metric_match.match_confidence,
                     match_source=metric_match.match_source,
                     model_id=model_id,
-                    include_debug_info=options.get("includeDebugInfo", False) is True,
+                    include_debug_info=self._resolve_include_debug_info(options, namespace, profile),
                 )
             ), None
 
@@ -1270,7 +1306,19 @@ class Orchestrator:
                 degraded_sources=tier3_result.degraded_sources or None,
                 model_id=model_id,
                 partial=tier3_result.partial,
+                # Label by MODE, not tier: Deep Reasoning resolves at tier=3 but is
+                # a distinct execution mode; without this the console mislabels it
+                # as Standard mode's "Tier 3 — Knowledge Retrieval" (#1166).
+                execution_mode=Mode.DEEP_REASONING.value,
+                # Return the SQL/SPARQL the agentic loop ran, same as Standard mode
+                # does — gated by the same includeDebugInfo opt-in (#1166).
+                query_used=tier3_result.query_used,
+                sparql_generated=tier3_result.sparql_generated,
+                include_debug_info=self._resolve_include_debug_info(options, namespace, profile),
             )
+            # Also keep the free-form metadata["mode"] stamp for request logs / eval
+            # attribution (unchanged observability contract); execution_mode above is
+            # the structural field the console reads (#1166).
             result.metadata = {**(result.metadata or {}), "mode": Mode.DEEP_REASONING.value}
             return InvokeResponse(result=result)
 

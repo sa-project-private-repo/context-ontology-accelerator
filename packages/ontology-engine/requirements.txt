@@ -20,3 +20,4 @@ defusedxml>=0.7.1
 # 2026.10.19 is the first certifi bundle without the roots behind the compromised
 # emSign intermediates. botocore also uses certifi's bundle over its own when installed.
 certifi>=2026.10.19
+strands-agents>=1.41.0

@@ -16,7 +16,6 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
-from decimal import Decimal
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +31,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from coa_ontology import dynamo_store
+from coa_ontology.abox import store as abox_store
 from coa_ontology.datasource_ids import bare_datasource_id, is_valid_datasource_id
 from coa_ontology.inducer.services.generated_text import render
 from coa_ontology.inducer.strategies import get_strategy
@@ -42,6 +42,8 @@ from coa_ontology.namespace_language import (
     resolve_namespace_language,
 )
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
+from coa_ontology.studio import chat_store
+from coa_ontology.versions import registry as version_registry
 
 if TYPE_CHECKING:
     # Type-only: ``inducer.schemas`` is deliberately NOT imported at runtime here
@@ -157,19 +159,7 @@ def _compute_structural_fingerprint(tables) -> str:
     return hashlib.sha256(str(parts).encode()).hexdigest()[:16]
 
 
-def _floats_to_decimal(obj):
-    """Recursively convert float values to Decimal for DynamoDB compatibility."""
-    if isinstance(obj, float):
-        import math
-
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return Decimal(str(obj))
-    if isinstance(obj, dict):
-        return {k: _floats_to_decimal(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_floats_to_decimal(i) for i in obj]
-    return obj
+_floats_to_decimal = dynamo_store.floats_to_decimal
 
 
 class NamespaceNotFoundError(ValueError):
@@ -1064,6 +1054,10 @@ def _run_induction(
                     # list back (all consumers use novel_classes_created).
                     "novel_tables_count": len(novel_tables),
                     "datasource_ids": body.datasource_ids,
+                    # Publish treats this proposal's R2RML as the full mapping of its
+                    # datasources only for a complete table_to_ontology run.
+                    "induction_strategy": body.strategy,
+                    "dropped_tables_count": len(dropped_tables),
                     # Matches are offloaded to S3 by create_proposal (popped from
                     # this dict before the DynamoDB write) to stay under the 400 KB
                     # item limit. The S3 artifact receives the FULL match set.
@@ -1696,15 +1690,15 @@ _TERMINAL_INGEST_STATUSES = {"completed", "failed"}
 # ontology-induction.smithy). "pending" is intentionally included here: a
 # proposal awaiting steward review has no active writer and is not a race
 # risk for namespace deletion. Only "accepting" represents a background
-# thread actively writing to the namespace's ontology data (catalog
-# projection, Turtle bulk load, embedding writes, S3 persist — see
+# thread actively writing to the namespace's ontology data (publishing a
+# version snapshot, then possibly starting its deployment; see
 # proposals.py) — that is the one proposal state that must block deletion.
 _ACCEPTING_PROPOSAL_STATUS = "accepting"
 
 
 @router.get("/active-jobs")
 def count_active_jobs(namespace: str) -> dict[str, int]:
-    """Count non-terminal induction jobs, ingest jobs, and accepting proposals.
+    """Count non-terminal induction jobs, ingest jobs, accepting proposals, deployments, publishes and ABox builds.
 
     Backed by durable DynamoDB reads (dynamo_store.list_jobs /
     list_ingest_jobs / list_proposals), not the in-memory ``_jobs`` dict used
@@ -1716,8 +1710,17 @@ def count_active_jobs(namespace: str) -> dict[str, int]:
     about to tear down:
       - an induction run (structured or unstructured)
       - an async ontology-ingest job (uploading a custom ontology file)
-      - a proposal accept in progress ("accepting" — catalog projection,
-        Turtle bulk load, embeddings, S3 persist)
+      - a proposal accept in progress ("accepting": publishing a version
+        snapshot, then possibly starting its deployment)
+      - a running deployment (a live deploy lock: staging and domain graph,
+        embeddings, ``latest/``)
+      - a live publish (the newest version row is still PUBLISHING; a dead one
+        is swept to PUBLISH_FAILED by ``list_versions``)
+      - a running domain ABox build (a live ``ABOXLOCK``; a stale one has no
+        holder, so a dead worker never blocks deletion, and the lock a namespace
+        teardown keeps is no build, so a failed teardown can be retried at once)
+      - a running Ontology designer agent turn (a live ``STUDIOTURN#`` lease; it writes
+        the proposal's chat rows and files until it ends)
 
     A pending/accepted/rejected/cancelled/updated proposal has no
     background writer and does not count — only "accepting" does.
@@ -1740,7 +1743,22 @@ def count_active_jobs(namespace: str) -> dict[str, int]:
         namespace=namespace, status=_ACCEPTING_PROPOSAL_STATUS, limit=1000
     )
 
-    return {"activeJobs": active_jobs + active_ingest_jobs + len(accepting_proposals)}
+    deploying = 1 if version_registry.deploy_lock_holder(namespace) else 0
+    versions = version_registry.list_versions(namespace)
+    publishing = 1 if versions and versions[0].get("status") == version_registry.PUBLISHING else 0
+    abox_holder = abox_store.lock_holder(namespace)
+    abox_building = 1 if abox_holder and not abox_store.is_teardown(abox_holder) else 0
+    studio_turns = chat_store.live_turns(namespace)
+
+    return {
+        "activeJobs": active_jobs
+        + active_ingest_jobs
+        + len(accepting_proposals)
+        + deploying
+        + publishing
+        + abox_building
+        + studio_turns
+    }
 
 
 @router.get("/datasources")

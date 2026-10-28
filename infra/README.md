@@ -201,9 +201,14 @@ these:
    waits for them before step 8.
 3. **Delete VKG's per-namespace ECS services** and wait for them to
    reach `INACTIVE`. These are created outside CFN by the VKG reload
-   Lambda reacting to `ontology.published` events, so ECS's
-   `DeleteCluster` fails with `ClusterContainsServicesException` while
-   any are active.
+   Lambda reacting to `ontology.deployed` events (a version deployed, or
+   the domain ontology deleted with `version: null`). The Lambda decides
+   from the VKG files in the namespace's `latest/`: it reloads the
+   service when they are loadable and scales it to zero (desired count
+   and autoscaling MinCapacity 0) when they are gone. A service scaled to
+   zero still exists, so ECS's `DeleteCluster` fails with
+   `ClusterContainsServicesException` while any are active. See
+   `packages/vkg/README.md` ("Image Reloads and the Scheduled Sweep").
 4. **Delete the Cloud Map services** inside the private DNS namespace. CFN
    owns the namespace (network stack) but not the services the VKG reload
    Lambda registers in it, and `DeleteNamespace` fails while any remain.

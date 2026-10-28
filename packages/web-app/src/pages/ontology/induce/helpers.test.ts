@@ -2,12 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, it, expect, vi } from "vitest";
+import { render } from "@testing-library/react";
+import { ProposalStatus } from "@coa/control-plane-client";
 import {
   proposalScope,
   proposalScopeSortKey,
   proposalSourceTypeLabel,
+  proposalStatusIndicator,
   resolveConstraintConfig,
 } from "./helpers";
+import { formatAppMessage } from "../../../i18n/appMessages";
+import type { AppTranslate } from "../../../i18n/LocaleProvider";
 
 describe("proposalSourceTypeLabel", () => {
   it("maps the source-type enum to a human label", () => {
@@ -17,6 +22,22 @@ describe("proposalSourceTypeLabel", () => {
 
   it("treats a missing source_type as structured, matching the backend's asymmetric backfill", () => {
     expect(proposalSourceTypeLabel(undefined)).toBe("Structured");
+  });
+});
+
+describe("proposalStatusIndicator", () => {
+  const ja: AppTranslate = (m, v) => formatAppMessage("ja", m, v);
+
+  it("words every proposal status in Japanese, inducing and failed included", () => {
+    for (const status of Object.values(ProposalStatus)) {
+      const { container, unmount } = render(
+        proposalStatusIndicator(status, ja),
+      );
+      expect(container.textContent).toMatch(/[\u3040-\u30ff\u4e00-\u9fff]/);
+      unmount();
+    }
+    const { container } = render(proposalStatusIndicator("failed", ja));
+    expect(container.textContent).toBe("失敗");
   });
 });
 

@@ -4,7 +4,10 @@
 import { renderHook, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Node } from "@xyflow/react";
-import { useLiveForceSimulation } from "./useLiveForceSimulation";
+import {
+  settledBounds,
+  useLiveForceSimulation,
+} from "./useLiveForceSimulation";
 
 // d3-force drives its animation with requestAnimationFrame. Stub it to a no-op
 // so the simulation never ticks asynchronously — the hook's *synchronous*
@@ -174,5 +177,45 @@ describe("useLiveForceSimulation", () => {
     ];
     act(() => rerender({ ns: extended }));
     expect(setNodes.mock.calls.length).toBeGreaterThan(callsAfterMount);
+  });
+});
+
+describe("settledBounds", () => {
+  function grid(count: number, gap: number): FlowNode[] {
+    return Array.from({ length: count }, (_, i) => ({
+      id: `n${i}`,
+      type: "ontology",
+      position: { x: (i % 3) * gap, y: Math.floor(i / 3) * gap },
+      data: { id: `n${i}`, label: `N${i}`, kind: "class" },
+    }));
+  }
+  function complete(ns: FlowNode[]) {
+    const out: { id: string; source: string; target: string }[] = [];
+    for (let i = 0; i < ns.length; i++)
+      for (let j = i + 1; j < ns.length; j++)
+        out.push({ id: `${i}-${j}`, source: ns[i].id, target: ns[j].id });
+    return out;
+  }
+
+  it("is null for an empty graph", () => {
+    expect(settledBounds([], [], opts)).toBeNull();
+  });
+
+  it("is deterministic for the same input", () => {
+    const ns = grid(6, 120);
+    expect(settledBounds(ns, complete(ns), opts)).toEqual(
+      settledBounds(ns, complete(ns), opts),
+    );
+  });
+
+  it("covers where a dense graph settles, not just its packed layout", () => {
+    // A tightly packed dense cluster: the live physics spreads it out well past
+    // the packed positions, so a frame fitted to those positions cuts nodes off.
+    const ns = grid(9, 100);
+    const packed = { width: 2 * 100 + 80, height: 2 * 100 + 80 };
+    const b = settledBounds(ns, complete(ns), opts);
+    expect(b).not.toBeNull();
+    expect(b!.width).toBeGreaterThan(packed.width);
+    expect(b!.height).toBeGreaterThan(packed.height);
   });
 });

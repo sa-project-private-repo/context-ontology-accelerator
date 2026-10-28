@@ -307,6 +307,61 @@ describe("VkgStack", () => {
     });
   });
 
+  test("reload Lambda may manage the alarms its target-tracking policy creates", () => {
+    // Without these, PutScalingPolicy is AccessDenied and VKG services never
+    // autoscale. Scoped to this cluster's TargetTracking-service/<cluster>/* alarms.
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Action: [
+              "cloudwatch:DescribeAlarms",
+              "cloudwatch:PutMetricAlarm",
+              "cloudwatch:DeleteAlarms",
+            ],
+            Effect: "Allow",
+            Resource: {
+              "Fn::Join": [
+                "",
+                Match.arrayWith([
+                  Match.stringLikeRegexp(":alarm:TargetTracking-service/$"),
+                ]),
+              ],
+            },
+          }),
+        ]),
+      },
+    });
+  });
+
+  test("reload Lambda may create only the ECS autoscaling service-linked role", () => {
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Action: "iam:CreateServiceLinkedRole",
+            Effect: "Allow",
+            Resource: {
+              "Fn::Join": [
+                "",
+                Match.arrayWith([
+                  Match.stringLikeRegexp(
+                    ":role/aws-service-role/ecs\\.application-autoscaling\\.amazonaws\\.com/AWSServiceRoleForApplicationAutoScaling_ECSService$",
+                  ),
+                ]),
+              ],
+            },
+            Condition: {
+              StringLike: {
+                "iam:AWSServiceName": "ecs.application-autoscaling.amazonaws.com",
+              },
+            },
+          }),
+        ]),
+      },
+    });
+  });
+
   // ── SSM Parameters ───────────────────────────────────────────────
 
   test("publishes VKG container image URI to SSM for reload Lambda", () => {
@@ -466,6 +521,63 @@ describe("VkgStack", () => {
           }),
         ]),
       },
+    });
+  });
+
+  test("reload Lambda may invoke only itself (sweep fan-out)", () => {
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      Roles: [{ Ref: Match.stringLikeRegexp("VkgReloadFn") }],
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          // The sweep invokes the function once per namespace. The ARN is built
+          // from the function's literal name: its own GetAtt Arn in the policy
+          // of the role it runs as would be a circular dependency.
+          Match.objectLike({
+            Action: "lambda:InvokeFunction",
+            Effect: "Allow",
+            Resource: {
+              "Fn::Join": [
+                "",
+                Match.arrayWith([`:function:${PREFIX}-vkg-reload`]),
+              ],
+            },
+          }),
+        ]),
+      },
+    });
+  });
+
+  test("reload Lambda may list only the latest/ prefixes of the ontology bucket", () => {
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      Roles: [{ Ref: Match.stringLikeRegexp("VkgReloadFn") }],
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          // The handler decides reload vs scale-to-zero from the files in
+          // ontologies/{ns}/latest/ (ListObjectsV2 is authorized as s3:ListBucket).
+          Match.objectLike({
+            Action: "s3:ListBucket",
+            Effect: "Allow",
+            // The ontology bucket's own ARN (exported from its stack), not "*"
+            // or an object ARN.
+            Resource: {
+              "Fn::ImportValue": Match.stringLikeRegexp(
+                "OntologyBucket\\w*Arn",
+              ),
+            },
+            Condition: {
+              StringLike: { "s3:prefix": ["ontologies/*/latest/*"] },
+            },
+          }),
+        ]),
+      },
+    });
+  });
+
+  test("reload rule fires on ontology.deployed and the legacy ontology.published", () => {
+    renderVkgWithContext({}).hasResourceProperties("AWS::Events::Rule", {
+      EventPattern: Match.objectLike({
+        "detail-type": ["ontology.deployed", "ontology.published"],
+      }),
     });
   });
 });

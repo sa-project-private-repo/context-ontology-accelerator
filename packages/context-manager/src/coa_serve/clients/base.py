@@ -337,6 +337,9 @@ class QueryResult:
     # Surfaced in the serve trace (t1.execute / t2.sql.execute) so the routing is
     # observable end-to-end. Empty when the executor doesn't tag itself.
     engine: str = ""
+    # The statement the engine ran, after the executor's own row cap and rewrites: the SQL a
+    # caller shows as the one that ran. Empty when the executor doesn't report it.
+    sql: str = ""
 
 
 @runtime_checkable

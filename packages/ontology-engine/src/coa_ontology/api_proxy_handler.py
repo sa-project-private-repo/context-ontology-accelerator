@@ -68,6 +68,7 @@ _IDEMPOTENT_POSTS = {
     "/namespaces/{namespaceId}/ontology/foundational/{key}/load": "LoadFoundationalOntology",
     "/namespaces/{namespaceId}/proposals/{proposalId}/validate": "ValidateProposal",
     "/namespaces/{namespaceId}/proposals/{proposalId}/infer-constraints": "InferConstraints",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/messages": "SendStudioMessage",
 }
 
 # Map API Gateway paths to ontology-engine paths
@@ -100,6 +101,52 @@ _PATH_MAP = {
     ),
     "/namespaces/{namespaceId}/proposals/update": "/ontology/proposals/update",
     "/namespaces/{namespaceId}/proposals/reject": "/ontology/proposals/reject",
+    # Ontology designer: the draft of a proposal.
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio": "/ontology/proposals/{proposalId}/studio",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/graph": "/ontology/proposals/{proposalId}/studio/graph",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/term": "/ontology/proposals/{proposalId}/studio/term",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/terms": "/ontology/proposals/{proposalId}/studio/terms",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changes": (
+        "/ontology/proposals/{proposalId}/studio/changes"
+    ),
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/undo": "/ontology/proposals/{proposalId}/studio/undo",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/redo": "/ontology/proposals/{proposalId}/studio/redo",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/history": (
+        "/ontology/proposals/{proposalId}/studio/history"
+    ),
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/rebase": (
+        "/ontology/proposals/{proposalId}/studio/rebase"
+    ),
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/accept-preview": (
+        "/ontology/proposals/{proposalId}/studio/accept-preview"
+    ),
+    # Ontology designer: the chat and the assistant's change sets.
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/messages": (
+        "/ontology/proposals/{proposalId}/studio/messages"
+    ),
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/events": "/ontology/proposals/{proposalId}/studio/events",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets": (
+        "/ontology/proposals/{proposalId}/studio/changesets"
+    ),
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/preview": (
+        "/ontology/proposals/{proposalId}/studio/changesets/{changeSetId}/preview"
+    ),
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/apply": (
+        "/ontology/proposals/{proposalId}/studio/changesets/{changeSetId}/apply"
+    ),
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/changesets/{changeSetId}/discard": (
+        "/ontology/proposals/{proposalId}/studio/changesets/{changeSetId}/discard"
+    ),
+    # Ontology designer checks, the query console and competency questions.
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/checks": "/ontology/proposals/{proposalId}/studio/checks",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/queries": (
+        "/ontology/proposals/{proposalId}/studio/queries"
+    ),
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/questions/{questionId}/check": (
+        "/ontology/proposals/{proposalId}/studio/questions/{questionId}/check"
+    ),
+    "/namespaces/{namespaceId}/studio/questions": "/ontology/studio/questions",
+    "/namespaces/{namespaceId}/studio/questions/{questionId}": "/ontology/studio/questions/{questionId}",
     "/namespaces/{namespaceId}/graph/search": "/graph/search",
     "/namespaces/{namespaceId}/graph/ontology-overview": "/graph/ontology-overview",
     # ``/namespaces/{namespaceId}/schema`` is the canonical Smithy DescribeSchema
@@ -132,7 +179,23 @@ _PATH_MAP = {
     "/namespaces/{namespaceId}/validate/jobs/{jobId}": "/validate/jobs/{jobId}",
     "/namespaces/{namespaceId}/ontology/foundational": "/ontology/foundational",
     "/namespaces/{namespaceId}/ontology/foundational/{key}/load": "/ontology/foundational/{key}/load",
+    "/namespaces/{namespaceId}/ontology/versions": "/ontology/versions",
+    "/namespaces/{namespaceId}/ontology/versions/{version}": "/ontology/versions/{version}",
+    "/namespaces/{namespaceId}/ontology/versions/{version}/deploy": "/ontology/versions/{version}/deploy",
+    "/namespaces/{namespaceId}/ontology/deployments/{deploymentId}": "/ontology/deployments/{deploymentId}",
+    # Domain ABox. /internal/abox is deliberately absent: VPC-only.
+    "/namespaces/{namespaceId}/abox": "/abox",
+    "/namespaces/{namespaceId}/abox/instances": "/abox/instances",
+    "/namespaces/{namespaceId}/abox/instance": "/abox/instance",
+    "/namespaces/{namespaceId}/abox/mappings": "/abox/mappings",
+    "/namespaces/{namespaceId}/abox/mappings/{mappingId}": "/abox/mappings/{mappingId}",
+    "/namespaces/{namespaceId}/abox/rebuild": "/abox/rebuild",
 }
+
+# Path params encoded with no safe characters at all, so a decoded value holding
+# ``/`` cannot reach another backend path either. The other params keep ``/`` and
+# ``:`` literal so an IRI id round-trips (see ``_forward``).
+_QUOTED_PATH_PARAMS = frozenset({"version", "deploymentId", "mappingId"})
 
 # Query params a caller spells in camelCase, per backend path, and the snake_case
 # name the ontology engine's FastAPI route actually binds.
@@ -318,7 +381,8 @@ def _forward(event: dict, *, timeout: float) -> dict:
     # early and overriding the authorizer-validated '?namespace=' set below.
     backend_path = _PATH_MAP.get(resource, resource)
     for key, val in path_params.items():
-        backend_path = backend_path.replace(f"{{{key}}}", quote(unquote(val), safe="/:"))
+        safe = "" if key in _QUOTED_PATH_PARAMS else "/:"
+        backend_path = backend_path.replace(f"{{{key}}}", quote(unquote(val), safe=safe))
 
     # Add namespace as query param (ontology-engine uses ?namespace=)
     namespace_id = path_params.get("namespaceId")
@@ -338,6 +402,14 @@ def _forward(event: dict, *, timeout: float) -> dict:
     event_headers = event.get("headers") or {}
     content_type = event_headers.get("content-type") or event_headers.get("Content-Type") or "application/json"
     headers = {"Content-Type": content_type}
+    # Who is acting, for audit fields (version createdBy, deployment requestedBy).
+    # Set from the authorizer's verdict, never copied from a client header; the ECS
+    # service is reachable only by first-party Lambdas in the Lambda security group.
+    # Percent-encoded because a principal may hold non-latin-1 characters or CR/LF,
+    # which urllib refuses to send; the engine decodes it.
+    principal = str(((event.get("requestContext") or {}).get("authorizer") or {}).get("principalId") or "")
+    if principal.strip():
+        headers["X-Coa-Principal"] = quote(principal, safe="@._+-")
     data: bytes | None = None
     if event.get("isBase64Encoded") and body:
         data = base64.b64decode(body)

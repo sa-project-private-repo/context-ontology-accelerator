@@ -3,8 +3,9 @@
 
 """Shared fixtures for the infra Lambda handler tests.
 
-Patch the boto3 factory to mock the cloudwatch client so it survives the in-test
-`importlib.reload(index)` and never makes real PutMetricData calls.
+Patch the boto3 factory to mock the cloudwatch, application-autoscaling and lambda
+clients so they survive the in-test `importlib.reload(index)` and never make real
+PutMetricData / RegisterScalableTarget / Invoke calls.
 
 Adding a test for another Lambda handler here
 -----------------------------------------------
@@ -69,11 +70,11 @@ def _guard_index_module_identity():
 
 
 @pytest.fixture(autouse=True)
-def _mock_cloudwatch_client(monkeypatch):
+def _mock_metric_and_autoscaling_clients(monkeypatch):
     real_client = boto3.client
 
     def fake_client(name, *args, **kwargs):
-        if name == "cloudwatch":
+        if name in ("cloudwatch", "application-autoscaling", "lambda"):
             return MagicMock()
         return real_client(name, *args, **kwargs)
 

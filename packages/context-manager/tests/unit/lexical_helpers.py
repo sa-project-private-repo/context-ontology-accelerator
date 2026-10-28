@@ -13,6 +13,8 @@ suites (tasks 1.a–8.a) and the cross-cutting coverage sweep (task 9) all reuse
 - :func:`make_toolkit_node`, :func:`source_metadata`, :func:`entity_contexts` —
   build a fake toolkit ``NodeWithScore`` and the real nested toolkit metadata
   shapes (``Source`` / ``EntityContexts``).
+- :func:`topic_beam_nodes`: the nodes the real ``TopicBeamSearch`` returns for
+  given results (no entity contexts; the chunk ids under ``result``).
 - :func:`make_synthesizer`, :func:`make_baseline_result`,
   :func:`make_baseline_retriever` — Tier-3 wiring helpers.
 
@@ -153,6 +155,47 @@ def entity_contexts(entities: list[tuple[str, str, str]]) -> dict:
         ],
         "keywords": [],
     }
+
+
+def topic_beam_nodes(results: list[tuple[str, str, list[str]]]) -> list:
+    """The nodes graphrag's real ``TopicBeamSearch`` returns for ``(source id, chunk id, statements)`` results.
+
+    The retriever runs with mocked stores and serve's processor arguments, its default processors
+    included, so the node metadata is the toolkit's own: no entity contexts (the retriever builds
+    none), and each result's chunk ids under ``metadata["result"]``.
+    """
+    from graphrag_toolkit.lexical_graph.retrieval.processors import ProcessorArgs
+    from graphrag_toolkit.lexical_graph.retrieval.retrievers import TopicBeamSearch
+    from llama_index.core.schema import QueryBundle
+
+    retriever = TopicBeamSearch(
+        graph_store=MagicMock(),
+        vector_store=MagicMock(),
+        processor_args=ProcessorArgs(reranker="tfidf", max_search_results=10, max_statements_per_topic=10),
+    )
+    raw = [
+        {
+            "result": {
+                "score": 1.0,
+                "source": {"sourceId": source_id, "metadata": {}, "versioning": {}},
+                "topics": [
+                    {
+                        "topic": statements[0],
+                        "topicId": f"topic-{chunk_id}",
+                        "chunks": [{"chunkId": chunk_id}],
+                        "statements": [
+                            {"statementId": f"{chunk_id}-{n}", "statement": text, "chunkId": chunk_id, "score": 1.0}
+                            for n, text in enumerate(statements)
+                        ],
+                    }
+                ],
+            }
+        }
+        for source_id, chunk_id, statements in results
+    ]
+    retriever.get_start_node_ids = lambda _query: [f"topic-{chunk_id}" for _, chunk_id, _ in results]
+    retriever.do_graph_search = lambda _query, _ids: retriever._to_search_results_collection(raw)
+    return retriever._retrieve(QueryBundle("question"))
 
 
 # ── Tier-3 wiring helpers ───────────────────────────────────────────

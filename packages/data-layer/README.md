@@ -8,6 +8,7 @@ REST API for programmatic query/retrieval — thin Lambda adapter that forwards 
 |--------|------|-------------|
 | POST | `/namespaces/{namespaceId}/query` | Unified NL query (tiered resolution) |
 | POST | `/namespaces/{namespaceId}/translate` | NL-to-SPARQL translation only |
+| POST | `/namespaces/{namespaceId}/sparql` | The caller's own SPARQL `SELECT`/`ASK` over the VKG (the Ontology designer's query console): serve's `sparqlQuery` translates it, applies the caller's grants and runs the SQL |
 | POST | `/namespaces/{namespaceId}/kb/search` | Vector search (OpenSearch) |
 | POST | `/namespaces/{namespaceId}/graph/traverse` | Graph traversal (Neptune) |
 | GET  | `/namespaces/{namespaceId}/schema` | Schema discovery — returns queryable classes and properties |

@@ -22,13 +22,31 @@ These tests pin the new async contract:
 
 from __future__ import annotations
 
+import threading
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _stub_job_persistence(monkeypatch):
+    """Keep the best-effort DynamoDB job writes off the network.
+
+    The worker persists once more after flipping the in-memory status, so wait
+    for it before the stub is undone.
+    """
+    from coa_ontology import proposals
+
+    monkeypatch.setattr(proposals.dynamo_store, "put_async_job", MagicMock())
+    yield
+    for t in threading.enumerate():
+        if t.name.endswith("(_run_infer_constraints)"):
+            t.join(timeout=5)
+
 
 _VALID_TTL = """@prefix owl: <http://www.w3.org/2002/07/owl#> .
 <https://example.org/o> a owl:Ontology .

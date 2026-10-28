@@ -74,8 +74,12 @@ export function ToolsPanelProvider({
     setState((prev) => ({ ...prev, activeDrawerId: id }));
   }, []);
 
+  // Like the split panel's close: with no drawer open the state stays, and
+  // nothing renders again.
   const closeDrawer = useCallback(() => {
-    setState((prev) => ({ ...prev, activeDrawerId: null }));
+    setState((prev) =>
+      prev.activeDrawerId === null ? prev : { ...prev, activeDrawerId: null },
+    );
   }, []);
 
   const toggleDrawer = useCallback((id: string) => {

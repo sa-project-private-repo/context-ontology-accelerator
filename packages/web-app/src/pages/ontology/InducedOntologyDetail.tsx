@@ -28,6 +28,7 @@ import { SortableTable } from "@components/SortableTable";
 import { useOntologyOverview } from "@api-hooks/use-ontology-overview";
 import { useListOntologies } from "@api-hooks/use-list-ontologies";
 import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useCanManageOntology } from "@api-hooks/use-can-manage-ontology";
 import { useNamespace } from "@api-hooks/use-namespace";
 import {
   deleteOntology,
@@ -97,6 +98,8 @@ export function InducedOntologyDetailPage() {
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const isDeleting = record?.status === "deleting";
+  // A role that only reads (a data analyst) is not offered a delete the API would refuse it.
+  const canDelete = useCanManageOntology(namespaceId);
 
   function closeDeleteModal() {
     setShowDeleteModal(false);
@@ -225,9 +228,15 @@ export function InducedOntologyDetailPage() {
           <SpaceBetween direction="horizontal" size="xs">
             {isDeleting && (
               <Box padding={{ top: "xxs" }}>
-                <StatusIndicator type="in-progress">
-                  {t("Delete in progress")}
-                </StatusIndicator>
+                {record?.deleteError ? (
+                  <StatusIndicator type="error">
+                    {t("Delete failed")}
+                  </StatusIndicator>
+                ) : (
+                  <StatusIndicator type="in-progress">
+                    {t("Delete in progress")}
+                  </StatusIndicator>
+                )}
               </Box>
             )}
             <Button
@@ -237,12 +246,15 @@ export function InducedOntologyDetailPage() {
             >
               {t("Download .ttl")}
             </Button>
+            {/* A failed delete stays "deleting" with a deleteError; re-issuing retries it. */}
             <Button
               onClick={() => setShowDeleteModal(true)}
-              disabled={isDeleting}
-              disabledReason={t(
-                "A delete is already in progress for this ontology.",
-              )}
+              disabled={(isDeleting && !record?.deleteError) || !canDelete}
+              disabledReason={
+                canDelete
+                  ? t("A delete is already in progress for this ontology.")
+                  : t("Your role on this namespace does not allow this.")
+              }
             >
               {t("Delete ontology")}
             </Button>

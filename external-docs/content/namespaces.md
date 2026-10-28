@@ -194,7 +194,9 @@ Before deleting, the namespace must be:
 That's the only precondition on the namespace's *contents*. The only thing
 that can still block the call is something **actively in-flight** right now
 — a source mid-scan/enrichment, an ontology induction/ingest job that hasn't
-reached a terminal state, or a metric import job still `IN_PROGRESS` — since
+reached a terminal state, a proposal being accepted, a version being
+published or deployed, a domain ABox build, an Ontology designer assistant turn,
+or a metric import job still `IN_PROGRESS` — since
 deleting a child resource out from under a job that's still writing to it
 would race. Merely *having* sources, ontologies, or metrics does not block
 deletion; those are removed by the pipeline itself.

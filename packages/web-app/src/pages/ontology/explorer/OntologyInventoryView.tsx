@@ -43,30 +43,44 @@ const TYPE_MESSAGES: Record<string, AppMessage> = {
   Unknown: "Unknown",
 };
 
-export function OntologyInventoryView({
-  apiClient,
-  namespace,
-}: {
+interface OntologyInventoryViewProps {
   apiClient: ApiClient;
   namespace?: string;
-}) {
+}
+
+/**
+ * Keyed by namespace, so switching namespaces starts from scratch: no rows or
+ * counts of the previous namespace show under the new one, and its in-flight
+ * answers are dropped.
+ */
+export function OntologyInventoryView(props: OntologyInventoryViewProps) {
+  return <NamespaceOntologyInventory key={props.namespace ?? ""} {...props} />;
+}
+
+function NamespaceOntologyInventory({
+  apiClient,
+  namespace,
+}: OntologyInventoryViewProps) {
   const { t } = useAppI18n();
   const navigate = useNavigate();
   const [items, setItems] = useState<ListedOntology[]>([]);
+  // Only loads the user waits on (the first one, Refresh) set this. A poll
+  // leaves the rows on screen until it answers, so the table always shows the
+  // rows the counters count.
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
+  const [reload, setReload] = useState({ key: 0, background: false });
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
 
   useEffect(() => {
     if (!namespace) return;
-    setLoading(true);
+    if (!reload.background) setLoading(true);
     setError(null);
     listOntologies(apiClient, namespace)
       .then(setItems)
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [apiClient, namespace, refreshKey]);
+  }, [apiClient, namespace, reload]);
 
   // Poll while a row is mid-delete so "Delete in progress" clears itself instead
   // of looking hung. Same 4s cadence as the Induction page's poll.
@@ -80,7 +94,10 @@ export function OntologyInventoryView({
   );
   useEffect(() => {
     if (!namespace || !hasDeleting) return;
-    const id = window.setInterval(() => setRefreshKey((k) => k + 1), 4000);
+    const id = window.setInterval(
+      () => setReload((r) => ({ key: r.key + 1, background: true })),
+      4000,
+    );
     return () => window.clearInterval(id);
   }, [namespace, hasDeleting]);
 
@@ -130,10 +147,11 @@ export function OntologyInventoryView({
               ),
             cell: (o) => {
               // Only induced ontologies have a detail page, and not while their
-              // graph is being torn down.
+              // graph is being torn down, unless the delete failed, since the
+              // page is where it is retried.
               const href =
                 ontologyTypeGroup(o.ontologyType) === "induced" &&
-                o.status !== "deleting"
+                (o.status !== "deleting" || !!o.deleteError)
                   ? `/namespaces/${namespace}/ontology/induced?ontology_id=${encodeURIComponent(
                       o.ontologyId,
                     )}`
@@ -277,7 +295,9 @@ export function OntologyInventoryView({
                 <Button
                   iconName="refresh"
                   loading={loading}
-                  onClick={() => setRefreshKey((k) => k + 1)}
+                  onClick={() =>
+                    setReload((r) => ({ key: r.key + 1, background: false }))
+                  }
                 >
                   {t("Refresh")}
                 </Button>

@@ -23,7 +23,7 @@ from typing import Any
 import boto3
 import structlog
 
-from coa_control_plane.namespace.cleanup import delete_graphrag_indexes
+from coa_control_plane.namespace.cleanup import delete_graphrag_indexes, stop_domain_abox_builds
 
 logger = structlog.get_logger(__name__)
 
@@ -100,8 +100,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     sources remain in this namespace" becomes true, so it is where they can be
     dropped. Nothing deleted them before, leaving one index set per deleted
     namespace against a collection AOSS caps at 1000 indexes.
+
+    Before the first source delete, stops the namespace's domain ABox builds
+    (best-effort): each document source delete starts a deletion pipeline that
+    ends by requesting a build, which must not start on a namespace being torn
+    down. DeleteOntology stops them again and waits out one still running.
     """
     namespace_id = event["namespaceId"]
+    stop_domain_abox_builds(namespace_id)
     deleted = 0
     next_token: str | None = None
 

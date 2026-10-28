@@ -44,6 +44,25 @@ def mock_graph():
     return client
 
 
+def _existence_checks(client: AsyncMock) -> list[str]:
+    """The existence-check queries sent, in order.
+
+    The validator also reads the namespace's unmapped properties, once a minute; these
+    tests are about the existence check alone.
+    """
+    return [c[0][0] for c in client.query.call_args_list if "COUNT(DISTINCT ?s)" in c[0][0]]
+
+
+def _counts(*found: str):
+    """A query side effect: the existence checks find ``found`` in turn; the unmapped read finds nothing."""
+    pending = list(found)
+
+    async def query(sparql, **_kwargs):
+        return [{"found": pending.pop(0)}] if "COUNT(DISTINCT ?s)" in sparql else []
+
+    return query
+
+
 @pytest.fixture
 def validator(mock_graph):
     return SPARQLValidator(graph_client=mock_graph, graph_uri_template=_TEMPLATE)
@@ -56,7 +75,7 @@ class TestUriExistenceCheckScoping:
         result = await validator.validate(_SPARQL_WITH_URI, "test-ns", graph_iris=[_G1])
 
         assert result.valid is True
-        query = mock_graph.query.call_args[0][0]
+        (query,) = _existence_checks(mock_graph)
         assert f"GRAPH <{_G1}>" in query
         # The whole point: no cluster-wide match-then-filter.
         assert "GRAPH ?g" not in query
@@ -67,7 +86,7 @@ class TestUriExistenceCheckScoping:
     async def test_two_graphs_union_both(self, validator, mock_graph):
         await validator.validate(_SPARQL_WITH_URI, "test-ns", graph_iris=[_G1, _G2])
 
-        query = mock_graph.query.call_args[0][0]
+        (query,) = _existence_checks(mock_graph)
         assert f"GRAPH <{_G1}>" in query
         assert f"GRAPH <{_G2}>" in query
         assert "UNION" in query
@@ -78,7 +97,7 @@ class TestUriExistenceCheckScoping:
         """No graphs resolved degrades to slow, never to no validation."""
         await validator.validate(_SPARQL_WITH_URI, "test-ns", graph_iris=graphs)
 
-        query = mock_graph.query.call_args[0][0]
+        (query,) = _existence_checks(mock_graph)
         assert "GRAPH ?g" in query
         assert 'STRSTARTS(STR(?g), "https://ontology-workbench.local/test-ns/")' in query
 
@@ -87,7 +106,7 @@ class TestUriExistenceCheckScoping:
         many = [f"{_G1}-{i}" for i in range(_MAX_INLINED_GRAPHS + 1)]
         await validator.validate(_SPARQL_WITH_URI, "test-ns", graph_iris=many)
 
-        query = mock_graph.query.call_args[0][0]
+        (query,) = _existence_checks(mock_graph)
         assert "GRAPH ?g" in query
         assert "STRSTARTS" in query
 
@@ -111,32 +130,32 @@ class TestUriExistenceCheckScoping:
         namespace. Rejecting on the scoped count alone would false-reject a valid
         query, so the shortfall is re-checked against the whole prefix.
         """
-        mock_graph.query.side_effect = [[{"found": "0"}], [{"found": "1"}]]
+        mock_graph.query.side_effect = _counts("0", "1")
         validator = SPARQLValidator(graph_client=mock_graph, graph_uri_template=_TEMPLATE)
 
         result = await validator.validate(_SPARQL_WITH_URI, "test-ns", graph_iris=[_G1])
 
         assert result.valid is True, "a URI outside the marked graphs must not be a rejection"
-        first, second = (c[0][0] for c in mock_graph.query.call_args_list)
+        first, second = _existence_checks(mock_graph)
         assert f"GRAPH <{_G1}>" in first and "STRSTARTS" not in first  # fast path stays scoped
         assert "STRSTARTS" in second  # only the rejection path pays the second query
 
     async def test_a_genuine_miss_still_rejects_after_the_recheck(self, mock_graph):
         """The re-check confirms rather than excuses: an absent URI still fails."""
-        mock_graph.query.side_effect = [[{"found": "0"}], [{"found": "0"}]]
+        mock_graph.query.side_effect = _counts("0", "0")
         validator = SPARQLValidator(graph_client=mock_graph, graph_uri_template=_TEMPLATE)
 
         result = await validator.validate(_SPARQL_WITH_URI, "test-ns", graph_iris=[_G1])
 
         assert result.valid is False
         assert result.error == "URI not found in ontology"
-        assert len(mock_graph.query.call_args_list) == 2
+        assert len(_existence_checks(mock_graph)) == 2
 
     async def test_a_passing_check_never_pays_the_second_query(self, validator, mock_graph):
         """The re-check is on the reject path only — the common case is one query."""
         await validator.validate(_SPARQL_WITH_URI, "test-ns", graph_iris=[_G1])
 
-        assert len(mock_graph.query.call_args_list) == 1
+        assert len(_existence_checks(mock_graph)) == 1
 
 
 class TestDomainRangeAskScoping:

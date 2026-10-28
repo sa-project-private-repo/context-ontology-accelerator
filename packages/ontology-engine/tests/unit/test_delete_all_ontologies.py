@@ -4,12 +4,32 @@
 
 """Unit tests for DELETE /ontologies/ (delete all ontologies in namespace)."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _versions_aws(versions_aws):
+    """Moto DynamoDB/S3: the delete routes take the namespace deploy lock and reset ontology versions."""
+    return versions_aws
+
+
+@pytest.fixture(autouse=True)
+def abox_drop_graphs():
+    """The domain ABox graph drop talks to Neptune; these tests see it as a mock."""
+    with patch("coa_ontology.abox.build.drop_graphs") as drop:
+        yield drop
+
+
+@pytest.fixture(autouse=True)
+def abox_stop_builds():
+    """No domain ABox build to stop unless a test says otherwise."""
+    with patch("coa_ontology.abox.build.stop_builds", return_value=0.0) as stop:
+        yield stop
 
 
 @pytest.fixture()
@@ -49,6 +69,105 @@ class TestDeleteAllOntologies:
         assert mock_graph.delete_ontology.call_count == 2
         mock_vector.delete_index.assert_called_once_with(namespace="test-ns")
         mock_delete_all.assert_called_once_with("test-ns")
+
+    @patch("coa_ontology.dynamo_store.list_ontologies_registry")
+    @patch("coa_ontology.dynamo_store.delete_all_namespace_items")
+    def test_drops_the_domain_abox_graphs_before_the_ddb_purge(
+        self, mock_delete_all, mock_list, client, abox_drop_graphs
+    ):
+        """The drop reads the ABOX state row for its in-flight build id, which the purge deletes."""
+        test_client, _, mock_vector = client
+        mock_list.return_value = []
+        mock_vector.delete_index.return_value = True
+        order: list[str] = []
+        abox_drop_graphs.side_effect = lambda *_a, **_k: order.append("drop_graphs")
+        mock_delete_all.side_effect = lambda *_a, **_k: order.append("purge") or 0
+
+        resp = test_client.delete("/ontologies/?namespace=test-ns")
+
+        assert resp.status_code == 200
+        abox_drop_graphs.assert_called_once_with("test-ns")
+        assert order == ["drop_graphs", "purge"]
+
+    @patch("coa_ontology.dynamo_store.list_ontologies_registry")
+    @patch("coa_ontology.dynamo_store.delete_all_namespace_items")
+    def test_stops_the_abox_builds_and_outwaits_one_before_deleting_anything(
+        self, mock_delete_all, mock_list, client, abox_drop_graphs, abox_stop_builds
+    ):
+        """Each document source the pipeline deleted before this step requests an ABox build when its
+        own deletion pipeline ends. A build still running must not write after the drops and the purge."""
+        test_client, mock_graph, mock_vector = client
+        mock_list.return_value = [{"ontology_id": "http://ex.org/ont1"}]
+        order: list[str] = []
+        abox_stop_builds.side_effect = lambda *_a: order.append("stop_builds") or 42.0
+        mock_graph.delete_ontology.side_effect = lambda *_a: order.append("drop_ontology") or True
+        abox_drop_graphs.side_effect = lambda *_a: order.append("drop_graphs")
+        mock_vector.delete_index.side_effect = lambda **_k: order.append("delete_index") or True
+        mock_delete_all.side_effect = lambda *_a: order.append("purge") or 0
+
+        with patch("time.sleep", side_effect=lambda s: order.append(f"sleep {s:g}")):
+            resp = test_client.delete("/ontologies/?namespace=test-ns")
+
+        assert resp.status_code == 200
+        abox_stop_builds.assert_called_once_with("test-ns")
+        assert order == ["stop_builds", "sleep 42", "drop_ontology", "drop_graphs", "delete_index", "purge"]
+
+    @patch("coa_ontology.dynamo_store.list_ontologies_registry")
+    @patch("coa_ontology.dynamo_store.delete_all_namespace_items")
+    def test_a_teardown_that_cannot_stop_the_abox_builds_deletes_nothing(
+        self, mock_delete_all, mock_list, client, abox_drop_graphs, abox_stop_builds
+    ):
+        """Deleting while a build may still write is the race; failing lets the pipeline step retry."""
+        test_client, mock_graph, mock_vector = client
+        mock_list.return_value = [{"ontology_id": "http://ex.org/ont1"}]
+        abox_stop_builds.side_effect = RuntimeError("DynamoDB throttled")
+
+        with pytest.raises(RuntimeError, match="DynamoDB throttled"):
+            test_client.delete("/ontologies/?namespace=test-ns")
+
+        mock_graph.delete_ontology.assert_not_called()
+        abox_drop_graphs.assert_not_called()
+        mock_vector.delete_index.assert_not_called()
+        mock_delete_all.assert_not_called()
+
+    @patch("coa_ontology.dynamo_store.list_ontologies_registry")
+    @patch("coa_ontology.dynamo_store.delete_all_namespace_items")
+    def test_abox_graph_drop_failure_does_not_fail_the_purge(
+        self, mock_delete_all, mock_list, client, abox_drop_graphs
+    ):
+        test_client, _, mock_vector = client
+        mock_list.return_value = []
+        mock_vector.delete_index.return_value = True
+        mock_delete_all.return_value = 7
+        abox_drop_graphs.side_effect = RuntimeError("Neptune down")
+
+        resp = test_client.delete("/ontologies/?namespace=test-ns")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["indexDeleted"] is True and body["dynamoItemsDeleted"] == 7
+        abox_drop_graphs.assert_called_once_with("test-ns")
+        mock_delete_all.assert_called_once_with("test-ns")
+
+    @pytest.mark.parametrize("params", [{}, {"ontology_id": ""}], ids=["omitted", "empty"])
+    @patch("coa_ontology.dynamo_store.delete_all_namespace_items")
+    def test_a_public_call_without_ontology_id_is_refused(self, mock_delete_all, params, client):
+        """Only the control plane's teardown may wipe the namespace (version rows and deploy lock included).
+
+        The API proxy sets ``X-Coa-Principal`` on every public call; the teardown calls
+        the service directly without it (``test_deletes_graphs_index_and_ddb``).
+        """
+        test_client, mock_graph, mock_vector = client
+        resp = test_client.delete(
+            "/ontologies/",
+            params={"namespace": "test-ns", **params},
+            headers={"X-Coa-Principal": "alice%40example.com"},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "ontology_id is required"
+        mock_delete_all.assert_not_called()
+        mock_vector.delete_index.assert_not_called()
+        mock_graph.delete_ontology.assert_not_called()
 
     @patch("coa_ontology.dynamo_store.list_ontologies_registry")
     @patch("coa_ontology.dynamo_store.delete_all_namespace_items")
@@ -174,7 +293,7 @@ class TestDeleteSingleOntology:
         assert resp.status_code == 202
         # Row flipped to "deleting" (stays listed as "Delete in progress"),
         # clearing any stale delete_error from a prior attempt.
-        mock_upd_reg.assert_called_once_with("test-ns", oid, status="deleting", delete_error="")
+        mock_upd_reg.assert_called_once_with("test-ns", oid, status="deleting", delete_error="", delete_lock_id=ANY)
         # Graph + embeddings torn down.
         mock_graph.delete_ontology.assert_called_once_with(oid)
         mock_vector.delete_embeddings_for_ontology.assert_called_once_with(oid, namespace="test-ns")
@@ -311,7 +430,7 @@ class TestDeleteSingleOntology:
         resp = test_client.delete("/ontologies/", params={"namespace": "test-ns", "ontology_id": oid})
 
         assert resp.status_code == 202
-        mock_upd_reg.assert_called_once_with("test-ns", oid, status="deleting", delete_error="")
+        mock_upd_reg.assert_called_once_with("test-ns", oid, status="deleting", delete_error="", delete_lock_id=ANY)
 
     @patch("coa_ontology.catalog.routers.ontologies.Thread", _InlineThread)
     @patch("coa_ontology.dynamo_store.delete_proposal")
@@ -335,7 +454,7 @@ class TestDeleteSingleOntology:
         resp = test_client.delete("/ontologies/", params={"namespace": "test-ns", "ontology_id": oid})
 
         assert resp.status_code == 202
-        mock_upd_reg.assert_called_once_with("test-ns", oid, status="deleting", delete_error="")
+        mock_upd_reg.assert_called_once_with("test-ns", oid, status="deleting", delete_error="", delete_lock_id=ANY)
 
     @patch("coa_ontology.catalog.routers.ontologies.Thread", _InlineThread)
     @patch("coa_ontology.dynamo_store.delete_proposal")
@@ -393,8 +512,9 @@ class TestDeleteSingleOntology:
     @patch("coa_ontology.dynamo_store.update_ontology_registry")
     @patch("coa_ontology.dynamo_store.delete_ontology_registry")
     @patch("coa_ontology.dynamo_store.get_ontology_registry")
+    @patch("coa_ontology.dynamo_store.set_ontology_delete_error")
     def test_graph_delete_failure_keeps_registry_row(
-        self, mock_get_reg, mock_del_reg, mock_upd_reg, mock_list_props, mock_del_prop, client
+        self, mock_set_err, mock_get_reg, mock_del_reg, mock_upd_reg, mock_list_props, mock_del_prop, client
     ):
         """Neptune DROP failure must NOT remove the registry row — otherwise the
         ontology vanishes from the UI while its triples linger (orphaned quads).
@@ -411,12 +531,10 @@ class TestDeleteSingleOntology:
         assert resp.status_code == 202  # still 202 — teardown is async
         # Flipped to "deleting" up front, then stamped with delete_error so a
         # stuck row is distinguishable from one still in progress.
-        mock_upd_reg.assert_any_call("test-ns", oid, status="deleting", delete_error="")
-        err_calls = [c for c in mock_upd_reg.call_args_list if "delete_error" in c.kwargs and c.kwargs["delete_error"]]
-        assert err_calls, "expected a delete_error to be recorded on graph-delete failure"
-        assert "Graph delete failed" in err_calls[0].kwargs["delete_error"]
+        mock_upd_reg.assert_called_once_with("test-ns", oid, status="deleting", delete_error="", delete_lock_id=ANY)
+        mock_set_err.assert_called_once()
         # Returned by ListOntologies as deleteError: the type, never the backend's message.
-        assert err_calls[0].kwargs["delete_error"] == "Graph delete failed: RuntimeError"
+        assert mock_set_err.call_args.args[2] == "Graph delete failed: RuntimeError"
         # Hard gate: registry row NOT removed, embeddings + proposals not touched.
         mock_del_reg.assert_not_called()
         mock_vector.delete_embeddings_for_ontology.assert_not_called()
@@ -428,8 +546,9 @@ class TestDeleteSingleOntology:
     @patch("coa_ontology.dynamo_store.update_ontology_registry")
     @patch("coa_ontology.dynamo_store.delete_ontology_registry")
     @patch("coa_ontology.dynamo_store.get_ontology_registry")
+    @patch("coa_ontology.dynamo_store.set_ontology_delete_error")
     def test_embedding_delete_failure_keeps_registry_row(
-        self, mock_get_reg, mock_del_reg, mock_upd_reg, mock_list_props, mock_del_prop, client
+        self, mock_set_err, mock_get_reg, mock_del_reg, mock_upd_reg, mock_list_props, mock_del_prop, client
     ):
         """AOSS teardown failure must also NOT remove the registry row."""
         test_client, mock_graph, mock_vector = client
@@ -444,10 +563,9 @@ class TestDeleteSingleOntology:
         assert resp.status_code == 202
         mock_graph.delete_ontology.assert_called_once_with(oid)
         # delete_error records the embedding-teardown failure.
-        err_calls = [c for c in mock_upd_reg.call_args_list if "delete_error" in c.kwargs and c.kwargs["delete_error"]]
-        assert err_calls, "expected a delete_error to be recorded on embedding-delete failure"
-        assert "Embedding delete failed" in err_calls[0].kwargs["delete_error"]
-        assert "AOSS 503" not in err_calls[0].kwargs["delete_error"]
+        mock_set_err.assert_called_once()
+        assert "Embedding delete failed" in mock_set_err.call_args.args[2]
+        assert "AOSS 503" not in mock_set_err.call_args.args[2]
         # Hard gate: registry row NOT removed, proposals not touched.
         mock_del_reg.assert_not_called()
         mock_del_prop.assert_not_called()
@@ -458,8 +576,9 @@ class TestDeleteSingleOntology:
     @patch("coa_ontology.dynamo_store.update_ontology_registry")
     @patch("coa_ontology.dynamo_store.delete_ontology_registry")
     @patch("coa_ontology.dynamo_store.get_ontology_registry")
+    @patch("coa_ontology.dynamo_store.set_ontology_delete_error")
     def test_embedding_delete_incomplete_keeps_registry_row(
-        self, mock_get_reg, mock_del_reg, mock_upd_reg, mock_list_props, mock_del_prop, client
+        self, mock_set_err, mock_get_reg, mock_del_reg, mock_upd_reg, mock_list_props, mock_del_prop, client
     ):
         """A delete that stalls with embeddings still matching is a teardown
         failure too: it used to return normally, so the row was removed with the
@@ -491,9 +610,8 @@ class TestDeleteSingleOntology:
             resp = test_client.delete("/ontologies/", params={"namespace": "test-ns", "ontology_id": oid})
 
         assert resp.status_code == 202
-        err_calls = [c for c in mock_upd_reg.call_args_list if "delete_error" in c.kwargs and c.kwargs["delete_error"]]
-        assert err_calls, "expected a delete_error to be recorded on an incomplete embedding delete"
-        assert "Embedding delete failed: DeleteIncompleteError" in err_calls[0].kwargs["delete_error"]
+        mock_set_err.assert_called_once()
+        assert mock_set_err.call_args.args[2] == "Embedding delete failed: DeleteIncompleteError"
         mock_del_reg.assert_not_called()
         mock_del_prop.assert_not_called()
 

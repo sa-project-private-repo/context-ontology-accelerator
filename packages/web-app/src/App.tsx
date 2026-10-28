@@ -24,12 +24,14 @@ import { NamespacePermissions } from "./pages/NamespacePermissions";
 import { TableDetail } from "./pages/TableDetail";
 import { ProfilePage } from "./pages/ProfilePage";
 import { Playground } from "./pages/Playground";
+import { McpPage } from "./pages/McpPage";
 import { TraceDetail } from "./pages/TraceDetail";
 import { SourceList } from "./pages/SourceList";
 import { ConnectSource } from "./pages/ConnectSource";
 import { SourceDetail } from "./pages/SourceDetail";
 import { OntologyPage } from "./pages/OntologyPage";
-import { ProposalDetailPage } from "./pages/ontology/induce/ProposalDetail";
+import { ProposalDetailRoute } from "./pages/ontology/induce/ProposalDetail";
+import { StudioRoute } from "./pages/ontology/studio/StudioPage";
 import { GraphSearchPage } from "./pages/ontology/GraphSearch";
 import { InducedOntologyDetailPage } from "./pages/ontology/InducedOntologyDetail";
 import { OntologyClassDetailPage } from "./pages/ontology/OntologyClassDetail";
@@ -230,6 +232,11 @@ function AppShell() {
       section: t("Serve"),
       label: t("Playground"),
       href: "/playground",
+    },
+    {
+      section: t("Serve"),
+      label: t("MCP Server"),
+      href: "/mcp",
     },
     {
       section: t("Administration"),
@@ -507,6 +514,11 @@ function AppShell() {
                     text: t("Playground"),
                     href: "/playground",
                   },
+                  {
+                    type: "link",
+                    text: "MCP Server",
+                    href: "/mcp",
+                  },
                 ],
               },
               { type: "divider" },
@@ -590,7 +602,11 @@ function AppShell() {
               />
               <Route
                 path="/namespaces/:namespaceId/ontology/proposals/:proposalId"
-                element={<ProposalDetailPage />}
+                element={<ProposalDetailRoute />}
+              />
+              <Route
+                path="/namespaces/:namespaceId/ontology/proposals/:proposalId/studio"
+                element={<StudioRoute />}
               />
               <Route
                 path="/namespaces/:namespaceId/ontology/graph"
@@ -624,6 +640,7 @@ function AppShell() {
               <Route path="/system-health" element={<SystemHealthPage />} />
               <Route path="/profile" element={<ProfilePage />} />
               <Route path="/playground" element={<Playground />} />
+              <Route path="/mcp" element={<McpPage />} />
               <Route
                 path="/playground/trace/:sessionId/:requestId"
                 element={<TraceDetail />}

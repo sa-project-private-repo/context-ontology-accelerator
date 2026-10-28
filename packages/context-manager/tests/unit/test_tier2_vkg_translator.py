@@ -5,23 +5,25 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from coa_common.constants import RESOURCE_PREFIX
 from coa_serve.clients.base import QueryResult as ExecQueryResult
-from coa_serve.clients.vkg import SparqlProjection, VKGClient, VKGResult, VKGTranslationError
+from coa_serve.clients.vkg import SparqlProjection, VKGClient, VKGResult, VKGTranslationError, VKGUnavailableError
+from coa_serve.served_version import ServedVersionReader
 from coa_serve.tier2.ontop.vkg_translator import (
+    VKG_NO_MAPPING,
     Tier2Status,
     Tier2Step,
     VKGTranslator,
 )
-from coa_serve.tier2.sql_firewall import FirewallResult, SQLFirewall
+from coa_serve.tier2.sql_firewall import FirewallResult, NullCedarAuthorizer, SQLFirewall
 
 _TEST_VKG_ENDPOINT = "http://vkg.test-services.local:8080"
 
 
-def _make_vkg_client(sql="SELECT 1", tables=None, error=None, projection=None):
+def _make_vkg_client(sql="SELECT 1", tables=None, error=None, projection=None, ontology_version="v2.1"):
     client = AsyncMock(spec=VKGClient)
     if error:
         client.translate.side_effect = error
@@ -29,20 +31,21 @@ def _make_vkg_client(sql="SELECT 1", tables=None, error=None, projection=None):
         client.translate.return_value = VKGResult(
             sql=sql,
             dialect="postgresql",
-            ontology_version="v2.1",
+            ontology_version=ontology_version,
             source_table_refs=tables or ["catalog.schema.orders"],
             projection=projection,
         )
     return client
 
 
-def _make_translator(vkg_client=None, firewall=None, executor=None, sources_registry=None):
+def _make_translator(vkg_client=None, firewall=None, executor=None, sources_registry=None, served_versions=None):
     """Create a VKGTranslator with a mocked VKG client seeded for test namespaces."""
     translator = VKGTranslator(
         vkg_endpoint=_TEST_VKG_ENDPOINT,
         firewall=firewall or _make_firewall(),
         query_executor=executor or _make_executor(),
         sources_registry=sources_registry,
+        served_versions=served_versions,
     )
     if vkg_client:
         translator._clients["demo"] = vkg_client
@@ -166,6 +169,27 @@ class TestVKGTranslatorErrors:
         assert len(result.trace_steps) == 1
         assert result.trace_steps[0].status == Tier2Status.ERROR
 
+    async def test_a_vkg_that_is_not_running_is_not_a_translation_error(self):
+        """An unreachable or reloading VKG was reported as a query it could not translate."""
+        vkg = _make_vkg_client(error=VKGUnavailableError("VKG request failed after 3 attempts: ConnectError"))
+        executor = _make_executor()
+        translator = _make_translator(vkg_client=vkg, firewall=_make_firewall(), executor=executor)
+        result = await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        assert result.error == "vkg_unavailable" and result.query_result is None
+        assert [(s.step, s.status) for s in result.trace_steps] == [(Tier2Step.VKG_COMPILE, Tier2Status.ERROR)]
+        executor.execute.assert_not_awaited()
+
+    async def test_a_caller_that_stops_waiting_sees_the_steps_done_so_far(self):
+        """A caller's deadline cannot tell a VKG that never answered from slow SQL otherwise."""
+        steps: list = []
+        translator = _make_translator(
+            vkg_client=_make_vkg_client(), firewall=_make_firewall(), executor=_make_executor()
+        )
+        result = await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo", trace_steps=steps)
+
+        assert result.trace_steps is steps and [s.step for s in steps][0] == Tier2Step.VKG_COMPILE
+
     async def test_firewall_denied(self):
         translator = _make_translator(
             vkg_client=_make_vkg_client(),
@@ -220,6 +244,19 @@ class TestVKGTranslatorErrors:
         assert result.query_result is None
         assert result.vkg_result is not None
         assert result.firewall_result is not None
+
+    async def test_an_executor_timeout_is_reported_as_a_timeout(self):
+        from coa_serve.clients.athena import AthenaTimeoutError
+
+        translator = _make_translator(
+            vkg_client=_make_vkg_client(),
+            firewall=_make_firewall(),
+            executor=_make_executor(error=AthenaTimeoutError("Athena query q timed out after 20s")),
+        )
+        result = await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
+
+        assert result.error == "query_timeout"
+        assert result.query_result is None
         assert len(result.trace_steps) == 4  # vkg_translate + authorize + firewall + execute
         assert result.trace_steps[3].status == Tier2Status.ERROR
 
@@ -236,6 +273,218 @@ class TestVKGTranslatorErrors:
 
         assert result.error == "firewall_error"
         assert result.query_result is None
+
+
+def _served(*versions: str, error: Exception | None = None):
+    """A stand-in for the reader of the ontology versions Neptune serves."""
+    reader = AsyncMock()
+    if error:
+        reader.versions.side_effect = error
+    else:
+        reader.versions.return_value = frozenset(versions)
+    return reader
+
+
+_TEMPLATE = "https://ontology-workbench.local/{namespace}"
+
+
+class _Neptune:
+    """Serves one published version until a deploy swaps it, counting the reads that reach it."""
+
+    def __init__(self, version: str) -> None:
+        self.version = version
+        self.reads = 0
+
+    async def query(self, sparql: str, **_kwargs):
+        self.reads += 1
+        return [{"v": self.version}]
+
+
+@pytest.mark.unit
+class TestVKGTranslatorVersionSkew:
+    """After a deploy the VKG task reloads on its own, and a failed reload keeps the old
+    task serving. Meanwhile the T-Box prompt names the new version's IRIs while Ontop
+    compiles against the old mapping, so its SQL answers a different ontology. The
+    translate response names the version Ontop loaded; when it parses and differs from
+    the one Neptune serves, the translator stops before the firewall."""
+
+    async def test_a_vkg_on_another_version_is_a_skew_and_nothing_runs(self):
+        fw, executor = _make_firewall(), _make_executor()
+        reader = _served("v2")
+        translator = _make_translator(
+            vkg_client=_make_vkg_client(ontology_version="v1"), firewall=fw, executor=executor, served_versions=reader
+        )
+
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :PurchaseOrder }", namespace="demo")
+
+        assert result.error == "vkg_version_skew"
+        assert result.query_result is None
+        fw.evaluate.assert_not_called()
+        executor.execute.assert_not_called()
+        # The kept read is confirmed by a fresh one before the translation is refused.
+        assert reader.versions.await_args_list == [call("demo"), call("demo", fresh=True)]
+        (step,) = result.trace_steps
+        assert (step.step, step.status) == (Tier2Step.VKG_COMPILE, Tier2Status.ERROR)
+        assert step.detail == {
+            "error": "vkg_version_skew",
+            "reason": "The VKG still serves v1; the ontology is v2.",
+            "vkgVersion": "v1",
+            "ontologyVersion": "v2",
+        }
+
+    async def test_the_same_version_runs_as_before(self):
+        translator = _make_translator(vkg_client=_make_vkg_client(ontology_version="v2"), served_versions=_served("v2"))
+
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :PurchaseOrder }", namespace="demo")
+
+        assert result.error is None and result.query_result is not None
+        assert [s.status for s in result.trace_steps] == [Tier2Status.OK] * 4
+
+    @pytest.mark.parametrize("vkg_version", ["unknown", "none", "latest", "v2.1", "2026-10-15T00:00:00Z", ""])
+    async def test_a_vkg_version_that_does_not_parse_is_not_compared(self, vkg_version):
+        translator = _make_translator(
+            vkg_client=_make_vkg_client(ontology_version=vkg_version), served_versions=_served("v2")
+        )
+
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :Order }", namespace="demo")
+
+        assert result.error is None and result.query_result is not None
+
+    @pytest.mark.parametrize("served", [(), ("v1", "v2")])
+    async def test_a_namespace_without_exactly_one_published_version_is_not_compared(self, served):
+        translator = _make_translator(
+            vkg_client=_make_vkg_client(ontology_version="v1"), served_versions=_served(*served)
+        )
+
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :Order }", namespace="demo")
+
+        assert result.error is None and result.query_result is not None
+
+    async def test_an_unreadable_neptune_version_is_not_compared(self):
+        translator = _make_translator(
+            vkg_client=_make_vkg_client(ontology_version="v1"), served_versions=_served(error=TimeoutError())
+        )
+
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :Order }", namespace="demo")
+
+        assert result.error is None and result.query_result is not None
+
+    async def test_a_failed_confirming_read_is_not_compared(self):
+        reader = AsyncMock()
+        reader.versions.side_effect = [frozenset({"v2"}), TimeoutError()]
+        translator = _make_translator(vkg_client=_make_vkg_client(ontology_version="v1"), served_versions=reader)
+
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :Order }", namespace="demo")
+
+        assert result.error is None and result.query_result is not None
+
+    async def test_a_read_kept_from_before_a_deploy_the_vkg_already_loaded_is_not_a_skew(self):
+        """The reader keeps a read for a minute, and the VKG can finish reloading inside it."""
+        neptune = _Neptune("v1")
+        reader = ServedVersionReader(neptune, graph_uri_template=_TEMPLATE)
+        translator = _make_translator(vkg_client=_make_vkg_client(ontology_version="v1"), served_versions=reader)
+        assert (await translator.resolve("SELECT ?o WHERE { ?o a :Order }", namespace="demo")).error is None
+
+        # The deploy swaps Neptune to v2, and the VKG has loaded v2 before the kept read expires.
+        neptune.version = "v2"
+        translator._clients["demo"] = _make_vkg_client(ontology_version="v2")
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :PurchaseOrder }", namespace="demo")
+
+        assert result.error is None and result.query_result is not None
+        assert neptune.reads == 2
+
+    async def test_a_skew_names_the_version_the_fresh_read_finds(self):
+        neptune = _Neptune("v1")
+        reader = ServedVersionReader(neptune, graph_uri_template=_TEMPLATE)
+        await reader.versions("demo")  # kept from before the deploy
+        neptune.version = "v3"
+        translator = _make_translator(vkg_client=_make_vkg_client(ontology_version="v2"), served_versions=reader)
+
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :PurchaseOrder }", namespace="demo")
+
+        assert result.error == "vkg_version_skew"
+        assert result.trace_steps[0].detail["reason"] == "The VKG still serves v2; the ontology is v3."
+
+    async def test_a_matching_version_is_read_once_for_many_queries(self):
+        neptune = _Neptune("v2")
+        translator = _make_translator(
+            vkg_client=_make_vkg_client(ontology_version="v2"),
+            served_versions=ServedVersionReader(neptune, graph_uri_template=_TEMPLATE),
+        )
+
+        for _ in range(3):
+            assert (await translator.resolve("SELECT ?o WHERE { ?o a :Order }", namespace="demo")).error is None
+
+        assert neptune.reads == 1
+
+    async def test_against_the_deployed_graph(self):
+        from .deployed_graph import NS, TEMPLATE, designer_v2_dataset, neptune_over
+
+        reader = ServedVersionReader(neptune_over(designer_v2_dataset()), graph_uri_template=TEMPLATE)
+        vkg = _make_vkg_client(ontology_version="v1")
+        translator = _make_translator(served_versions=reader)
+        translator._clients[NS] = vkg
+
+        result = await translator.resolve("SELECT ?o WHERE { ?o a :PurchaseOrder }", namespace=NS)
+
+        assert result.error == "vkg_version_skew"
+        assert result.trace_steps[0].detail["reason"] == "The VKG still serves v1; the ontology is v2."
+
+
+# What Ontop 5.5.0 answers when no table mapping matches the query: its empty plan, which the VKG
+# passes on as it is, or for an aggregate its one-row placeholder. An ASK over a mapped class also
+# selects uselessVariable, from the class's table.
+_EMPTY_PLAN = VKGResult(sql="ans1(c, t)\nEMPTY [c, t]", dialect="trino", ontology_version="v2")
+_PLACEHOLDER = VKGResult(
+    sql="SELECT 1 AS uselessVariable FROM (SELECT 1) AS tdummy", dialect="trino", ontology_version="v2"
+)
+_ASK_OVER_A_MAPPED_CLASS = VKGResult(
+    sql='SELECT 1 AS uselessVariable FROM "orders" AS V1 LIMIT 1',
+    dialect="trino",
+    ontology_version="v2",
+    source_table_refs=["orders"],
+)
+
+
+@pytest.mark.unit
+class TestVKGTranslatorWithoutTable:
+    @staticmethod
+    def _vkg(answer: VKGResult) -> AsyncMock:
+        client = AsyncMock(spec=VKGClient)
+        client.translate.return_value = answer
+        return client
+
+    @pytest.mark.parametrize("answer", [_EMPTY_PLAN, _PLACEHOLDER], ids=["empty plan", "placeholder"])
+    async def test_the_console_s_query_stops_before_the_firewall(self, answer):
+        fw, executor = _make_firewall(), _make_executor()
+        translator = _make_translator(vkg_client=self._vkg(answer), firewall=fw, executor=executor)
+
+        result = await translator.resolve("SELECT ?c WHERE { }", namespace="demo", refuse_without_table=True)
+
+        assert result.error == VKG_NO_MAPPING and result.query_result is None
+        assert [s.step for s in result.trace_steps] == [Tier2Step.VKG_COMPILE]
+        fw.evaluate.assert_not_called()
+        executor.execute.assert_not_called()
+
+    async def test_an_ask_over_a_mapped_class_reads_its_table_and_runs(self):
+        executor = _make_executor()
+        translator = _make_translator(vkg_client=self._vkg(_ASK_OVER_A_MAPPED_CLASS), executor=executor)
+
+        result = await translator.resolve("ASK { ?o a :Orders }", namespace="demo", refuse_without_table=True)
+
+        assert result.error is None
+        executor.execute.assert_called_once()
+
+    async def test_the_tier2_strategies_get_both_answers_as_before(self):
+        # The empty plan is not SQL, so the firewall fails on it; the placeholder runs.
+        firewall = SQLFirewall(NullCedarAuthorizer())
+        translator = _make_translator(vkg_client=self._vkg(_EMPTY_PLAN), firewall=firewall)
+        assert (await translator.resolve("SELECT ?c WHERE { }", namespace="demo")).error == "firewall_error"
+
+        executor = _make_executor(rows=[{"uselessvariable": 1}])
+        translator = _make_translator(vkg_client=self._vkg(_PLACEHOLDER), executor=executor)
+        result = await translator.resolve("SELECT ?c WHERE { }", namespace="demo")
+        assert result.error is None and result.query_result.rows == [{"uselessvariable": 1}]
 
 
 @pytest.mark.unit
@@ -497,6 +746,24 @@ class TestVKGTranslatorCrossSourceQualification:
 
         assert result.executed_sql == executor.execute.call_args.args[0]
         assert result.executed_sql != self._SQL, "executed_sql still holds the un-qualified translate output"
+
+    async def test_reported_executed_sql_is_the_engine_s_statement_when_the_executor_names_it(self):
+        """The executor adds its row cap (and may transpile); 'SQL that ran' did not show it."""
+        ran = "SELECT a.id FROM claims a JOIN policies b ON a.id = b.claim_id\nLIMIT 1001"
+        executor = _make_executor()
+        executor.execute.return_value = ExecQueryResult(
+            rows=[{"id": 1}], columns=["id"], row_count=1, truncated=False, sql=ran
+        )
+        projection = SparqlProjection(select_vars=["s"], var_to_column={"s": "id"})
+        translator = _make_translator(
+            vkg_client=_make_vkg_client(sql=self._SQL, projection=projection),
+            firewall=self._firewall(),
+            executor=executor,
+        )
+        result = await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo", max_rows=1001)
+
+        assert result.query_result is not None and result.query_result.rows == [{"s": 1}]  # projected
+        assert result.executed_sql == ran
 
     async def test_single_source_sql_reaches_executor_verbatim(self):
         """No regression on the path that already works."""

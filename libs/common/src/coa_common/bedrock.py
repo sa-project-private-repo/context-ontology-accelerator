@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import boto3
 from botocore.config import Config
@@ -196,8 +197,22 @@ class BedrockClient:
 
         return False
 
-    def invoke(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> BedrockInvocationResult:
-        """Call Bedrock via Converse API, parse JSON response, and return result with token usage + latency."""
+    def invoke(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 4096,
+        temperature: float | None = None,
+    ) -> BedrockInvocationResult:
+        """Call Bedrock via Converse API, parse JSON response, and return result with token usage + latency.
+
+        Args:
+            system_prompt: System prompt.
+            user_prompt: User prompt.
+            max_tokens: Maximum output tokens.
+            temperature: Sampling temperature. Left out of the request when ``None``,
+                so the model's default applies.
+        """
         input_chars = len(system_prompt) + len(user_prompt)
         if input_chars > self._max_input_chars:
             logger.warning("Bedrock input too large: %d chars (limit %d)", input_chars, self._max_input_chars)
@@ -205,11 +220,14 @@ class BedrockClient:
                 f"Combined prompt is {input_chars} chars, exceeds limit of {self._max_input_chars}"
             )
         start = time.monotonic()
+        inference: dict[str, Any] = {"maxTokens": max_tokens}
+        if temperature is not None:
+            inference["temperature"] = temperature
         kwargs = {
             "modelId": self._model_id,
             "messages": [{"role": "user", "content": [{"text": user_prompt}]}],
             "system": [{"text": system_prompt}],
-            "inferenceConfig": {"maxTokens": max_tokens},
+            "inferenceConfig": inference,
         }
         if self._guardrail_id:
             kwargs["guardrailConfig"] = {

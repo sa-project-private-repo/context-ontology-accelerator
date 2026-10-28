@@ -109,3 +109,21 @@ def test_update_rebuild_reads_a_mock_datasource_from_the_fixture(sources, monkey
         proposals._apply_grounding_overrides("p-mock", {}, item, namespace="ns")
     assert sources == [("fixture", "ds-pc-insurance-mock")]
     assert built["tables"] == ["policy"]
+
+
+def test_publish_schema_sql_reads_a_mock_datasource_from_the_fixture(sources, monkeypatch):
+    """The version publish declares a mock source's tables, so its proposal can be accepted.
+
+    Regression for the deployed ``test_reinduction_duplicate_of_points_at_existing_proposal``:
+    schema.sql generation asked SMUS for the mock ID, got no tables, and the publish
+    failed closed on every mapped table.
+    """
+    monkeypatch.setenv("CATALOG_SOURCE", "smus")
+    mapping = (
+        '@prefix rr: <http://www.w3.org/ns/r2rml#> .\n<#tm_policy> rr:logicalTable [ rr:tableName "\\"policy\\"" ] .\n'
+    )
+    ddl = proposals._generate_schema_sql(
+        "ns", "ont-1", mapping, extra_datasource_ids=["ds-pc-insurance-mock"], scan_accepted=False
+    )
+    assert sources == [("fixture", "ds-pc-insurance-mock")]
+    assert ddl and 'CREATE TABLE IF NOT EXISTS "policy" (' in ddl

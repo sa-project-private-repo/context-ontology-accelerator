@@ -72,6 +72,98 @@ export function mergeOpenApiPaths(
 }
 
 /**
+ * Removes the modelled request and response examples from `spec`, mutating it.
+ *
+ * The spec is inlined into the API stack's template, which CloudFormation caps
+ * at 1 MB, and API Gateway does not use examples (neither for routing nor for
+ * request validation). The generated `openapi.json`, which the API reference
+ * is built from, keeps them. Only the `examples` / `example` of parameters
+ * and of media types are removed: a schema property that happens to be named
+ * `examples` is part of the contract and stays.
+ */
+export function stripOpenApiExamples(
+  spec: Record<string, unknown>,
+): Record<string, unknown> {
+  const isObject = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+  const dropExamples = (holder: unknown): void => {
+    if (!isObject(holder)) return;
+    delete holder.examples;
+    delete holder.example;
+  };
+  const dropContentExamples = (content: unknown): void => {
+    if (!isObject(content)) return;
+    Object.values(content).forEach(dropExamples);
+  };
+  const paths = isObject(spec.paths) ? spec.paths : {};
+  for (const methods of Object.values(paths)) {
+    if (!isObject(methods)) continue;
+    for (const operation of Object.values(methods)) {
+      if (!isObject(operation)) continue;
+      if (Array.isArray(operation.parameters)) {
+        operation.parameters.forEach(dropExamples);
+      }
+      if (isObject(operation.requestBody)) {
+        dropContentExamples(operation.requestBody.content);
+      }
+      if (isObject(operation.responses)) {
+        for (const response of Object.values(operation.responses)) {
+          if (isObject(response)) dropContentExamples(response.content);
+        }
+      }
+    }
+  }
+  return spec;
+}
+
+/**
+ * Removes the operation and schema descriptions from `spec`, mutating it.
+ *
+ * Like the examples (see `stripOpenApiExamples`), descriptions only grow the
+ * inlined spec: API Gateway uses them neither for routing nor for request
+ * validation, and the generated `openapi.json` keeps them for the API
+ * reference. Removed are an operation's `description` and the `description`
+ * of every schema under `components.schemas`, including nested property,
+ * item and composed schemas. A property that happens to be named
+ * `description` is part of the contract and stays, and so do the response
+ * descriptions, which OpenAPI requires.
+ */
+export function stripOpenApiDescriptions(
+  spec: Record<string, unknown>,
+): Record<string, unknown> {
+  const isObject = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+  const dropSchema = (schema: unknown): void => {
+    if (!isObject(schema)) return;
+    if (typeof schema.description === "string") delete schema.description;
+    if (isObject(schema.properties)) {
+      Object.values(schema.properties).forEach(dropSchema);
+    }
+    dropSchema(schema.items);
+    dropSchema(schema.additionalProperties);
+    dropSchema(schema.not);
+    for (const key of ["allOf", "anyOf", "oneOf"]) {
+      const composed = schema[key];
+      if (Array.isArray(composed)) composed.forEach(dropSchema);
+    }
+  };
+  const paths = isObject(spec.paths) ? spec.paths : {};
+  for (const methods of Object.values(paths)) {
+    if (!isObject(methods)) continue;
+    for (const operation of Object.values(methods)) {
+      if (isObject(operation) && typeof operation.description === "string") {
+        delete operation.description;
+      }
+    }
+  }
+  const components = isObject(spec.components) ? spec.components : {};
+  if (isObject(components.schemas)) {
+    Object.values(components.schemas).forEach(dropSchema);
+  }
+  return spec;
+}
+
+/**
  * Mapping of API path to the Lambda ARN(s) that handle it.
  *
  * - A string value routes all HTTP methods to that Lambda.

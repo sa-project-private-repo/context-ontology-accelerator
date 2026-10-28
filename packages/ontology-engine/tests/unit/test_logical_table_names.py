@@ -33,7 +33,12 @@ from coa_ontology.inducer.strategies.base import (
     table_identity,
     table_schema_prefix,
 )
-from coa_ontology.proposals import SchemaSqlGenerationError, _mapping_table_names, _tables_to_h2_ddl
+from coa_ontology.proposals import (
+    SchemaSqlCoverageError,
+    SchemaSqlGenerationError,
+    _mapping_table_names,
+    _tables_to_h2_ddl,
+)
 from rdflib import RDF, Graph
 
 pytestmark = pytest.mark.unit
@@ -388,6 +393,11 @@ class TestDDLAlignsToTheMapping:
         than emitting a mapping Ontop will silently reject at VKG load."""
         with pytest.raises(SchemaSqlGenerationError, match="no matching physical table"):
             _tables_to_h2_ddl([_table("customers", "public", "src-pg1")], {'"orders"'})
+
+    def test_an_uncoverable_literal_is_a_coverage_error_naming_it(self):
+        with pytest.raises(SchemaSqlCoverageError) as exc:
+            _tables_to_h2_ddl([_table("customers", "public", "src-pg1")], {'"customers"', '"orders"', '"s"."gone"'})
+        assert exc.value.missing == ['"orders"', '"s"."gone"']
 
     def test_unknown_mapping_keeps_the_derived_names(self):
         tables = [_table("customers", "public", "src-pg"), _table("customers", "crm", "src-glue")]

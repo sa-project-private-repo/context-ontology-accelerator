@@ -151,6 +151,7 @@ _WRAPPED_RESOURCES = [
     "/namespaces/{namespaceId}/ontology/foundational/{key}/load",
     "/namespaces/{namespaceId}/proposals/{proposalId}/infer-constraints",
     "/namespaces/{namespaceId}/proposals/{proposalId}/validate",
+    "/namespaces/{namespaceId}/proposals/{proposalId}/studio/messages",
 ]
 
 

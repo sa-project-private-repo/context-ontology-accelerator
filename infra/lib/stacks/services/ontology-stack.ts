@@ -496,7 +496,7 @@ export class OntologyStack extends SCLStack {
       }),
     );
 
-    // EventBridge — emit ontology.published events for VKG reload
+    // EventBridge: emit ontology.deployed events for VKG reload
     taskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ["events:PutEvents"],

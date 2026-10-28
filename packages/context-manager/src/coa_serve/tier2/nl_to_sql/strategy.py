@@ -38,9 +38,10 @@ from ...exceptions import AccessDeniedError, AmbiguousReferenceError
 from ...identity import display_principal
 from ...step_ids import StepId
 from ..sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError, tables_visible_to
-from ..strategy import StrategyContext, StrategyOption, StrategyResult, capped_max_rows
+from ..strategy import StrategyContext, StrategyDeclined, StrategyOption, StrategyResult, capped_max_rows
 from ..table_qualifier import PreparedSQL, SourceLookup, prepare_execution_sql
 from ..tools import OntologyGraphTool
+from ..unmapped_terms import CANNOT_ANSWER, DECLINED
 from .sql_generator import NLtoSQLResult, SQLGenerator, sql_table_routing, table_sources_need_preparation
 
 if TYPE_CHECKING:
@@ -297,7 +298,9 @@ class NLtoSQLStrategy:
             return True
         return context.deadline.remaining_s() >= (estimated_shot_cost_s + _CORRECTION_MARGIN_S)
 
-    async def resolve(self, query: str, namespace: str, context: StrategyContext) -> StrategyResult | None:
+    async def resolve(
+        self, query: str, namespace: str, context: StrategyContext
+    ) -> StrategyResult | StrategyDeclined | None:
         """Generate SQL from the query, enforce the firewall, and execute it.
 
         Args:
@@ -306,8 +309,10 @@ class NLtoSQLStrategy:
             context: Shared strategy context (embedding, profile, options, trace).
 
         Returns:
-            A StrategyResult on success, or None when this strategy should be
-            skipped so the next strategy can try.
+            A StrategyResult on success, a StrategyDeclined when the writer replied
+            that the schema cannot answer the question (on its first shot, or on a
+            correction with no clean empty result to keep), or None when this
+            strategy should be skipped so the next strategy can try.
 
         Raises:
             AccessDeniedError: If the firewall denies the generated SQL (terminal).
@@ -374,6 +379,12 @@ class NLtoSQLStrategy:
 
         t_ms = int((time.perf_counter() - t_start) * 1000)
 
+        if nl_to_sql_result.error == DECLINED:
+            # The question asks about a term no table holds: no SQL was written.
+            trace.record(StepId.T2_SQL_GENERATE, "skipped", t_ms, detail=DECLINED, tool_used="bedrock")
+            logger.info("nl_to_sql_declined", namespace=namespace, duration_ms=t_ms)
+            return StrategyDeclined(self.name)
+
         if nl_to_sql_result.error or not nl_to_sql_result.sql:
             # Consolidate all sub-steps into a single t2.sql.generate step (E10).
             # A retrieval-backend failure (e.g. the vector proxy/index being
@@ -429,7 +440,7 @@ class NLtoSQLStrategy:
 
         # Best clean-but-empty result seen so far. A zero-row result is NEVER
         # downgraded to a miss: if a correction shot also comes back empty (or
-        # fails), we return this instead of None.
+        # fails, or declines), we return this instead of None.
         empty_fallback: StrategyResult | None = None
 
         for shot in range(1, self._max_shots + 1):
@@ -631,8 +642,26 @@ class NLtoSQLStrategy:
                     # authored against a different source is dropped rather than
                     # fed into the correction, which would otherwise burn the shot.
                     governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
+                    # The terms with no table the first shot was told of: without them a
+                    # correction drops the condition on one and answers a broader question.
+                    unmapped_terms=nl_to_sql_result.unmapped_terms,
                 )
                 correct_ms = int((time.perf_counter() - correct_start) * 1000)
+                # Only a correction told the terms was offered the word.
+                if nl_to_sql_result.unmapped_terms and sql == CANNOT_ANSWER:
+                    trace.record(
+                        StepId.T2_SQL_GENERATE,
+                        "skipped",
+                        correct_ms,
+                        detail={"correction_shot": shot + 1, "error": DECLINED},
+                        tool_used="bedrock",
+                    )
+                    logger.info("nl_to_sql_declined", namespace=namespace, shot=shot + 1)
+                    # After a clean empty shot the decline answers the zero-row feedback,
+                    # not the question: that empty result stays the answer. After an
+                    # execution error there is no result, and the writer says the schema
+                    # cannot answer the question.
+                    return empty_fallback or StrategyDeclined(self.name)
                 if not sql:
                     logger.warning("nl_to_sql_correction_empty", shot=shot)
                     trace.record(

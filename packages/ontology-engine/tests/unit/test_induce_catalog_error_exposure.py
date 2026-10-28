@@ -31,6 +31,7 @@ def test_induction_failure_exposes_only_type_and_message() -> None:
             side_effect=ValueError("bad datasource"),
         ),
         patch("coa_ontology.induce_catalog.dynamo_store") as mock_dynamo,
+        patch("coa_ontology.induce_catalog.emit_induction_job_metrics"),
     ):
         mock_dynamo.update_job_status.return_value = None
 

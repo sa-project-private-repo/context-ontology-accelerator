@@ -72,6 +72,7 @@ def test_duplicate_induction_sets_duplicate_of_on_inmemory_job() -> None:
             ],
         ),
         patch("coa_ontology.induce_catalog.dynamo_store") as mock_dynamo,
+        patch("coa_ontology.induce_catalog.emit_induction_job_metrics"),
     ):
         mock_dynamo.list_proposals.return_value = [existing_accepted]
         mock_dynamo.update_job_status.return_value = None

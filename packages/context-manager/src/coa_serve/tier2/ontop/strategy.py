@@ -20,10 +20,10 @@ from ...clients.base import VectorClient
 from ...exceptions import AccessDeniedError
 from ...step_ids import TOOL_FOR_STEP, StepId
 from ...trace import TraceCollector, client_error_detail
-from ..strategy import StrategyContext, StrategyOption, StrategyResult, capped_max_rows
-from .nl_to_sparql import NLtoSPARQL
+from ..strategy import StrategyContext, StrategyDeclined, StrategyOption, StrategyResult, capped_max_rows
+from .nl_to_sparql import NLtoSPARQL, TranslationError
 from .types import VectorHit
-from .vkg_translator import Tier2Result, VKGTranslator
+from .vkg_translator import VKG_VERSION_SKEW, Tier2Result, VKGTranslator
 
 logger = structlog.get_logger(__name__)
 
@@ -74,7 +74,9 @@ class OntopStrategy:
         self._vector_client = vector_client
         self._oss_ontology_index = oss_ontology_index
 
-    async def resolve(self, query: str, namespace: str, context: StrategyContext) -> StrategyResult | None:
+    async def resolve(
+        self, query: str, namespace: str, context: StrategyContext
+    ) -> StrategyResult | StrategyDeclined | None:
         """Translate the query to SPARQL, resolve it through the VKG, and execute.
 
         Args:
@@ -83,8 +85,9 @@ class OntopStrategy:
             context: Shared strategy context (embedding, profile, options, trace).
 
         Returns:
-            A StrategyResult on success, or None when the strategy should be
-            skipped so the next strategy can try.
+            A StrategyResult on success, a StrategyDeclined when the writer replied
+            that the schema cannot answer the question, or None when the strategy
+            should be skipped so the next strategy can try.
         """
         trace = context.trace
         profile = context.profile
@@ -105,6 +108,8 @@ class OntopStrategy:
             ]
             trace.add_dicts(annotated)
 
+        if sparql_result.error == TranslationError.CANNOT_ANSWER:
+            return StrategyDeclined(self.name)
         if not (sparql_result.valid and sparql_result.sparql):
             return None
 
@@ -223,6 +228,12 @@ class OntopStrategy:
                 )
             return None
 
+        # A VKG on another ontology version compiles any rewrite against the same
+        # stale mapping: no retry. Replay the steps so the trace names both versions.
+        if tier2_result.error == VKG_VERSION_SKEW:
+            self._replay_vkg_steps(tier2_result, trace)
+            return None
+
         # Result-based retry: VKGTranslator swallows VKGTranslationError and
         # returns it as Tier2Result.error rather than raising. Replay the
         # translator's own trace steps (which include the authoritative
@@ -284,7 +295,9 @@ class OntopStrategy:
 
         if not (retry_result.valid and retry_result.sparql):
             retry_ms = int((time.perf_counter() - retry_start) * 1000)
-            trace.record(StepId.T2_VKG_RETRY, "failed", retry_ms, detail={"reason": "re-translation failed validation"})
+            declined = retry_result.error == TranslationError.CANNOT_ANSWER
+            reason = TranslationError.CANNOT_ANSWER if declined else "re-translation failed validation"
+            trace.record(StepId.T2_VKG_RETRY, "failed", retry_ms, detail={"reason": reason})
             return None
         try:
             tier2_result = await self._vkg_translator.resolve(

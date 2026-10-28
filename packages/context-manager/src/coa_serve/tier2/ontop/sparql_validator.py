@@ -14,17 +14,26 @@ SPARQL as a hint for the knowledge retriever.
 from __future__ import annotations
 
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 from coa_common.constants import URN_PREFIX as _URN_PREFIX
+from rdflib.paths import Path
 from rdflib.plugins.sparql import prepareQuery
+from rdflib.term import URIRef
 
 from ...clients.base import GraphClient
+from ...clients.ttl_cache import TtlLruCache
 from ...query_utils import (
+    IS_MAPPED_IRI,
+    SPARQL_PREFIXES,
     get_graph_uri_template,
     graph_scoped_body,
     namespace_graph_prefix,
+    unmapped_property_filter,
     validate_namespace,
 )
 
@@ -36,6 +45,21 @@ _SAFE_URI_RE = re.compile(r"^https?://[^\s<>{}\"|\\^`'();]+\Z")  # \Z, not $, so
 # validating all would produce large Neptune VALUES clauses risking timeouts.
 # 10 is sufficient to catch hallucinated URIs (the primary failure mode).
 _MAX_URI_VALIDATION_COUNT = 10
+# Max terms the query console's pre-translation check reads. Higher than the cap
+# above because a miss here is not a hallucination but a real term with no mapping,
+# and a multi-join query names more than ten terms; one VALUES clause keeps it cheap.
+_MAX_VKG_TERM_CHECK_COUNT = 50
+# The properties deploy marked unmapped are read per namespace and kept this long, so a
+# validation costs no Neptune query for them and a deploy is seen within a minute (the
+# served version is read on the same schedule, see ``served_version.ServedVersionReader``).
+_UNMAPPED_CACHE_TTL_S = 60.0
+_UNMAPPED_CACHE_NAMESPACES = 512
+# Rows read for one namespace's marked properties. A namespace with more keeps the first
+# ones read, and the rest are checked by existence only, as before they were marked.
+_MAX_UNMAPPED_READ = 10_000
+# A prefixed name's escaped local-name character (``ind:esc\-aped``), which SPARQL reads
+# without its backslash; rdflib keeps the backslash in the IRI.
+_PN_LOCAL_ESC_RE = re.compile(r"\\([_~.\-!$&'()*+,;=/?#@%])")
 
 # GovernedMetric URI pattern (<urn:{prefix}:{ns}:metric:{name}>). Metric
 # IRIs live under urn:{prefix}: (not the http(s) ontology base), so the existing
@@ -43,6 +67,14 @@ _MAX_URI_VALIDATION_COUNT = 10
 # validator treat a well-formed metric IRI as valid rather than "not found".
 
 _GOVERNED_METRIC_URI_RE = re.compile(rf"^urn:{re.escape(_URN_PREFIX)}:[^\s:]+:metric:[^\s>]+$")
+
+# What the query console says about a term of a caller's query that the VKG cannot answer.
+NOT_A_TERM = "<{iri}> is not a class or property of the deployed ontology."
+NO_TABLE_MAPPING = "<{iri}> has no table mapping, so the VKG cannot answer it."
+# A class or property is linked when the graph declares another term its subclass or subproperty, or
+# an equivalent of it: Ontop answers it through that term, so having no marker of its own refuses nothing.
+_LINKS = "rdfs:subClassOf|owl:equivalentClass|rdfs:subPropertyOf|owl:equivalentProperty"
+_EQUIVALENCES = "owl:equivalentClass|owl:equivalentProperty"
 
 __all__ = ["SPARQLValidator", "ValidationResult"]
 
@@ -58,16 +90,27 @@ class ValidationResult:
 class SPARQLValidator:
     """Validates LLM-generated SPARQL for syntax correctness and URI existence."""
 
-    def __init__(self, graph_client: GraphClient, graph_uri_template: str | None = None):
+    def __init__(
+        self,
+        graph_client: GraphClient,
+        graph_uri_template: str | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         """Bind the graph client and named-graph URI template for validation.
 
         Args:
             graph_client: Graph client used for URI existence checks.
             graph_uri_template: Optional named-graph URI template; a default is
                 resolved when None.
+            clock: Monotonic clock for the kept read of each namespace's unmapped
+                properties; injectable for tests.
         """
         self._graph = graph_client
         self._graph_uri_template = get_graph_uri_template(graph_uri_template)
+        self._unmapped: TtlLruCache[str, frozenset[str]] = TtlLruCache(
+            ttl_s=_UNMAPPED_CACHE_TTL_S, max_size=_UNMAPPED_CACHE_NAMESPACES, time_fn=clock
+        )
 
     async def validate(self, sparql: str, namespace: str, graph_iris: list[str] | None = None) -> ValidationResult:
         """Four-stage validation: syntax, URI existence, domain/range, determinism.
@@ -383,7 +426,7 @@ class SPARQLValidator:
 
             uris = self._extract_uris(sparql)
             if not uris:
-                return ValidationResult(valid=True)
+                return await self._refuse_unmapped_names(sparql, namespace)
 
             # Validate URI format (prevent injection)
             safe_uris = []
@@ -397,8 +440,9 @@ class SPARQLValidator:
             graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
             # COUNT(DISTINCT ?s) is what makes this safe to scope: a subject in two
             # of the namespace's graphs still counts once, so the threshold below is
-            # unaffected by the query form.
-            body = f"VALUES (?s) {{ {values_clause} }} ?s ?p ?o"
+            # unaffected by the query form. A property deploy marked unmapped is not
+            # counted, so a query naming one gets the feedback of an unknown IRI.
+            body = f"VALUES (?s) {{ {values_clause} }} ?s ?p ?o . {unmapped_property_filter('?s')}"
             found = await self._count_subjects(body, graph_uri_prefix, graph_iris)
             if found < len(safe_uris) and graph_iris:
                 unscoped = await self._count_subjects(body, graph_uri_prefix, None)
@@ -423,10 +467,142 @@ class SPARQLValidator:
                 )
                 return ValidationResult(valid=False, error="URI not found in ontology")
 
-            return ValidationResult(valid=True)
+            return await self._refuse_unmapped_names(sparql, namespace)
         except Exception as e:
             logger.debug("uri_validation_error", error=str(e))
             return ValidationResult(valid=False, error="URI validation failed")
+
+    async def _refuse_unmapped_names(self, sparql: str, namespace: str) -> ValidationResult:
+        """Refuse a query that names a property deploy marked unmapped, however it spells it.
+
+        The writer is told to use prefixed names, and a query may also name a full IRI,
+        one relative to its ``BASE``, or a prefixed name with the empty prefix or with
+        ``-``, ``.``, ``%HH`` or an escape in its local name. Every IRI comes from the
+        parsed query, so each spelling is the IRI SPARQL gives it, and all of them are
+        checked, not only the first ones. They are compared with the namespace's marked
+        properties (:meth:`_unmapped_properties`), so a name that merely does not exist
+        passes as it always has, and a namespace without markers is judged exactly as
+        before. Fails open: when the markers cannot be read, nothing is refused for them.
+        """
+        named = {iri for iri in self._query_iris(sparql) if not iri.startswith(self._STANDARD_PREFIXES)}
+        if not named:
+            return ValidationResult(valid=True)  # nothing a deploy marks
+        named &= await self._unmapped_properties(namespace)
+        if named:
+            logger.warning("uri_unmapped_property", namespace=namespace, uris=sorted(named)[:5])
+            return ValidationResult(valid=False, error="URI not found in ontology")
+        return ValidationResult(valid=True)
+
+    async def _unmapped_properties(self, namespace: str) -> frozenset[str]:
+        """The properties deploy marked unmapped in ``namespace``, read at most once a minute.
+
+        One read serves every validation of the namespace in that window (an answer
+        validates its SPARQL up to three times), and only a successful read is kept, so
+        a transient failure is read again next time. Read over the namespace's graph
+        prefix: the marker matches few triples, and the prefix covers every graph the
+        namespace's queries are checked against. Empty when the markers cannot be read.
+        """
+        cached = self._unmapped.get(namespace)
+        if cached is not None:
+            return cached
+        graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
+        body = f"?s <{IS_MAPPED_IRI}> false ."
+        try:
+            rows = await self._graph.query(
+                f"SELECT DISTINCT ?s WHERE {{ {graph_scoped_body(body, graph_uri_prefix, None)} }} "
+                f"LIMIT {_MAX_UNMAPPED_READ}"
+            )
+        except Exception as e:
+            logger.warning("unmapped_property_check_failed", namespace=namespace, error=type(e).__name__)
+            return frozenset()
+        if len(rows) >= _MAX_UNMAPPED_READ:
+            logger.warning("unmapped_property_read_truncated", namespace=namespace, limit=_MAX_UNMAPPED_READ)
+        unmapped = frozenset(row["s"] for row in rows if row.get("s"))
+        self._unmapped.set(namespace, unmapped)
+        return unmapped
+
+    @staticmethod
+    def _query_iris(sparql: str) -> set[str]:
+        """Every IRI the parsed query names, as SPARQL resolves it (empty when it does not parse).
+
+        Read from the query's algebra, so string contents, comments and prefix
+        declarations name nothing, and a property path names each of its IRIs.
+        """
+        try:
+            algebra = prepareQuery(sparql).algebra
+        except Exception:
+            return set()
+        iris: set[str] = set()
+        pending: list[Any] = [algebra]
+        seen: set[int] = set()
+        while pending:
+            node = pending.pop()
+            if isinstance(node, URIRef):
+                iris.add(_PN_LOCAL_ESC_RE.sub(r"\1", str(node)))
+                continue
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            if isinstance(node, Path):
+                pending.extend(vars(node).values())
+            elif isinstance(node, dict):
+                pending.extend(node.values())
+            elif isinstance(node, (list, tuple, set, frozenset)):
+                pending.extend(node)
+        return iris
+
+    async def refuse_vkg_terms(self, classes: list[str], properties: list[str], namespace: str) -> str | None:
+        """Why the VKG cannot answer a query naming these classes and properties; ``None`` refuses nothing.
+
+        The query console asks this before the VKG translates a caller's own query, with one Neptune
+        query over the namespace's graphs. Standard vocabularies pass, as they do in :meth:`validate`.
+        A term the graphs neither describe nor name as a parent or an equivalent of one of theirs is no
+        term of the deployed ontology (:data:`NOT_A_TERM`). Structured queries cannot answer a property
+        deploy marked ``coa:isMapped false``, nor a class with no ``coa:isMapped true`` that no other
+        term links to (:data:`NO_TABLE_MAPPING`): a parent of a mapped class is answered through it.
+        A namespace without class markers keeps today's checks, so nothing is refused there. At most
+        50 terms are checked. Fails open: when the graphs cannot be read, nothing is refused.
+        """
+        terms = sorted(
+            t for t in {*classes, *properties} if not t.startswith(self._STANDARD_PREFIXES) and _SAFE_URI_RE.match(t)
+        )[:_MAX_VKG_TERM_CHECK_COUNT]
+        if not terms:
+            return None
+        prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
+        values = "VALUES ?term { " + " ".join(f"<{t}>" for t in terms) + " }"
+        described = graph_scoped_body(f"{values} ?term ?p ?o .", prefix)
+        linked = graph_scoped_body(f"{values} {{ ?x {_LINKS} ?term }} UNION {{ ?term {_EQUIVALENCES} ?x }}", prefix)
+        marked = graph_scoped_body(f"{values} ?term <{IS_MAPPED_IRI}> ?mapped .", prefix)
+        any_class = graph_scoped_body(f"?term <{IS_MAPPED_IRI}> true .", prefix)
+        sparql = (
+            f"{SPARQL_PREFIXES}SELECT DISTINCT ?term ?fact WHERE {{\n"
+            f'  {{ {described} BIND("term" AS ?fact) }}\n'
+            f'  UNION {{ {linked} BIND("linked" AS ?fact) }}\n'
+            f"  UNION {{ {marked} BIND(STR(?mapped) AS ?fact) }}\n"
+            f'  UNION {{ SELECT ?term ?fact WHERE {{ {any_class} BIND("marker" AS ?fact) }} LIMIT 1 }}\n'
+            "}"
+        )
+        try:
+            rows = await self._graph.query(sparql)
+        except Exception as e:
+            logger.warning("vkg_terms_check_failed", namespace=namespace, error=type(e).__name__)
+            return None
+        facts: dict[str, set[str]] = {}
+        for row in rows:
+            facts.setdefault(row.get("term", ""), set()).add(row.get("fact", ""))
+        if not any("marker" in f or "true" in f for f in facts.values()):
+            return None
+        unknown = [t for t in terms if not facts.get(t, set()) & {"term", "linked"}]
+        unmapped = [
+            t
+            for t in terms
+            if t not in unknown
+            and ((t in properties and "false" in facts[t]) or (t in classes and not facts[t] & {"true", "linked"}))
+        ]
+        sentences = [NOT_A_TERM.format(iri=t) for t in unknown] + [NO_TABLE_MAPPING.format(iri=t) for t in unmapped]
+        if sentences:
+            logger.info("vkg_terms_refused", namespace=namespace, unknown=len(unknown), unmapped=len(unmapped))
+        return " ".join(sentences) or None
 
     async def _count_subjects(self, body: str, graph_uri_prefix: str, graph_iris: list[str] | None) -> int:
         """Count distinct subjects matching ``body``, scoped to ``graph_iris`` if given."""

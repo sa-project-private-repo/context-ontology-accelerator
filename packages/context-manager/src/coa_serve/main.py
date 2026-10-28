@@ -16,6 +16,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -46,6 +47,7 @@ from .models import InvokeRequest, TraceStep
 from .namespace_language import bind_label_preference
 from .orchestrator import Orchestrator
 from .role_resolver import ResolvedProfile, may_view_debug_info, resolve_profile
+from .served_version import ServedVersionReader
 from .session import SessionManager
 from .session_actions import (
     handle_create_session,
@@ -61,13 +63,18 @@ from .tier1.metric_resolver import MetricResolver
 from .tier2.nl_to_sql.agentic_strategy import AgenticStrategy
 from .tier2.nl_to_sql.sql_generator import SQLGenerator
 from .tier2.nl_to_sql.strategy import NLtoSQLStrategy
+from .tier2.ontop.comparison_spacing import space_comparisons
 from .tier2.ontop.nl_to_sparql import NLtoSPARQL
 from .tier2.ontop.sparql_example_loader import FewShotExampleLoader
+from .tier2.ontop.sparql_guard import MAX_SPARQL_CHARS, SparqlRefused, check_vkg_sparql, vkg_terms
+from .tier2.ontop.sparql_validator import SPARQLValidator
 from .tier2.ontop.strategy import OntopStrategy
-from .tier2.ontop.vkg_translator import VKGTranslator
+from .tier2.ontop.vkg_translator import VKG_NO_MAPPING, VKG_VERSION_SKEW, VKGTranslator
+from .tier2.ontop.vkg_translator import TraceStep as Tier2TraceStep
 from .tier2.skip.aoss_provenance import AossProvenanceEvaluator
 from .tier2.sql_firewall import SQLFirewall
 from .tier2.strategy import StructuredQueryTier
+from .tier2.unmapped_terms import UnmappedTermsReader
 from .tier3.graph_traverser import GraphTraverser, is_traversable_uri
 from .tier3.knowledge_retriever import KnowledgeRetriever
 from .tier3.synthesizer import Synthesizer
@@ -90,7 +97,19 @@ _session_manager: SessionManager | None = None
 _session_metadata: SessionMetadataStore | None = None
 _sources_registry: SourcesRegistry | None = None
 _nl_to_sparql: NLtoSPARQL | None = None
+_vkg_translator: VKGTranslator | None = None
+# Checks the classes and properties of a query console query against the namespace's graph.
+_sparql_validator: SPARQLValidator | None = None
+# Builds the Tier 3 retrievers only the query path uses, set by _ensure_initialized and
+# None once _ensure_query_path_initialized has run it.
+_query_path_builder: Callable[[], None] | None = None
 _init_lock = asyncio.Lock()
+
+# The isolated actions use neither the Tier 3 lexical retriever nor the deep-reasoning
+# retriever, so they do not wait for them to be built. Every other request builds them
+# first, as before: the session actions come from the web app on the runtime session
+# that its queries reuse.
+_ISOLATED_ACTIONS = ("translate", "kbSearch", "graphTraverse", "sparqlQuery")
 
 # Hard upper bound on the per-request transport budget: max(10, min(env, 300)).
 # The 300s cap is a deliberate ceiling — even a misconfigured RESOLVE_TIMEOUT_S
@@ -128,9 +147,15 @@ _NAMESPACE_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 
 async def _ensure_initialized():
-    """Initialize config and orchestrator on first request."""
+    """Initialize config and orchestrator on first request.
+
+    The Tier 3 lexical retriever and the deep-reasoning retriever (with its tool registry)
+    are left to ``_ensure_query_path_initialized``: building them imports graphrag-toolkit,
+    which takes seconds on a new runtime session, and the isolated actions use neither.
+    """
     global _config, _guardrail_provider, _orchestrator, _session_manager
-    global _session_metadata, _sources_registry, _nl_to_sparql
+    global _session_metadata, _sources_registry, _nl_to_sparql, _vkg_translator, _sparql_validator
+    global _query_path_builder
     if _orchestrator is not None:
         return
     async with _init_lock:
@@ -251,6 +276,16 @@ async def _ensure_initialized():
             bucket=os.environ.get("ONTOLOGY_BUCKET", ""),
             region=config.bedrock_region,
         )
+        # The ontology version Neptune serves, read at most once a minute per
+        # namespace: a VKG translation is refused while the VKG still serves another
+        # version, both Tier 2 paths keep their mapped gate for a namespace with one,
+        # and the deep-reasoning ontology lookup reloads after a deploy. One reader, so
+        # all of them see a new version at the same moment.
+        served_versions = ServedVersionReader(neptune_client)
+        # The terms no table maps, which both Tier 2 writers are told so that they
+        # decline a question about one instead of answering it with a stand-in. One
+        # reader, read at most once a minute per namespace, so both list the same terms.
+        unmapped_terms = UnmappedTermsReader(neptune_client)
         nl_to_sparql = NLtoSPARQL(
             graph_client=neptune_client,
             llm_client=bedrock_client,
@@ -259,6 +294,8 @@ async def _ensure_initialized():
             # enrich Tier-2 metric context with full Neptune metric defs.
             metric_resolver=metric_resolver,
             few_shot_loader=few_shot_loader,
+            served_versions=served_versions,
+            unmapped_terms=unmapped_terms,
         )
         _nl_to_sparql = nl_to_sparql
         firewall = SQLFirewall()
@@ -267,7 +304,10 @@ async def _ensure_initialized():
             firewall=firewall,
             query_executor=query_executor,
             sources_registry=sources_registry,
+            served_versions=served_versions,
         )
+        _vkg_translator = vkg_translator
+        _sparql_validator = SPARQLValidator(neptune_client)
         vector_retriever = VectorRetriever(vector_client=opensearch_client)
         graph_traverser = GraphTraverser(graph_client=neptune_client)
 
@@ -302,16 +342,17 @@ async def _ensure_initialized():
             chunk_screener=chunk_screener,
         )
 
-        # Lexical baseline retriever — only when TIER3_STRATEGY="lexical-baseline"
-        from .clients.factory import build_lexical_retriever
+        # Domain ABox facts for the lexical answer path (ABOX_CONTEXT_ENABLED=false turns them off)
+        from .tier3.domain_abox import DomainAboxAugmenter, context_enabled
 
-        lexical_retriever = build_lexical_retriever(config)
+        domain_abox = DomainAboxAugmenter(neptune_client) if context_enabled() else None
 
+        # build_query_path below adds the lexical baseline retriever.
         knowledge_retriever = KnowledgeRetriever(
             vector_retriever=vector_retriever,
             graph_traverser=graph_traverser,
             synthesizer=synthesizer,
-            lexical_retriever=lexical_retriever,
+            domain_abox=domain_abox,
         )
 
         # NL-to-SQL: Direct SQL generation via LLM with ontology retrieval + FK expansion
@@ -320,6 +361,8 @@ async def _ensure_initialized():
             vector_client=opensearch_client,
             guardrail_id=config.guardrail_id,
             guardrail_id_provider=guardrail_provider.guardrail_id,
+            served_versions=served_versions,
+            unmapped_terms=unmapped_terms,
         )
 
         # Tier 2 strategies
@@ -361,45 +404,6 @@ async def _ensure_initialized():
             strategies=[ontop_strategy, nl_to_sql_strategy, agentic_strategy],
         )
 
-        # Deep-reasoning Tier 3 path. Built so a deployment default
-        # (TIER3_STRATEGY=deep-reasoning) OR a per-request
-        # options.mode="deep-reasoning" can engage it; construction is
-        # cheap and keeps the graphrag_toolkit import lazy (the registry's
-        # strategy/graph tools defer toolkit access to first invoke). Imported here
-        # (not at module load) so the serve module import stays graphrag-free. A
-        # construction failure must NOT break startup — the orchestrator simply runs
-        # the existing Tier 3 paths — so we degrade with a warning.
-        #
-        # Built AFTER structured_query_tier so the agentic registry can expose the
-        # nl_to_sql tool over the same Tier-2 engine; per-namespace composition
-        # gating withholds it at request time on document-only namespaces.
-        agentic_retriever = None
-        try:
-            from .clients.base import ClientSet
-            from .tier3.agentic.factory import build_agentic_retriever
-            from .tier3.agentic.planner import BedrockStepPlanner
-
-            agentic_clients = ClientSet(
-                graph=neptune_client,
-                vector=opensearch_client,
-                llm=bedrock_client,
-                query_executor=query_executor,
-            )
-            step_planner = BedrockStepPlanner(
-                bedrock_client,
-                guardrail_id=config.guardrail_id or None,
-                guardrail_id_provider=guardrail_provider.guardrail_id,
-            )
-            agentic_retriever = build_agentic_retriever(
-                config,
-                agentic_clients,
-                step_planner,
-                structured_query_tier=structured_query_tier,
-                guardrail_id_provider=guardrail_provider.guardrail_id,
-            )
-        except Exception as exc:
-            logger.warning("agentic_retriever_unavailable", error=type(exc).__name__, error_msg=str(exc)[:200])
-
         # Per-query Tier-2 pruning for MIXED namespaces (which namespace-level
         # source-composition gating cannot rule out). On by default; set
         # SERVE_TIER2_SKIP_MODE=off to disable. Fail-open — see aoss_provenance.py.
@@ -411,7 +415,8 @@ async def _ensure_initialized():
                 oss_ontology_index=oss_ontology_index,
             )
 
-        _orchestrator = Orchestrator(
+        # build_query_path below adds the deep-reasoning retriever.
+        orchestrator = Orchestrator(
             metric_resolver=metric_resolver,
             knowledge_retriever=knowledge_retriever,
             query_executor=query_executor,
@@ -430,16 +435,85 @@ async def _ensure_initialized():
             # from matched concept URIs instead of the ASCII keyword branch.
             vector_client=opensearch_client,
             oss_ontology_index=oss_ontology_index,
-            agentic_retriever=agentic_retriever,
             tier3_deep_reasoning_default=(config.tier3_strategy == "deep-reasoning"),
             tier1_metric_timeout_s=config.tier1_metric_timeout_s,
         )
+
+        # What only the query path uses, built by the first request that is not an isolated
+        # action (_ensure_query_path_initialized).
+        def build_query_path() -> None:
+            # Lexical baseline retriever (graphrag-toolkit): the default Tier 3 engine under
+            # TIER3_STRATEGY="lexical-baseline", and what a request's options.retrieverStrategy runs.
+            from .clients.factory import build_lexical_retriever
+
+            knowledge_retriever.set_lexical_retriever(build_lexical_retriever(config))
+
+            # Deep-reasoning Tier 3 path. Built so a deployment default
+            # (TIER3_STRATEGY=deep-reasoning) OR a per-request
+            # options.mode="deep-reasoning" can engage it; its registry's strategy
+            # tools wrap a lexical retriever of their own, so building it imports
+            # graphrag-toolkit too. Imported here (not at module load) so the serve
+            # module import stays graphrag-free. A construction failure must NOT break
+            # the query path: the orchestrator simply runs the existing Tier 3 paths,
+            # so we degrade with a warning.
+            #
+            # Built AFTER structured_query_tier so the agentic registry can expose the
+            # nl_to_sql tool over the same Tier-2 engine; per-namespace composition
+            # gating withholds it at request time on document-only namespaces.
+            agentic_retriever = None
+            try:
+                from .clients.base import ClientSet
+                from .tier3.agentic.factory import build_agentic_retriever
+                from .tier3.agentic.planner import BedrockStepPlanner
+
+                agentic_clients = ClientSet(
+                    graph=neptune_client,
+                    vector=opensearch_client,
+                    llm=bedrock_client,
+                    query_executor=query_executor,
+                )
+                step_planner = BedrockStepPlanner(
+                    bedrock_client,
+                    guardrail_id=config.guardrail_id or None,
+                    guardrail_id_provider=guardrail_provider.guardrail_id,
+                )
+                agentic_retriever = build_agentic_retriever(
+                    config,
+                    agentic_clients,
+                    step_planner,
+                    structured_query_tier=structured_query_tier,
+                    guardrail_id_provider=guardrail_provider.guardrail_id,
+                    # Its ontology lookup reloads when this reader sees a new version.
+                    served_versions=served_versions,
+                )
+            except Exception as exc:
+                logger.warning("agentic_retriever_unavailable", error=type(exc).__name__, error_msg=str(exc)[:200])
+            orchestrator.set_agentic_retriever(agentic_retriever)
+
+        _orchestrator = orchestrator
+        _query_path_builder = build_query_path
         _config = config
         logger.info(
             "context_manager_initialized",
             guardrail_configured=bool(config.guardrail_id),
             vkg_endpoint=config.vkg_endpoint,
         )
+
+
+async def _ensure_query_path_initialized():
+    """Build the Tier 3 lexical retriever and the deep-reasoning retriever once, for the query path.
+
+    Runs after ``_ensure_initialized``, which leaves both to it. A build that raises is tried
+    again by the next request that needs it, as a failed ``_ensure_initialized`` is.
+    """
+    global _query_path_builder
+    if _query_path_builder is None:
+        return
+    async with _init_lock:
+        if _query_path_builder is None:
+            return
+        _query_path_builder()
+        _query_path_builder = None
 
 
 def _format_validation_errors(e: ValidationError) -> list[dict]:
@@ -568,6 +642,133 @@ def _parse_kb_search_options(options: Any) -> tuple[int, float | None]:
         if options.get(name):
             raise ValueError(f"{name} is not supported by kbSearch.")
     return top_k, min_score
+
+
+SPARQL_MAX_ROWS = 1000
+SPARQL_TIMEOUT_S = 20
+# How long the console waits for the namespace's graph to check a query's terms; then the VKG decides.
+SPARQL_TERMS_TIMEOUT_S = 3
+VKG_UNAVAILABLE = "The namespace's VKG is not running or not ready; deploy a version or try again later"
+NO_TABLE_MATCHES = "No table mapping matches this query, so the VKG cannot answer it."
+
+
+def _plain_value(value: Any) -> Any:
+    return value if value is None or isinstance(value, (str, int, float, bool)) else str(value)
+
+
+async def _refuse_vkg_terms(sparql: str, namespace: str) -> str | None:
+    """Why the VKG cannot answer the classes and properties every answer of ``sparql`` needs, from the graph.
+
+    ``None`` refuses nothing, also when the graph does not answer in time: the VKG then decides,
+    as before.
+    """
+    classes, properties = vkg_terms(sparql)
+    if _sparql_validator is None or not (classes or properties):
+        return None
+    try:
+        return await asyncio.wait_for(
+            _sparql_validator.refuse_vkg_terms(classes, properties, namespace), timeout=SPARQL_TERMS_TIMEOUT_S
+        )
+    except TimeoutError:
+        logger.warning("vkg_terms_check_timeout", namespace=namespace)
+        return None
+
+
+async def _handle_sparql_query(payload: dict, request_id: str, profile: ResolvedProfile | None) -> dict:
+    """Run the caller's own SPARQL over the namespace's VKG (the Ontology designer query console).
+
+    The namespace admission gate has run; the query is checked (``SELECT`` or ``ASK``, no
+    graphs of its own, and the VKG can answer the classes and properties every answer needs),
+    then the VKG pipeline translates it, the SQL firewall applies the caller's grants and the SQL
+    runs, at most 1,000 rows in 20 s. A query that no table mapping matches is refused like a
+    term the VKG cannot answer, not reported as a failure to run. The executed SQL is returned
+    only to a caller who would get it with ``includeDebugInfo`` on the query path: a schema role
+    on the namespace and the viewNamespace right.
+    """
+    namespace = payload.get("namespace", "")
+    if not namespace or profile is None:
+        return _error(400, "namespace required", request_id)
+    sparql = payload.get("sparql")
+    try:
+        form = check_vkg_sparql(sparql)
+    except SparqlRefused as e:
+        return {"error": "ValidationError", "message": str(e), "requestId": request_id, "statusCode": 400}
+    # Ontop's parser would read <2000&&?y> in FILTER(?y<2000&&?y>1900) as an IRI: the VKG gets the comparison spaced.
+    sparql = space_comparisons(sparql)
+    if _vkg_translator is None:
+        raise DataSourceUnavailableError("The virtual knowledge graph is not configured")
+    started = time.monotonic()
+    refusal = await _refuse_vkg_terms(sparql, namespace)
+    if refusal:
+        return {"error": "ValidationError", "message": refusal, "requestId": request_id, "statusCode": 400}
+    # The check's time comes out of the 25 s, which leaves the data layer and the API (29 s) room to answer.
+    budget = SPARQL_TIMEOUT_S + 5 - (time.monotonic() - started)
+    caller: dict[str, Any] = {}
+    profile.inject_into(caller)
+    steps: list[Tier2TraceStep] = []
+    try:
+        result = await asyncio.wait_for(
+            _vkg_translator.resolve(
+                sparql,
+                namespace=namespace,
+                profile=caller,
+                # One row more than is shown: Athena and Redshift cap the SQL at the rows asked
+                # for and then see no more, so only the extra row tells that there were more.
+                max_rows=SPARQL_MAX_ROWS + 1,
+                timeout_seconds=SPARQL_TIMEOUT_S,
+                trace_steps=steps,
+                refuse_without_table=True,
+            ),
+            timeout=budget,
+        )
+    except TimeoutError:
+        if not steps:  # still waiting for the VKG to translate it: the query never ran
+            return _error(503, VKG_UNAVAILABLE, request_id)
+        return _error(504, f"The query did not finish within {SPARQL_TIMEOUT_S} seconds", request_id)
+    if result.firewall_result is not None and result.firewall_result.denied:
+        raise AccessDeniedError(result.firewall_result.reason)
+    if result.error == "vkg_unavailable":
+        return _error(503, VKG_UNAVAILABLE, request_id)
+    if result.error == VKG_VERSION_SKEW:
+        # The VKG is still on the previous version's mapping (reloading, or the reload
+        # failed): not ready for this version, as above, so retryable.
+        reason = next((s.detail["reason"] for s in steps if s.detail.get("error") == VKG_VERSION_SKEW), "")
+        return _error(503, f"{reason} Try again once it has loaded the deployed version.".strip(), request_id)
+    if result.error == "vkg_translation_error":
+        raise QueryTranslationError("The VKG could not translate the query; check its classes and properties")
+    if result.error == VKG_NO_MAPPING:
+        # Ontop's empty plan or its no-table placeholder: a query problem, not a data source down.
+        return {"error": "ValidationError", "message": NO_TABLE_MATCHES, "requestId": request_id, "statusCode": 400}
+    if result.error == "query_timeout":
+        return _error(504, f"The query did not finish within {SPARQL_TIMEOUT_S} seconds", request_id)
+    if result.error or result.query_result is None:
+        logger.warning("sparql_query_failed", namespace=namespace, error=result.error, request_id=request_id)
+        raise DataSourceUnavailableError("The query could not run")
+    qr = result.query_result
+    if form == "ASK":
+        columns, rows, truncated = ["result"], [[bool(qr.rows)]], False
+    else:
+        columns = list(qr.columns)
+        rows = [[_plain_value(row.get(c)) for c in columns] for row in qr.rows[:SPARQL_MAX_ROWS]]
+        truncated = bool(qr.truncated) or len(qr.rows) > SPARQL_MAX_ROWS
+    # The SQL names the physical schema. It goes to a caller who passes both checks that
+    # ``includeDebugInfo`` passes on the query path: a schema role here, and viewNamespace
+    # in Cedar (False on an evaluation error, so the SQL is withheld).
+    show_sql = (
+        result.executed_sql is not None
+        and may_view_debug_info(caller, namespace)
+        and await asyncio.to_thread(_orchestrator.can_view_namespace, namespace, caller) is True
+    )
+    return {
+        "form": form,
+        "columns": columns,
+        "rows": rows,
+        "rowCount": len(rows),
+        "truncated": truncated,
+        "executedSql": result.executed_sql if show_sql else None,
+        "requestId": request_id,
+        "statusCode": 200,
+    }
 
 
 async def _handle_kb_search(payload: dict, request_id: str) -> dict:
@@ -1143,8 +1344,11 @@ async def invoke(payload: dict, context=None):
     """
     logger.info("invoke_entry", has_context=context is not None, payload_keys=list(payload.keys()) if payload else [])
 
+    action = payload.get("action")
     try:
         await _ensure_initialized()
+        if action not in _ISOLATED_ACTIONS:
+            await _ensure_query_path_initialized()
     except Exception as e:
         logger.error("invoke_init_failed", error=str(e))
         yield {"error": "InternalError", "message": "Initialization failed", "statusCode": 500}
@@ -1163,7 +1367,6 @@ async def invoke(payload: dict, context=None):
         logger.info("invoke_no_context", payload_keys=list(payload.keys()))
 
     # ── Session CRUD actions (delegated to session_actions module) ──────
-    action = payload.get("action")
     if action == "getRecentSession" and _session_metadata:
         user_id = resolve_user_id(payload, _jwt_user_id, _jwt_email)
         if not user_id:
@@ -1216,6 +1419,20 @@ async def invoke(payload: dict, context=None):
                 "error": "ValidationError",
                 "message": "Invalid request payload",
                 "details": [{"field": "query", "type": "value_error"}],
+                "requestId": request_id,
+                "statusCode": 400,
+            }
+            return
+
+    # The sparqlQuery action carries a query too: refuse a missing or oversized one
+    # before any backend call. The handler parses and checks it in full.
+    if action == "sparqlQuery":
+        sparql = payload.get("sparql")
+        if not isinstance(sparql, str) or not sparql.strip() or len(sparql) > MAX_SPARQL_CHARS:
+            yield {
+                "error": "ValidationError",
+                "message": "Invalid request payload",
+                "details": [{"field": "sparql", "type": "value_error"}],
                 "requestId": request_id,
                 "statusCode": 400,
             }
@@ -1306,6 +1523,9 @@ async def invoke(payload: dict, context=None):
             return
         if action == "graphTraverse":
             yield await _handle_graph_traverse(payload, request_id)
+            return
+        if action == "sparqlQuery":
+            yield await _handle_sparql_query(payload, request_id, resolved_profile)
             return
     except ServeError as e:
         yield e.to_dict(request_id)

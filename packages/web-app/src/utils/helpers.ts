@@ -15,8 +15,12 @@ export function validateS3Prefix(value: string): string {
   return "";
 }
 
-export function formatTimestamp(date: Date | string | undefined): string {
+/** `date` as local date and time, in `locale` when given (else the browser's). */
+export function formatTimestamp(
+  date: Date | string | undefined,
+  locale?: string,
+): string {
   if (!date) return "—";
   const d = date instanceof Date ? date : new Date(date);
-  return d.toLocaleString();
+  return d.toLocaleString(locale);
 }

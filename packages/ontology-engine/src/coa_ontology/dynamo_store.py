@@ -14,12 +14,17 @@ Namespace registry patterns (one partition per namespace, sort key patterns):
   PK=NAMESPACE#{namespace}            SK=META                — namespace descriptor
   PK=NAMESPACE#{namespace}            SK=ONTOLOGY#{ontology_id}
                                                              — one per ontology in the namespace
+  PK=NAMESPACE#{namespace}            SK=VERSION#{n:06d}     : published ontology version (versions/registry.py)
+  PK=NAMESPACE#{namespace}            SK=ACTIVE              : version currently deployed (versions/registry.py)
+  PK=NAMESPACE#{namespace}            SK=DEPLOY#{id}         : one deploy / rollback attempt (versions/registry.py)
+  PK=NAMESPACE#{namespace}            SK=DEPLOYLOCK          : running-deployment lock (versions/registry.py)
 """
 
 import json
 import logging
+import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -641,13 +646,13 @@ TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cance
 _STALE_JOB_SECONDS = int(os.getenv("ASYNC_JOB_STALE_SECONDS", "1800"))  # 30 min
 
 # Proposal accept runs on a fire-and-forget daemon thread (see proposals.py
-# accept_proposal). If that worker dies mid-run — the ECS task recycled, an
-# unhandled crash, Neptune/Bedrock hanging past the task's lifetime — the
+# accept_proposal). If that worker dies mid-run (the ECS task recycled, an
+# unhandled crash, a store call hanging past the task's lifetime), the
 # proposal is left in a non-terminal ``accepting``/``embeddings_sync`` state
 # forever: the Accept button stays disabled and there is no path to recover it.
 # Mirror the async-job sweep: on read, a proposal stuck in an in-progress accept
 # state past ``_ACCEPT_STALE_SECONDS`` (with no ``updated_at`` heartbeat — the
-# accept pipeline bumps updated_at at every step checkpoint, so a live-but-slow
+# publish worker bumps updated_at with every progress report, so a live-but-slow
 # accept keeps resetting the clock and is NOT swept) is moved to the terminal
 # ``accept_failed`` state with an ``accept_error`` so the user can retry.
 #
@@ -668,15 +673,27 @@ def _async_job_pk(namespace: str, kind: str, job_id: str) -> str:
     return f"{namespace}#ASYNCJOB#{kind}#{job_id}"
 
 
+def floats_to_decimal(obj: Any) -> Any:
+    """Recursively convert float values to Decimal for DynamoDB compatibility (NaN and infinities become None)."""
+    if isinstance(obj, float):
+        return None if math.isnan(obj) or math.isinf(obj) else Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: floats_to_decimal(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [floats_to_decimal(i) for i in obj]
+    return obj
+
+
 def put_async_job(kind: str, job_id: str, item: dict, namespace: str = DEFAULT_NAMESPACE) -> None:
     """Persist the initial async-job record. ``item`` is the wire-shape job dict."""
     now = datetime.now(UTC).isoformat()
     # Spread ``item`` FIRST, then stamp the server-controlled fields, so a
     # caller-supplied created_at/updated_at can never override them — the
     # staleness sweep relies on updated_at being a server timestamp.
+    # A validation report's metrics are floats, which boto3 refuses.
     _get_dao().put(
         {
-            **item,
+            **floats_to_decimal(item),
             "PK": _async_job_pk(namespace, kind, job_id),
             "SK": "STATUS",
             "namespace": namespace,
@@ -692,7 +709,7 @@ def update_async_job(kind: str, job_id: str, fields: dict, namespace: str = DEFA
     """Update an async-job record (status/result/error). Reserved-word safe via the DAO."""
     _get_dao().update(
         {"PK": _async_job_pk(namespace, kind, job_id), "SK": "STATUS"},
-        {**fields, "updated_at": datetime.now(UTC).isoformat()},
+        {**floats_to_decimal(fields), "updated_at": datetime.now(UTC).isoformat()},
         auto_timestamp=False,
     )
 
@@ -732,7 +749,10 @@ def sweep_stale_record(
     ``write`` performs the store update and is called with the field dict; it is
     best-effort — a transient DDB failure is logged and swallowed so it cannot
     500 the very poll the user relies on to observe the stuck state (the next
-    read retries the sweep). The older copies let that failure escape.
+    read retries the sweep). The older copies let that failure escape. A
+    ``ConditionalCheckFailedException`` means the row changed since it was read
+    (a conditional ``write`` lost the race to the worker finishing), which is
+    expected: it is logged at INFO and the row is returned unswept.
 
     Returns the same ``item``, mutated when swept, so callers can return it
     directly.
@@ -753,8 +773,11 @@ def sweep_stale_record(
     fields = {"status": terminal_status, error_field: error_message, **(extra_fields or {})}
     try:
         write(fields)
-    except Exception:  # noqa: BLE001 — transient write failure; next read retries the sweep
-        _log.exception("%s: failed to mark stale record as %s", label, terminal_status)
+    except Exception as e:  # noqa: BLE001 (transient write failure; next read retries the sweep)
+        if isinstance(e, ClientError) and e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            _log.info("%s: lost sweep race; row changed", label)
+        else:
+            _log.exception("%s: failed to mark stale record as %s", label, terminal_status)
         return item
     # Mirror EVERY written field onto the returned item, ``extra_fields`` included.
     # ``fields`` is exactly what went to DDB, so reusing it keeps the two from
@@ -1277,18 +1300,18 @@ def _sweep_proposal_if_stale(proposal_id: str, namespace: str, item: dict) -> di
     """Move a proposal stuck in an in-progress accept state to ``accept_failed``.
 
     The accept worker is a fire-and-forget daemon thread; if it dies mid-run
-    (task recycled, crash, or a Neptune/Bedrock call hanging past the task's
-    lifetime) the proposal sits in ``accepting``/``embeddings_sync`` forever with
-    no recovery path. On read, if such a proposal has had no ``updated_at``
-    heartbeat for ``_ACCEPT_STALE_SECONDS``, move it to the terminal
-    ``accept_failed`` state with an ``accept_error`` so the UI surfaces it and the
-    user can re-accept (the pipeline is idempotent on re-run). Mirrors
-    :func:`_sweep_if_stale` for async jobs.
+    (task recycled, crash, or a store call hanging past the task's lifetime) the
+    proposal sits in ``accepting``/``embeddings_sync`` forever with no recovery
+    path. On read, if such a proposal has had no ``updated_at`` heartbeat for
+    ``_ACCEPT_STALE_SECONDS``, move it to the terminal ``accept_failed`` state
+    with an ``accept_error`` so the UI surfaces it and the user can re-accept (a
+    failed publish changed nothing, so a re-accept simply publishes again).
+    Mirrors :func:`_sweep_if_stale` for async jobs.
 
-    The accept pipeline checkpoints every step, refreshing ``updated_at`` each
-    time, so a genuinely-live-but-slow accept keeps resetting the staleness clock
-    and is never swept — only a worker that has made no progress for the whole
-    window is treated as dead.
+    The publish worker reports progress on the proposal, refreshing
+    ``updated_at`` each time, so a genuinely-live-but-slow accept keeps resetting
+    the staleness clock and is never swept; only a worker that has made no
+    progress for the whole window is treated as dead.
 
     Returns the (possibly updated) item. Best-effort: a write error is swallowed
     (the next read retries) so a transient DDB hiccup can't 500 the poll the user
@@ -1313,6 +1336,8 @@ def get_proposal_by_id(
     hydrate_turtle: bool = True,
     hydrate_matches: bool = True,
     hydrate_constraints: bool = True,
+    *,
+    consistent: bool = False,
 ) -> dict | None:
     """Fetch a proposal's META item, hydrating S3-offloaded content.
 
@@ -1333,12 +1358,15 @@ def get_proposal_by_id(
             The detail endpoint sets it False and serves constraints out-of-band
             via a presigned S3 URL instead, because the config can exceed the
             6 MB API Gateway / Lambda response cap on wide schemas.
+        consistent: When True, read the META item strongly consistently, for a
+            check whose answer decides a write (such as whether a review ended).
 
     Returns:
         The proposal item (with matches/Turtle/constraints hydrated from S3
         when the corresponding flag is set), or None if no such proposal exists.
     """
-    resp = _get_table().get_item(Key={"PK": _proposal_pk(namespace, proposal_id), "SK": "META"})
+    read = {"ConsistentRead": True} if consistent else {}
+    resp = _get_table().get_item(Key={"PK": _proposal_pk(namespace, proposal_id), "SK": "META"}, **read)
     item = resp.get("Item")
     if not item:
         return None
@@ -1519,6 +1547,7 @@ def update_proposal(
     *,
     expected_status: str | None = None,
     expected_status_not: str | None = None,
+    expected_studio_revision: int | None = None,
     **fields,
 ) -> None:
     """Update proposal fields.
@@ -1541,11 +1570,17 @@ def update_proposal(
 
     The two are mutually exclusive — passing both is a programming error.
 
+    ``expected_studio_revision`` narrows ``expected_status`` further: the write also needs the
+    proposal's designer draft to still be at that revision (``studio.revision``). Accept uses
+    it so the revision the user reviewed is the one that is published.
+
     All other call sites (cancel, reject, the worker's own status
     flip after ingest) remain unconditional.
     """
     if expected_status is not None and expected_status_not is not None:
         raise ValueError("expected_status and expected_status_not are mutually exclusive")
+    if expected_studio_revision is not None and expected_status is None:
+        raise ValueError("expected_studio_revision needs expected_status")
     fields["updated_at"] = datetime.now(UTC).isoformat()
     expr_parts, values, names = [], {}, {}
     for k, v in fields.items():
@@ -1565,6 +1600,11 @@ def update_proposal(
         names["#s"] = "status"
         values[":expected_status"] = expected_status
         kwargs["ConditionExpression"] = "#s = :expected_status"
+        if expected_studio_revision is not None:
+            names["#st"] = "studio"
+            names["#rev"] = "revision"
+            values[":expected_studio_revision"] = expected_studio_revision
+            kwargs["ConditionExpression"] += " AND #st.#rev = :expected_studio_revision"
     elif expected_status_not is not None:
         # ``attribute_not_exists`` keeps the guard correct for a legacy row that
         # predates the status field — absent status is not the forbidden value.
@@ -1578,7 +1618,7 @@ def update_proposal(
 
 # ── Namespace registry (PK=NAMESPACE#{ns}) ──────────────────────────────
 #
-# Two sort-key patterns live under ``PK=NAMESPACE#{namespace}``:
+# These sort-key patterns live under ``PK=NAMESPACE#{namespace}``:
 #
 #   SK=META                          namespace descriptor (backend, embedding
 #                                    model / dims / index, graph URI prefix,
@@ -1587,6 +1627,13 @@ def update_proposal(
 #                                    namespace, carrying the catalog-level
 #                                    metadata (uri, title, counts, graph_uri,
 #                                    embedding_index, etc.).
+#   SK=VERSION#{n:06d}               one row per published ontology version.
+#   SK=ACTIVE                        the version currently deployed.
+#   SK=DEPLOY#{deployment_id}        one row per deploy / rollback attempt.
+#   SK=DEPLOYLOCK                    the running-deployment lock.
+#
+# The last four are owned by ``coa_ontology.versions.registry``; this module only
+# deletes them with the rest of the partition (``delete_all_namespace_items``).
 #
 # This registry is the authoritative list of "what ontologies exist in
 # namespace X" — it supports a single-partition ``Query`` for the list,
@@ -1828,6 +1875,53 @@ def update_ontology_registry(namespace: str, ontology_id: str, **fields) -> dict
     return resp.get("Attributes")
 
 
+def set_ontology_delete_error(
+    namespace: str,
+    ontology_id: str,
+    error: str,
+    *,
+    delete_lock_id: str | None = None,
+    only_unstamped_delete: bool = False,
+) -> bool:
+    """Set ``delete_error`` on an existing registry row; return False when the row failed the condition.
+
+    Unlike :func:`update_ontology_registry` this never creates a row, so a delete
+    that lost a race to a finished teardown cannot leave an error-only stub behind.
+    With ``delete_lock_id`` the row must still carry it, so a worker whose delete was
+    re-issued (and the row re-flipped) cannot stamp the new attempt. With
+    ``only_unstamped_delete`` (the dead-worker sweep) the row must also still be
+    ``deleting`` with no ``delete_error``, and a None ``delete_lock_id`` means it has
+    none, so a worker that finished, failed or was re-issued meanwhile wins.
+    """
+    names = {"#de": "delete_error", "#ua": "updated_at"}
+    values: dict[str, Any] = {":de": error, ":ua": datetime.now(UTC).isoformat()}
+    condition = "attribute_exists(PK)"
+    if delete_lock_id is not None:
+        names["#lk"] = "delete_lock_id"
+        values[":lk"] = delete_lock_id
+        condition += " AND #lk = :lk"
+    elif only_unstamped_delete:
+        names["#lk"] = "delete_lock_id"
+        condition += " AND attribute_not_exists(#lk)"
+    if only_unstamped_delete:
+        names["#st"] = "status"
+        values.update({":deleting": "deleting", ":empty": ""})
+        condition += " AND #st = :deleting AND (attribute_not_exists(#de) OR #de = :empty)"
+    try:
+        _get_table().update_item(
+            Key={"PK": _namespace_pk(namespace), "SK": _ontology_sk(ontology_id)},
+            UpdateExpression="SET #de = :de, #ua = :ua",
+            ConditionExpression=condition,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+    return True
+
+
 def extend_ontology_registry(
     namespace: str,
     ontology_id: str,
@@ -1841,8 +1935,8 @@ def extend_ontology_registry(
 ) -> dict | None:
     """Atomic append / accumulate on an existing ontology registry row.
 
-    Used by the proposal-accept "append mode" so multiple proposals can
-    be merged under a single target ontology:
+    Used by the ingest "append mode" (``ingest_ontology(allow_append=True)``)
+    so repeated loads merge into a single target ontology:
 
       - ``add_*_count`` values are atomically added (DynamoDB ``ADD``)
         to the corresponding count attributes. Counts become cumulative
@@ -1941,41 +2035,97 @@ def _best_effort_delete_s3_prefix(prefix: str, context: str) -> None:
         _log.warning("S3 teardown for %s failed: %s", context, e)
 
 
-def delete_proposal(namespace: str, proposal_id: str) -> bool:
-    """Delete a proposal's DynamoDB row and its S3 artifacts.
+def delete_proposal(namespace: str, proposal_id: str, *, keep: Collection[str] = ()) -> bool:
+    """Delete a proposal's DynamoDB rows and its S3 artifacts.
 
-    Returns True if the DynamoDB row existed.
-    Removes the proposal META item (``{ns}#PROPOSAL#{id}`` / ``META``) and,
-    best-effort, every S3 object under ``proposals/{ns}/{id}/`` (ontology +
-    r2rml turtle for both ``original`` and ``latest`` versions, plus matches /
-    constraints JSON). S3 cleanup failures are logged but do not fail the
+    Returns True if the META row existed.
+    Removes every item of the proposal's partition (``{ns}#PROPOSAL#{id}``): the
+    META item and the Ontology designer rows beside it (``STUDIOCHAT``,
+    ``STUDIOCS#...``), META last. Best-effort, it also removes every S3 object
+    under ``proposals/{ns}/{id}/`` (ontology + r2rml turtle for both
+    ``original`` and ``latest`` versions, matches / constraints JSON, and the
+    designer draft and chat). S3 cleanup failures are logged but do not fail the
     delete — an orphaned S3 object is harmless, whereas a lingering DynamoDB
     row would keep the proposal visible in the catalog.
+
+    ``keep`` names sort keys of the partition to leave in place. Ontology
+    deletion keeps a designer ``STUDIOGRAPH`` row whose draft graphs could
+    not all be dropped, so the namespace purge still finds them.
     """
-    existing = _get_table().get_item(Key={"PK": _proposal_pk(namespace, proposal_id), "SK": "META"}).get("Item")
+    table = _get_table()
+    pk = _proposal_pk(namespace, proposal_id)
+    existing = table.get_item(Key={"PK": pk, "SK": "META"}).get("Item")
 
     # Best-effort S3 teardown: delete every object under the proposal's prefix.
     _best_effort_delete_s3_prefix(
         f"{_S3_PROPOSALS_PREFIX}/{namespace}/{proposal_id}/", f"proposal {proposal_id} in {namespace}"
     )
 
+    query: dict[str, Any] = {
+        "KeyConditionExpression": "PK = :pk",
+        "ExpressionAttributeValues": {":pk": pk},
+        "ProjectionExpression": "PK, SK",
+    }
+    others: list[dict[str, str]] = []
+    while True:
+        page = table.query(**query)
+        others.extend(
+            {"PK": i["PK"], "SK": i["SK"]} for i in page.get("Items", []) if i["SK"] != "META" and i["SK"] not in keep
+        )
+        if "LastEvaluatedKey" not in page:
+            break
+        query["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+    with table.batch_writer() as batch:
+        for key in others:
+            batch.delete_item(Key=key)
+
     if not existing:
         return False
-    _get_table().delete_item(Key={"PK": _proposal_pk(namespace, proposal_id), "SK": "META"})
+    table.delete_item(Key={"PK": pk, "SK": "META"})
     return True
+
+
+# Rows of the NAMESPACE#{ns} partition the purge deletes after every other row. A namespace
+# teardown holds the domain ABox build lock (``abox.store.fence_teardown``) so no build starts;
+# deleted in SK order it would go before ACTIVE and VERSION#, while a request still starts a build.
+_PURGED_LAST = ("ABOXREQ", "ABOXLOCK")
 
 
 def delete_all_namespace_items(namespace: str) -> int:
     """Delete ALL DynamoDB items belonging to a namespace.
 
     Covers ontology registry rows, induction jobs, ingest jobs, and proposals.
-    Returns the total number of items deleted.
+    Returns the total number of items deleted. The ``_PURGED_LAST`` rows go last.
     """
     table = _get_table()
     deleted = 0
+    last = [{"PK": _namespace_pk(namespace), "SK": sk} for sk in _PURGED_LAST]
+
+    def delete_page(items: list[dict[str, Any]]) -> None:
+        nonlocal deleted
+        with table.batch_writer() as batch:
+            for item in items:
+                key = {"PK": item["PK"], "SK": item["SK"]}
+                if key in last:
+                    continue
+                batch.delete_item(Key=key)
+                deleted += 1
+
+    # NAMESPACE#{ns}: the ontology registry and the namespace's other rows. Its exact key, since the
+    # prefix has no terminator and would match NAMESPACE#{ns}2 as well.
+    query: dict[str, Any] = {
+        "KeyConditionExpression": "PK = :pk",
+        "ExpressionAttributeValues": {":pk": _namespace_pk(namespace)},
+        "ProjectionExpression": "PK, SK",
+    }
+    while True:
+        page = table.query(**query)
+        delete_page(page.get("Items", []))
+        if "LastEvaluatedKey" not in page:
+            break
+        query["ExclusiveStartKey"] = page["LastEvaluatedKey"]
 
     prefixes = [
-        _namespace_pk(namespace),  # NAMESPACE#{ns} — ontology registry
         f"{namespace}#JOB#",  # induction jobs + proposal artifacts
         proposal_pk_prefix(namespace),  # standalone proposals
         f"{namespace}#INGESTJOB#",  # async ingest jobs
@@ -1993,17 +2143,19 @@ def delete_all_namespace_items(namespace: str) -> int:
             if last_key:
                 scan_kwargs["ExclusiveStartKey"] = last_key
             resp = table.scan(**scan_kwargs)
-            items = resp.get("Items", [])
-            with table.batch_writer() as batch:
-                for item in items:
-                    batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
-                    deleted += 1
+            delete_page(resp.get("Items", []))
             last_key = resp.get("LastEvaluatedKey")
             if not last_key:
                 break
+    for key in last:
+        if table.delete_item(Key=key, ReturnValues="ALL_OLD").get("Attributes"):
+            deleted += 1
 
     # Best-effort S3 teardown: sweep every offloaded job manifest under jobs/{ns}/
     # (put_job_datasources_s3) — deleting the DDB job rows above orphans them otherwise.
     _best_effort_delete_s3_prefix(f"jobs/{namespace}/", f"namespace {namespace} job manifests")
+    # And every proposal artifact under proposals/{ns}/: Turtle, matches, constraints and the
+    # Ontology designer drafts (proposals/{ns}/{id}/studio/), whose rows the purge above deleted.
+    _best_effort_delete_s3_prefix(f"{_S3_PROPOSALS_PREFIX}/{namespace}/", f"namespace {namespace} proposals")
 
     return deleted

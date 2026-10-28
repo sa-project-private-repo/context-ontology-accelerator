@@ -2660,6 +2660,56 @@ export class SourcesStack extends SCLStack {
     );
     savePreprocessingResults.addCatch(docErrorChain, { resultPath: "$.error" });
 
+    // Rebuilds the namespace's domain ABox after the document pipelines.
+    // Calls ontology-engine's VPC-only /internal/abox/requests over Cloud Map; the
+    // lambdaSecurityGroup -> ecsSecurityGroup:8001 rule already allows it (network-stack.ts).
+    const docAboxRequestFn = new lambda.Function(
+      this,
+      "SourcesDocAboxRequestFn",
+      {
+        functionName: this.prefixed("sources-doc-abox-request"),
+        runtime: lambda.Runtime.PYTHON_3_12,
+        architecture: lambda.Architecture.ARM_64,
+        handler: "handler.handler",
+        code: bundlePython({
+          srcDirs: [Paths.sourcesDocumentsAboxRequest],
+          requirementsFile: fromRoot(
+            "packages/sources/documents/abox_request/requirements.txt",
+          ),
+          architecture: "arm64",
+        }),
+        environment: {
+          // Built from the network stack: SourcesStack cannot read OntologyStack's SSM
+          // endpoint (ontology depends on sources).
+          ONTOLOGY_ENGINE_ENDPOINT: `http://ontology-engine.${props.network.serviceNamespace.namespaceName}:8001`,
+        },
+        timeout: cdk.Duration.seconds(30),
+        memorySize: 128,
+        vpc,
+        vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+        securityGroups: [lambdaSecurityGroup],
+      },
+    );
+
+    // A final, non-fatal state: the pipeline already succeeded, so a failed request only
+    // leaves the ABox to the next deploy or a manual rebuild.
+    const aboxRequest = (id: string, reason: string): tasks.LambdaInvoke => {
+      const task = new tasks.LambdaInvoke(this, id, {
+        lambdaFunction: docAboxRequestFn,
+        payloadResponseOnly: true,
+        resultPath: sfn.JsonPath.DISCARD,
+        payload: sfn.TaskInput.fromObject({
+          namespace: sfn.JsonPath.stringAt("$.namespace_id"),
+          docSourceId: sfn.JsonPath.stringAt("$.doc_source_id"),
+          reason,
+        }),
+      });
+      task.addCatch(new sfn.Pass(this, `${id}Skipped`), {
+        resultPath: "$.aboxRequestError",
+      });
+      return task;
+    };
+
     const checkPreprocessResult = new sfn.Choice(
       this,
       "SourcesPreprocessingSucceeded?",
@@ -2674,7 +2724,11 @@ export class SourcesStack extends SCLStack {
           error: "PreprocessingError",
         }),
       )
-      .otherwise(kgBuildTask.next(docUpdateCompleted));
+      .otherwise(
+        kgBuildTask
+          .next(docUpdateCompleted)
+          .next(aboxRequest("SourcesDocAboxRequest", "documents ingested")),
+      );
 
     const docIngestionStateMachine = new sfn.StateMachine(
       this,
@@ -2830,7 +2884,15 @@ export class SourcesStack extends SCLStack {
       {
         stateMachineName: this.prefixed("sources-doc-deletion-pipeline"),
         definitionBody: sfn.DefinitionBody.fromChainable(
-          docCleanupTask.next(docGraphCleanupTask).next(docDeleteDdbRecord),
+          docCleanupTask
+            .next(docGraphCleanupTask)
+            .next(docDeleteDdbRecord)
+            .next(
+              aboxRequest(
+                "SourcesDocDeletionAboxRequest",
+                "document source deleted",
+              ),
+            ),
         ),
         timeout: cdk.Duration.hours(2),
       },
@@ -3659,6 +3721,7 @@ export class SourcesStack extends SCLStack {
       .monitorLambda(preprocessingFn)
       .monitorLambda(dbTriggerFn)
       .monitorLambda(docCleanupFn)
+      .monitorLambda(docAboxRequestFn)
       .monitorLambda(docTriggerFn)
       .monitorLambda(federationProvisionerFn)
       .monitorLambda(sourceDeleteWorkerFn)

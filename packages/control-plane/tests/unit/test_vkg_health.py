@@ -364,6 +364,31 @@ class TestResolveVkgHealthWithReason:
             assert status == "UNAVAILABLE"
             assert reason is not None and "no running task" in reason.lower()
 
+    @pytest.mark.parametrize(
+        ("running", "deployments"),
+        [
+            pytest.param(0, [{"status": "PRIMARY", "rolloutState": "COMPLETED"}], id="scaled-down"),
+            pytest.param(0, [{"status": "PRIMARY", "rolloutState": "IN_PROGRESS"}], id="rolling-out"),
+            # The last task is draining: still counted as running, but list_tasks
+            # (desiredStatus=RUNNING) no longer returns it.
+            pytest.param(1, [{"status": "PRIMARY", "rolloutState": "COMPLETED"}], id="last-task-draining"),
+        ],
+    )
+    def test_zero_desired_count_is_unavailable_with_a_neutral_reason(self, monkeypatch, running, deployments):
+        """A service scaled to zero (the reload Lambda does this while latest/ has no
+        loadable ontology) reports UNAVAILABLE whatever its task count or rollout state,
+        with a reason that does not guess why it is at zero."""
+        monkeypatch.setenv("VKG_CLUSTER_ARN", "arn:cluster")
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev")
+        with patch(f"{MODULE}._ecs_client") as mock:
+            mock.return_value = _client_with(_running(running, 0, deployments=deployments), list_task_arns=[])
+            from coa_control_plane.namespace.vkg_health import resolve_vkg_health_with_reason
+
+            assert resolve_vkg_health_with_reason("ns-1") == (
+                "UNAVAILABLE",
+                "VKG is scaled to zero.",
+            )
+
     def test_unknown_has_reason(self, monkeypatch):
         monkeypatch.setenv("VKG_CLUSTER_ARN", "arn:cluster")
         monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev")

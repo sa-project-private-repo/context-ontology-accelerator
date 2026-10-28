@@ -18,7 +18,9 @@ State machine:
   translate — e.g. published R2RML/schema will not load). Distinct from UNAVAILABLE.
 - ``PROVISIONING`` — not yet serving (running < desired) with an IN_PROGRESS primary deployment,
   OR a running task whose container health is still UNKNOWN during its start period.
-- ``UNAVAILABLE``  — the service exists but no task is running and it is not rolling out.
+- ``UNAVAILABLE``: the service exists but no task is running and it is not rolling out,
+  or it is scaled to zero (``desiredCount`` 0, whatever its tasks or rollout show). The
+  reload Lambda scales a namespace to zero while ``latest/`` has no loadable ontology.
 - ``UNKNOWN``      — no service / missing config / any API error.
 
 Read on demand from GetNamespace; any failure degrades to UNKNOWN.
@@ -124,49 +126,61 @@ def _reason_for(status: str) -> str | None:
     }.get(status)
 
 
+# Only what is observed: the reload Lambda scales a namespace to zero for more than one
+# reason (no loadable files in latest/, a version without mappings, an operator), so
+# naming a cause, or what brings it back, could be wrong.
+_SCALED_TO_ZERO = "VKG is scaled to zero."
+
+
 def resolve_vkg_health_with_reason(namespace_id: str) -> tuple[str, str | None]:
     """Return ``(status, reason)`` for the namespace's VKG service.
 
     ``reason`` is None when HEALTHY, else a coarse human-readable explanation.
     """
-    status = _resolve_status(namespace_id)
+    status, desired = _resolve_status(namespace_id)
+    if desired == 0:
+        return status, _SCALED_TO_ZERO
     return status, _reason_for(status)
 
 
-def _resolve_status(namespace_id: str) -> str:
-    """Return a VkgHealthStatus value for the namespace's VKG service."""
+def _resolve_status(namespace_id: str) -> tuple[str, int | None]:
+    """Return ``(VkgHealthStatus value, desiredCount)``; the count is None without an ACTIVE service."""
     cluster = os.environ.get("VKG_CLUSTER_ARN")
     if not cluster or not namespace_id:
-        return VkgHealthStatus.UNKNOWN.value
+        return VkgHealthStatus.UNKNOWN.value, None
 
     service_name = _service_name(namespace_id)
     try:
         resp = _ecs_client().describe_services(cluster=cluster, services=[service_name])
     except Exception as e:
         logger.warning("vkg_health_resolve_failed", namespace_id=namespace_id, error=str(e))
-        return VkgHealthStatus.UNKNOWN.value
+        return VkgHealthStatus.UNKNOWN.value, None
 
     # A missing service comes back under `failures`, not `services`.
     active = [s for s in resp.get("services", []) if s.get("status") == "ACTIVE"]
     if not active:
-        return VkgHealthStatus.UNKNOWN.value
+        return VkgHealthStatus.UNKNOWN.value, None
 
     svc = active[0]
     running = svc.get("runningCount", 0)
     desired = svc.get("desiredCount", 0)
+    if desired == 0:
+        # Scaled to zero on purpose; a draining task or a finishing rollout is not
+        # worth reporting as HEALTHY or PROVISIONING.
+        return VkgHealthStatus.UNAVAILABLE.value, desired
 
     if running >= 1 and running >= desired:
         # A task is running, but "running" does NOT mean "can translate" — read
         # the container's functional-probe health before trusting it (#170).
         container_health = _container_health(cluster, service_name)
         if container_health == "HEALTHY":
-            return VkgHealthStatus.HEALTHY.value
+            return VkgHealthStatus.HEALTHY.value, desired
         if container_health == "UNHEALTHY":
             # Up but failing its /health probe — cannot answer queries.
-            return VkgHealthStatus.DEGRADED.value
+            return VkgHealthStatus.DEGRADED.value, desired
         if container_health == "UNKNOWN":
             # Health check still within its start period — treat as starting up.
-            return VkgHealthStatus.PROVISIONING.value
+            return VkgHealthStatus.PROVISIONING.value, desired
         # Could not read task health (transient API issue / race). Fall back to
         # the deployment-state logic below rather than asserting HEALTHY.
 
@@ -179,10 +193,10 @@ def _resolve_status(namespace_id: str) -> str:
     deployments = svc.get("deployments", [])
     primary = next((d for d in deployments if d.get("status") == "PRIMARY"), None)
     if primary is not None and primary.get("rolloutState") == "IN_PROGRESS":
-        return VkgHealthStatus.PROVISIONING.value
+        return VkgHealthStatus.PROVISIONING.value, desired
     if running >= 1:
         # A task is running but we could not confirm its container health and it
         # is not rolling out — report DEGRADED (up, unconfirmed) rather than the
         # old false HEALTHY or a misleading UNAVAILABLE (which means "no task").
-        return VkgHealthStatus.DEGRADED.value
-    return VkgHealthStatus.UNAVAILABLE.value
+        return VkgHealthStatus.DEGRADED.value, desired
+    return VkgHealthStatus.UNAVAILABLE.value, desired

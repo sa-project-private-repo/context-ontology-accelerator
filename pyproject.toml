@@ -65,6 +65,7 @@ markers = [
     "integ: Integration tests",
     "security: Security integration tests (authentication, authorization, input validation, SQL firewall)",
     "slow: Billable load-test rungs (500+) — manual only",
+    "llm: Runs a language-model turn (an Ontology designer assistant turn); deselect with -m 'not llm'",
     # Also registered in packages/sources/pyproject.toml, which is the rootdir nx
     # uses. Declared here too so running the trees together (a common local
     # invocation) does not warn about an unknown mark.

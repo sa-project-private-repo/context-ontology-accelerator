@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import regex
 import structlog
 from coa_common import validate_namespace_name
-from coa_common.constants import MAX_QUERY_CODEPOINTS
+from coa_common.constants import MAX_QUERY_CODEPOINTS, VOCAB_URI
 
 logger = structlog.get_logger(__name__)
 
@@ -537,6 +537,48 @@ def namespace_graph_prefix(template: str, namespace: str) -> str:
 # not (and duplicate declarations are legal SPARQL, so callers may add their own).
 SPARQL_PREFIXES = "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\nPREFIX owl: <http://www.w3.org/2002/07/owl#>\n"
 
+# The Tier-2 answerability marker. Deploy writes ``true`` on a mapped class and
+# ``false`` on a property that no PredicateObjectMap maps although one of its domains,
+# or for a relationship one of its ranges, is mapped (an attribute or relationship
+# added to a mapped class in the Ontology designer, or a relationship added into one,
+# with no column or join behind it).
+IS_MAPPED_IRI = f"{VOCAB_URI}isMapped"
+# The table a mapped class is read from, or the column of a mapped attribute, as deploy
+# derives them from the version's R2RML.
+PHYSICAL_NAME_IRI = f"{VOCAB_URI}physicalName"
+# Where the mapping puts a mapped property whose ``rdfs:domain`` (or ``rdfs:range``) says
+# otherwise, as after the designer moved one up to a parent of its mapped class: the
+# classes whose TriplesMaps map it (or that its joins reach). Deploy writes them only then.
+MAPPED_DOMAIN_IRI = f"{VOCAB_URI}mappedDomain"
+MAPPED_RANGE_IRI = f"{VOCAB_URI}mappedRange"
+
+
+def unmapped_property_filter(var: str) -> str:
+    """Return the FILTER that drops the property bound to ``var`` when deploy marked it unmapped.
+
+    Shared by every Tier-2 query that offers properties to a writer or accepts them
+    from one: the T-Box fetches, the FK join paths, the FK walk and the SPARQL
+    validator's existence check. Only the ``false`` marker is matched, so a namespace
+    deployed before properties were marked keeps every property.
+    """
+    return f"FILTER NOT EXISTS {{ {var} <{IS_MAPPED_IRI}> false }}"
+
+
+def placed_by_mapping(subject: str, axis: str, marker_iri: str, obj: str) -> str:
+    """Return the pattern binding ``obj`` to ``subject``'s ``rdfs:<axis>``, or to where its mapping puts it.
+
+    Deploy writes ``marker_iri`` (:data:`MAPPED_DOMAIN_IRI` / :data:`MAPPED_RANGE_IRI`) only
+    when the mapping puts the property on (or joins it to) other classes than its domain
+    (range) says, and then those classes replace the domain (range). A property without
+    the marker, as in a namespace deployed before it existed, is placed as it always was.
+    """
+    free = f"?placed{obj.lstrip('?').title()}"
+    return (
+        f"{subject} rdfs:{axis}|<{marker_iri}> {obj} .\n"
+        f"            FILTER(NOT EXISTS {{ {subject} <{marker_iri}> {free} }} "
+        f"|| EXISTS {{ {subject} <{marker_iri}> {obj} }})"
+    )
+
 
 # Above this many resolved graphs we stop inlining and fall back to the prefix
 # filter, because the inlined form repeats ``body`` once per graph and a body may
@@ -652,6 +694,7 @@ def object_properties_sparql(
     with_comment: bool = False,
     graph_iris: list[str] | None = None,
     domain_iris: list[str] | None = None,
+    physical: bool = False,
 ) -> str:
     """Build the namespace-scoped ``owl:ObjectProperty`` (FK join path) query.
 
@@ -673,7 +716,8 @@ def object_properties_sparql(
         limit: SPARQL ``LIMIT`` on the returned edges.
         mapped_gate_iri: When given, require the marker ``<iri> true`` on BOTH ends,
             so only edges between answerable (mapped) classes are returned. ``None``
-            returns every edge.
+            returns every edge between classes. Either way, an object property
+            deploy marked unmapped is never returned.
         with_comment: Also select ``?comment`` (the ingest pipeline's
             ``"Foreign key: a.b references c.d"`` provenance string).
         graph_iris: The namespace's named graphs, when the caller has resolved them
@@ -689,10 +733,18 @@ def object_properties_sparql(
             DOMAIN is anchored, so an edge from an unanchored class into an anchored
             one is dropped. Callers that need the whole FK graph (the traversal tool)
             omit it.
+        physical: Describe each edge as the tables NL-to-SQL writes against hold it
+            (the traversal tool). A relationship deploy placed by its mapping
+            (:data:`MAPPED_DOMAIN_IRI` / :data:`MAPPED_RANGE_IRI`) has those classes
+            as its ends instead of its domain and range, and each end also binds its
+            table name (``?domainName`` / ``?rangeName``, from
+            :data:`PHYSICAL_NAME_IRI`), so the walk names what it reached without a
+            query of its own.
 
     Returns:
         A SPARQL SELECT binding ``?op ?opLabel ?domain ?domainLabel ?range
-        ?rangeLabel`` (plus ``?comment`` when requested), and each label's tag as
+        ?rangeLabel`` (plus ``?comment`` when requested, and the ends' table names
+        when ``physical``), and each label's tag as
         ``?opLabelLang`` / ``?domainLabelLang`` / ``?rangeLabelLang``. A resource
         with several labels yields one row per label; consumers group by URI and
         choose the label with the request's namespace-language preference.
@@ -712,16 +764,30 @@ def object_properties_sparql(
         safe_domains = [iri for iri in domain_iris if _SAFE_GRAPH_IRI_RE.match(iri)]
         if safe_domains:
             domain_values = "VALUES ?domain { " + " ".join(f"<{iri}>" for iri in safe_domains) + " }\n            "
+    ends = "?op rdfs:domain ?domain .\n            ?op rdfs:range ?range ."
+    physical_select = physical_pattern = ""
+    if physical:
+        ends = (
+            placed_by_mapping("?op", "domain", MAPPED_DOMAIN_IRI, "?domain")
+            + "\n            "
+            + placed_by_mapping("?op", "range", MAPPED_RANGE_IRI, "?range")
+        )
+        physical_select = " ?domainName ?rangeName"
+        physical_pattern = "".join(
+            f"\n            OPTIONAL {{ ?{end} <{PHYSICAL_NAME_IRI}> ?{end}Name }}" for end in ("domain", "range")
+        )
+    # A relationship deploy marked unmapped has no join behind it, so it is never an
+    # edge, gated or not: not a join path offered to the writer, not a hop of the walk.
     body = f"""            {domain_values}?op a owl:ObjectProperty .
-            ?op rdfs:domain ?domain .
-            ?op rdfs:range ?range .
+            {ends}
             {gate}
+            {unmapped_property_filter("?op")}
             ?domain rdfs:label ?domainLabel .
             ?range rdfs:label ?rangeLabel .
-            OPTIONAL {{ ?op rdfs:label ?opLabel }}{comment_pattern}"""
+            OPTIONAL {{ ?op rdfs:label ?opLabel }}{comment_pattern}{physical_pattern}"""
     return f"""{SPARQL_PREFIXES}
         SELECT ?op ?opLabel (LANG(?opLabel) AS ?opLabelLang)
                ?domain ?domainLabel (LANG(?domainLabel) AS ?domainLabelLang)
-               ?range ?rangeLabel (LANG(?rangeLabel) AS ?rangeLabelLang){comment_select} WHERE {{
+               ?range ?rangeLabel (LANG(?rangeLabel) AS ?rangeLabelLang){comment_select}{physical_select} WHERE {{
 {graph_scoped_body(body, graph_uri_prefix, graph_iris)}
         }} LIMIT {int(limit)}"""

@@ -380,7 +380,15 @@ def test_grounding_override_rebuild_keeps_the_namespace_language(monkeypatch) ->
     assert '"購入注文"@ja' in turtles["ontology"]
 
 
-# ── accept-time fallback title ──────────────────────────────────────────
+# ── accept-time fallback title (recorded for the first deployment) ──────
+
+
+def _published_title(thread) -> str | None:
+    """The title the accept handed to the publish worker."""
+    from coa_ontology.versions.publish import PublishRequest
+
+    (request,) = [a for a in thread.call_args.kwargs["args"] if isinstance(a, PublishRequest)]
+    return request.title
 
 
 @pytest.mark.parametrize(
@@ -407,6 +415,7 @@ def test_accept_fallback_label_follows_the_namespace_language(source_type, langu
     with (
         patch.object(proposals, "dynamo_store") as dynamo,
         patch.object(proposals, "Thread") as thread,
+        patch.object(proposals.version_registry, "head_version", return_value=None),
         patch.object(induce_catalog, "resolve_namespace_language", return_value=language) as resolve,
     ):
         dynamo.get_proposal_by_id.return_value = item
@@ -414,7 +423,7 @@ def test_accept_fallback_label_follows_the_namespace_language(source_type, langu
         dynamo.list_ontologies_registry.return_value = []
         proposals.accept_proposal("p-1", namespace="ns-1")
     resolve.assert_called_once()
-    assert expected in thread.call_args.kwargs["args"]
+    assert _published_title(thread) == expected
 
 
 def test_accept_with_stored_label_does_not_read_the_namespace() -> None:
@@ -431,6 +440,7 @@ def test_accept_with_stored_label_does_not_read_the_namespace() -> None:
     with (
         patch.object(proposals, "dynamo_store") as dynamo,
         patch.object(proposals, "Thread") as thread,
+        patch.object(proposals.version_registry, "head_version", return_value=None),
         patch.object(induce_catalog, "resolve_namespace_language") as resolve,
     ):
         dynamo.get_proposal_by_id.return_value = item
@@ -438,4 +448,4 @@ def test_accept_with_stored_label_does_not_read_the_namespace() -> None:
         dynamo.list_ontologies_registry.return_value = []
         proposals.accept_proposal("p-1", namespace="ns-1")
     resolve.assert_not_called()
-    assert "Plant" in thread.call_args.kwargs["args"]
+    assert _published_title(thread) == "Plant"

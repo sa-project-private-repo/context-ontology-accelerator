@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
+  act,
   render,
   fireEvent,
   waitFor,
@@ -288,6 +289,149 @@ describe("OntologyInventoryView", () => {
     }
   });
 
+  it("keeps the rows its counters count while it polls, and drops both together", async () => {
+    let answerPoll: (rows: OntologyRecord[]) => void = () => {};
+    listOntologies
+      .mockResolvedValueOnce([
+        record({
+          ontologyId: "http://ex.org/going",
+          uri: "http://ex.org/going",
+          title: "Going Away",
+          ontologyType: "induced",
+          status: "deleting",
+        }),
+      ])
+      .mockReturnValueOnce(
+        new Promise<OntologyRecord[]>((resolve) => {
+          answerPoll = resolve;
+        }),
+      );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const view = renderView();
+      await view.findByText("Going Away");
+      await vi.advanceTimersByTimeAsync(4100);
+      await waitFor(() => expect(listOntologies).toHaveBeenCalledTimes(2));
+
+      // The poll is on its way: the table still shows the row the counters count.
+      expect(view.getByText("Going Away")).toBeInTheDocument();
+      expect(view.getByText("(1)")).toBeInTheDocument();
+      expect(segment(view, "all")).toHaveTextContent("All (1)");
+      expect(segment(view, "induced")).toHaveTextContent("Induced (1)");
+
+      // The delete finished: the row and the counts go at once.
+      await act(async () => answerPoll([]));
+      expect(await view.findByText(/No ontologies yet/)).toBeInTheDocument();
+      expect(view.queryByText("Going Away")).toBeNull();
+      expect(view.getByText("(0)")).toBeInTheDocument();
+      expect(segment(view, "all")).toHaveTextContent("All (0)");
+      expect(segment(view, "induced")).toHaveTextContent("Induced (0)");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows no row of the namespace it polled while another namespace loads", async () => {
+    const deleting = record({
+      ontologyId: "http://ex.org/going",
+      uri: "http://ex.org/going",
+      title: "Going Away",
+      ontologyType: "induced",
+      status: "deleting",
+    });
+    listOntologies
+      .mockResolvedValueOnce([deleting])
+      .mockResolvedValueOnce([deleting])
+      .mockReturnValueOnce(new Promise<OntologyRecord[]>(() => {}));
+    const page = (namespace: string) => (
+      <MemoryRouter initialEntries={["/namespaces/ns/ontology/graph"]}>
+        <Routes>
+          <Route
+            path="/namespaces/:namespaceId/ontology/graph"
+            element={
+              <OntologyInventoryView
+                apiClient={apiClient}
+                namespace={namespace}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const result = render(page("ns"));
+      const view = within(result.container);
+      await view.findByText("Going Away");
+      await vi.advanceTimersByTimeAsync(4100);
+      await waitFor(() => expect(listOntologies).toHaveBeenCalledTimes(2));
+
+      result.rerender(page("other"));
+      await waitFor(() =>
+        expect(listOntologies).toHaveBeenLastCalledWith(apiClient, "other"),
+      );
+      expect(view.queryByText("Going Away")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows no row or count of another namespace on going back to the namespace it polled", async () => {
+    const deleting = record({
+      ontologyId: "http://ex.org/going",
+      uri: "http://ex.org/going",
+      title: "Going Away",
+      ontologyType: "induced",
+      status: "deleting",
+    });
+    const other = record({
+      ontologyId: "http://ex.org/other",
+      uri: "http://ex.org/other",
+      title: "Other Namespace Onto",
+      ontologyType: "induced",
+    });
+    listOntologies
+      .mockResolvedValueOnce([deleting])
+      // The poll: the delete finished.
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([other])
+      .mockReturnValueOnce(new Promise<OntologyRecord[]>(() => {}));
+    const page = (namespace: string) => (
+      <MemoryRouter initialEntries={["/namespaces/ns/ontology/graph"]}>
+        <Routes>
+          <Route
+            path="/namespaces/:namespaceId/ontology/graph"
+            element={
+              <OntologyInventoryView
+                apiClient={apiClient}
+                namespace={namespace}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const result = render(page("ns"));
+      const view = within(result.container);
+      await view.findByText("Going Away");
+      await vi.advanceTimersByTimeAsync(4100);
+      await waitFor(() => expect(view.queryByText("Going Away")).toBeNull());
+      result.rerender(page("other"));
+      expect(await view.findByText("Other Namespace Onto")).toBeInTheDocument();
+
+      // Back to the namespace polled last: its list is on its way.
+      result.rerender(page("ns"));
+      await waitFor(() => expect(listOntologies).toHaveBeenCalledTimes(4));
+      expect(listOntologies).toHaveBeenLastCalledWith(apiClient, "ns");
+      expect(view.queryByText("Other Namespace Onto")).toBeNull();
+      expect(segment(view, "all")).toHaveTextContent("All (0)");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not link a row that is being deleted", async () => {
     listOntologies.mockResolvedValue([
       record({
@@ -305,6 +449,25 @@ describe("OntologyInventoryView", () => {
     // The title still renders (as plain text) — only the anchor is withheld.
     await view.findByText("Going Away");
     expect(view.queryByRole("link", { name: "Going Away" })).toBeNull();
+  });
+
+  it("links an induced row whose delete failed, so the delete can be retried from its page", async () => {
+    listOntologies.mockResolvedValue([
+      record({
+        ontologyId: "http://ex.org/stuck",
+        uri: "http://ex.org/stuck",
+        title: "Stuck Delete",
+        ontologyType: "induced",
+        status: "deleting",
+        deleteError: "Delete worker did not complete; retry the delete.",
+      }),
+    ]);
+
+    const view = renderView();
+    await view.findByText("Delete failed");
+    expect(
+      await view.findByRole("link", { name: "Stuck Delete" }),
+    ).toBeInTheDocument();
   });
 
   it("renders the all-types empty state pointing at the Induction page", async () => {

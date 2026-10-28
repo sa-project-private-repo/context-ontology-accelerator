@@ -246,6 +246,19 @@ class TestBoundsMatchSmithyModel:
         )
         assert _enum_values(text, "DimensionOperator") == contract.DIMENSION_OPERATORS
 
+    def test_run_sparql_query_length_matches(self):
+        assert _member_bound(_model(), "RunSparqlQuery", "sparql", "length") == (
+            contract.RUN_SPARQL_QUERY_SPARQL_MIN_LENGTH,
+            contract.RUN_SPARQL_QUERY_SPARQL_MAX_LENGTH,
+        )
+
+    def test_run_sparql_query_length_matches_the_context_manager_guard(self):
+        """The Context Manager's guard refuses the same lengths (its own copy of the bound)."""
+        guard = (
+            Path(__file__).resolve().parents[3] / "context-manager" / "src" / "coa_serve" / "tier2" / "ontop"
+        ) / "sparql_guard.py"
+        assert f"MAX_SPARQL_CHARS = {contract.RUN_SPARQL_QUERY_SPARQL_MAX_LENGTH:_}" in guard.read_text()
+
     def test_rest_budget_matches_timeout_bound(self):
         """The model's ``timeoutMs`` ceiling is this handler's own REST budget."""
         assert contract.QUERY_TIMEOUT_MS_MAX == handler_module.REST_TIMEOUT_MS

@@ -165,6 +165,39 @@ export const EXPENSIVE_API_OPERATIONS: ReadonlyArray<{
     method: "POST",
     path: "/namespaces/{namespaceId}/proposals/{proposalId}/accept",
   },
+  // Ontology version deploy: starts an async graph swap + embedding rebuild.
+  {
+    method: "POST",
+    path: "/namespaces/{namespaceId}/ontology/versions/{version}/deploy",
+  },
+  // Domain ABox rebuild: re-reads the lexical graph and may call the LLM.
+  { method: "POST", path: "/namespaces/{namespaceId}/abox/rebuild" },
+  // Ontology designer message: runs an agent turn of up to 25 Bedrock tool calls.
+  {
+    method: "POST",
+    path: "/namespaces/{namespaceId}/proposals/{proposalId}/studio/messages",
+  },
+  // Ontology designer query: up to 20 s of Neptune work, after loading the draft graph.
+  {
+    method: "POST",
+    path: "/namespaces/{namespaceId}/proposals/{proposalId}/studio/queries",
+  },
+  // VKG SPARQL (Ontology designer query console): translates, then runs SQL on the sources.
+  { method: "POST", path: "/namespaces/{namespaceId}/sparql" },
+  // Ontology designer question check: an agent turn, like a message.
+  {
+    method: "POST",
+    path: "/namespaces/{namespaceId}/proposals/{proposalId}/studio/questions/{questionId}/check",
+  },
+  // Domain ABox mapping edit and reset: each queues the same full rebuild.
+  {
+    method: "PUT",
+    path: "/namespaces/{namespaceId}/abox/mappings/{mappingId}",
+  },
+  {
+    method: "DELETE",
+    path: "/namespaces/{namespaceId}/abox/mappings/{mappingId}",
+  },
 ];
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -1003,6 +1003,91 @@ class TestMapResults:
         assert chunks[0].source_doc == "legacy-doc.pdf"
 
 
+async def _retrieve_nodes(nodes=(), *, side_effect=None, timeout_s=15.0) -> BaselineResult:
+    """``BaselineLexicalRetriever.retrieve`` when the toolkit returns ``nodes`` (or runs ``side_effect``)."""
+    retriever = BaselineLexicalRetriever(
+        graph_store_uri="neptune-graph://g-test",
+        vector_store_uri="aoss://https://test.aoss.amazonaws.com",
+        timeout_s=timeout_s,
+    )
+    with patch.object(retriever, "_retrieve_sync", return_value=list(nodes), side_effect=side_effect):
+        return await retriever.retrieve("What did Acme Corp order?", "550e8400-e29b-41d4-a716-446655440000")
+
+
+@pytest.mark.unit
+class TestChunkIds:
+    """The lexical chunk ids the results cite: the domain ABox step links by them when there is no entity."""
+
+    async def test_topic_beam_nodes_carry_no_entities_but_their_chunk_ids(self):
+        from .lexical_helpers import topic_beam_nodes
+
+        # graphrag's chunk ids are {sourceId}:{hash}.
+        nodes = topic_beam_nodes(
+            [
+                ("aws:t1:88c93c17:8e9a", "aws:t1:88c93c17:8e9a:6b4c5896", ["Acme Corp placed orders 1001 and 1002."]),
+                ("aws:t1:a6e44494:89e8", "aws:t1:a6e44494:89e8:0c1d2e3f", ["Stark Industries placed order 1007."]),
+            ]
+        )
+
+        result = await _retrieve_nodes(nodes)
+
+        assert result.entities == ()
+        assert sorted(result.chunk_ids) == ["aws:t1:88c93c17:8e9a:6b4c5896", "aws:t1:a6e44494:89e8:0c1d2e3f"]
+        # In the order of the nodes, which is the toolkit's ranking.
+        assert [c.source_doc for c in result.chunks] == [c.rsplit(":", 1)[0] for c in result.chunk_ids]
+
+    async def test_chunk_ids_keep_the_node_order_and_appear_once(self):
+        # A topic lists its chunks and each statement names its own; one cited again keeps its first place.
+        def node(node_id, *topics):
+            return _make_node(
+                node_id=node_id, metadata={"result": {"source": _source_metadata(), "topics": list(topics)}}
+            )
+
+        nodes = [
+            node("n1", {"chunks": [{"chunkId": "c2"}], "statements": [{"chunkId": "c2"}, {"chunkId": "c3"}]}),
+            node("n2", {"chunks": [{"chunkId": "c1"}, {"chunkId": "c2"}]}, {"statements": [{"chunkId": "c4"}]}),
+        ]
+
+        result = await _retrieve_nodes(nodes)
+
+        assert result.chunk_ids == ("c2", "c3", "c1", "c4")
+
+    async def test_malformed_results_give_fewer_chunk_ids_and_no_error(self):
+        nodes = [
+            _make_node(node_id="n1", metadata={"result": {"topics": "not-a-list"}}),
+            _make_node(node_id="n2", metadata={"result": ["not", "a", "dict"]}),
+            _make_node(
+                node_id="n3",
+                metadata={
+                    "result": {
+                        "topics": [
+                            "not-a-dict",
+                            {
+                                "chunks": "not-a-list",
+                                "statements": [None, {"chunkId": 7}, {"chunkId": ""}, {"chunkId": "ok"}],
+                            },
+                        ]
+                    }
+                },
+            ),
+            _make_node(node_id="n4", metadata={}),
+        ]
+
+        result = await _retrieve_nodes(nodes)
+
+        assert result.chunk_ids == ("ok",)
+        assert len(result.chunks) == 4
+
+    async def test_a_failed_retrieval_cites_no_chunk(self):
+        import time as _time
+
+        failed = await _retrieve_nodes(side_effect=RuntimeError("connection failed"))
+        timed_out = await _retrieve_nodes(side_effect=lambda *_: _time.sleep(0.2), timeout_s=0.01)
+
+        assert failed.trace_steps[0]["status"] == timed_out.trace_steps[0]["status"] == "error"
+        assert failed.chunk_ids == timed_out.chunk_ids == ()
+
+
 # ── KnowledgeRetriever integration tests ────────────────────────────
 
 
@@ -1118,6 +1203,132 @@ class TestKnowledgeRetrieverWithLexical:
         step_names = [s["step"] if isinstance(s, dict) else s.step for s in result.trace_steps]
         assert "lexical_baseline_retrieve" in step_names
         assert "t3.synthesize" in step_names
+
+    async def test_domain_abox_facts_reach_the_synthesizer_and_the_trace(self):
+        from coa_serve.lexical.strategies import RetrieverStrategy
+        from coa_serve.tier3.domain_abox import DomainFacts
+        from coa_serve.trace import TraceCollector
+
+        mock_lexical = AsyncMock()
+        mock_lexical.retrieve.return_value = _make_baseline_result()
+        synthesizer = _make_synthesizer()
+        step = {"step": "domain_abox", "status": "success", "durationMs": 7, "detail": "1 instances linked"}
+        augmenter = AsyncMock()
+        augmenter.augment.return_value = (DomainFacts("v3", ("fact",), 1), step)
+
+        retriever = KnowledgeRetriever(
+            vector_retriever=None,
+            graph_traverser=None,
+            synthesizer=synthesizer,
+            lexical_retriever=mock_lexical,
+            domain_abox=augmenter,
+        )
+
+        trace = TraceCollector()
+        result = await retriever.resolve(
+            "test",
+            "550e8400-e29b-41d4-a716-446655440000",
+            retriever_strategy=RetrieverStrategy.CHUNK_BASED_SEMANTIC,
+            trace=trace,
+        )
+
+        augmenter.augment.assert_awaited_once()
+        namespace, entities = augmenter.augment.call_args.args
+        assert namespace == "550e8400-e29b-41d4-a716-446655440000"
+        assert [e.label for e in entities] == ["Apple Inc."]
+        assert synthesizer.synthesize.call_args.kwargs["domain_facts"] == ["fact"]
+        assert synthesizer.synthesize.call_args.kwargs["domain_version"] == "v3"
+        assert step in result.trace_steps
+        assert "domain_abox" in [s.step for s in trace.steps]
+
+    async def test_skipped_domain_abox_leaves_the_synthesis_unchanged(self):
+        from coa_serve.lexical.strategies import RetrieverStrategy
+
+        mock_lexical = AsyncMock()
+        mock_lexical.retrieve.return_value = _make_baseline_result()
+        synthesizer = _make_synthesizer()
+        step = {"step": "domain_abox", "status": "skipped", "durationMs": 1, "detail": "no domain ABox"}
+        augmenter = AsyncMock()
+        augmenter.augment.return_value = (None, step)
+
+        retriever = KnowledgeRetriever(
+            vector_retriever=None,
+            graph_traverser=None,
+            synthesizer=synthesizer,
+            lexical_retriever=mock_lexical,
+            domain_abox=augmenter,
+        )
+
+        result = await retriever.resolve(
+            "test", "550e8400-e29b-41d4-a716-446655440000", retriever_strategy=RetrieverStrategy.CHUNK_BASED_SEMANTIC
+        )
+
+        assert synthesizer.synthesize.call_args.kwargs["domain_facts"] is None
+        assert synthesizer.synthesize.call_args.kwargs["domain_version"] is None
+        assert step in result.trace_steps
+        assert result.synthesized_answer == "Apple's revenue was $83 billion in Q3 2022."
+
+    async def test_without_a_domain_abox_the_trace_has_no_domain_step(self):
+        from coa_serve.lexical.strategies import RetrieverStrategy
+
+        mock_lexical = AsyncMock()
+        mock_lexical.retrieve.return_value = _make_baseline_result()
+        synthesizer = _make_synthesizer()
+
+        retriever = KnowledgeRetriever(
+            vector_retriever=None, graph_traverser=None, synthesizer=synthesizer, lexical_retriever=mock_lexical
+        )
+        result = await retriever.resolve(
+            "test", "550e8400-e29b-41d4-a716-446655440000", retriever_strategy=RetrieverStrategy.CHUNK_BASED_SEMANTIC
+        )
+
+        assert synthesizer.synthesize.call_args.kwargs["domain_facts"] is None
+        assert "domain_abox" not in [s["step"] for s in result.trace_steps]
+
+    @pytest.mark.parametrize(
+        ("entities", "chunk_ids", "error"),
+        [
+            pytest.param([], ("c1", "c2"), False, id="chunks"),
+            pytest.param(["Apple Inc."], ("c1",), False, id="entities-and-chunks"),
+            pytest.param([], (), True, id="unhandled-error"),
+        ],
+    )
+    async def test_the_retrieved_entities_and_chunks_reach_the_domain_abox(self, entities, chunk_ids, error):
+        from dataclasses import replace
+
+        from coa_serve.lexical.strategies import RetrieverStrategy
+        from coa_serve.tier3.graph_traverser import GraphEntity
+
+        mock_lexical = AsyncMock()
+        if error:
+            mock_lexical.retrieve.side_effect = RuntimeError("boom")
+        else:
+            baseline = _make_baseline_result(
+                entities=[GraphEntity(uri=e, label=e, type="lexical_entity") for e in entities]
+            )
+            mock_lexical.retrieve.return_value = replace(baseline, chunk_ids=chunk_ids)
+        augmenter = AsyncMock()
+        augmenter.augment.return_value = (
+            None,
+            {"step": "domain_abox", "status": "skipped", "durationMs": 0, "detail": "no domain ABox"},
+        )
+        retriever = KnowledgeRetriever(
+            vector_retriever=None,
+            graph_traverser=None,
+            synthesizer=_make_synthesizer(),
+            lexical_retriever=mock_lexical,
+            domain_abox=augmenter,
+        )
+
+        await retriever.resolve(
+            "test", "550e8400-e29b-41d4-a716-446655440000", retriever_strategy=RetrieverStrategy.TOPIC_BEAM
+        )
+
+        augmenter.augment.assert_awaited_once()
+        namespace, linked = augmenter.augment.call_args.args
+        assert namespace == "550e8400-e29b-41d4-a716-446655440000"
+        assert [e.label for e in linked] == entities
+        assert augmenter.augment.call_args.kwargs == {"chunk_ids": chunk_ids}
 
 
 # ── Factory tests ───────────────────────────────────────────────────

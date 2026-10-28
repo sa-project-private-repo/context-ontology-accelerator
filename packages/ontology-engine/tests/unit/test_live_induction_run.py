@@ -12,7 +12,9 @@ report success against behaviour the shipped API never exhibits:
    The old harness subscripted the model (``a["status"]`` → ``TypeError``) and
    asserted a synchronous ``"accepted"`` / a non-existent ``"already_accepted"``
    status. The fix (``accept_proposal_direct``) polls the proposal to a terminal
-   state and normalizes the result.
+   state and normalizes the result. Accept now publishes an ontology version and
+   starts its deployment, so the harness also waits for that deployment to finish
+   before it verifies Neptune / OpenSearch.
 2. **Grounding** — the harness never populated ``grounding_ontology_ids`` and
    defaulted to the ``rigor_ontology`` strategy (which ``del``\\ s the grounding
    scope), so grounding was never attempted yet the run still "passed". The fix
@@ -30,44 +32,80 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import create_autospec
 
 import pytest
+from coa_ontology.proposals import accept_proposal as _real_accept_proposal
+from fastapi import HTTPException
 
 pytestmark = pytest.mark.unit
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "live_induction_run.py"
 
 
-@pytest.fixture
-def harness(monkeypatch):
-    """Import ``live_induction_run`` by path with a minimal in-memory backend.
-
-    Uses the ``na_only`` backend so the module's import-time REQUIRED check is
-    satisfied with two trivial env vars and no AWS clients are constructed at
-    import (the store/proposal calls the tests exercise are all monkeypatched).
-    """
-    monkeypatch.setenv("WORKBENCH_BACKEND", "na_only")
-    monkeypatch.setenv("NA_GRAPH_ID", "g-test")
-    monkeypatch.setenv("DYNAMODB_TABLE", "t-test")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
-
+def _load_harness():
     spec = importlib.util.spec_from_file_location("live_induction_run_under_test", _SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     # Register before exec so dataclasses/type hints resolving __module__ work.
     sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
+    return mod
+
+
+@pytest.fixture
+def harness(monkeypatch):
+    """Import ``live_induction_run`` by path with trivial endpoint env.
+
+    The module's import-time REQUIRED check only reads env vars; no AWS clients
+    are constructed at import (the store/proposal calls the tests exercise are
+    all monkeypatched).
+    """
+    monkeypatch.setenv("WORKBENCH_BACKEND", "opensearch_neptune")
+    monkeypatch.setenv("NDB_ENDPOINT", "https://ndb.test:8182")
+    monkeypatch.setenv("OSS_ENDPOINT", "https://oss.test")
+    monkeypatch.setenv("DYNAMODB_TABLE", "t-test")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+
+    mod = _load_harness()
     try:
         yield mod
     finally:
-        sys.modules.pop(spec.name, None)
+        sys.modules.pop(mod.__name__, None)
 
 
-def _install_fake_proposals(monkeypatch, *, accept_status, poll_statuses):
-    """Stub the ``coa_ontology.proposals`` + ``dynamo_store`` surface the harness calls.
+def test_na_only_backend_is_refused(monkeypatch):
+    """Accept publishes a version and deploying it needs opensearch_neptune, so na_only cannot be verified."""
+    monkeypatch.setenv("WORKBENCH_BACKEND", "na_only")
+    monkeypatch.setenv("NA_GRAPH_ID", "g-test")
+    monkeypatch.setenv("DYNAMODB_TABLE", "t-test")
+    with pytest.raises(SystemExit, match="opensearch_neptune"):
+        _load_harness()
+
+
+def _install_fake_proposals(
+    monkeypatch,
+    *,
+    accept_status,
+    poll_statuses,
+    accepted_fields=None,
+    published_version=1,
+    deployment_statuses=("DEPLOYED",),
+    accept_error=None,
+):
+    """Stub the ``coa_ontology`` surface the harness calls (proposals, dynamo_store, versions.registry).
 
     ``accept_status`` is what the (async) ``accept_proposal`` 202 returns;
     ``poll_statuses`` is the sequence of ``status`` values ``get_proposal_by_id``
-    returns on successive polls (last one is the terminal state).
+    returns on successive polls (last one is the terminal state). An ``accepted``
+    record names ``published_version``, as the real worker writes it together with
+    ``accepted`` (``None``: the accept published nothing), and carries
+    ``accepted_fields`` (default: the auto-deploy ``d-1`` started).
+    ``deployment_statuses`` is what successive ``get_deployment`` polls return.
+    ``accept_error`` makes ``accept_proposal`` raise it instead of returning.
     """
 
     # Minimal AcceptProposalResponse stand-in: a pydantic-ish object exposing
@@ -87,8 +125,10 @@ def _install_fake_proposals(monkeypatch, *, accept_status, poll_statuses):
 
     accept_calls = []
 
-    def _accept_proposal(proposal_id, body=None, namespace="default"):
+    def _accept_proposal(proposal_id, body=None, namespace="default", **kwargs):
         accept_calls.append((proposal_id, namespace, getattr(body, "ontology_id", None)))
+        if accept_error is not None:
+            raise accept_error
         return _AcceptResp(proposal_id, accept_status)
 
     # ProposalStatus enum stand-in (values match the Smithy-generated enum).
@@ -107,7 +147,8 @@ def _install_fake_proposals(monkeypatch, *, accept_status, poll_statuses):
     monkeypatch.setitem(sys.modules, "coa_control_plane_server.models.proposal_status", ps_mod)
 
     proposals_mod = types.ModuleType("coa_ontology.proposals")
-    proposals_mod.accept_proposal = _accept_proposal
+    # Autospec the real route so a signature change there fails here instead of in a live run.
+    proposals_mod.accept_proposal = create_autospec(_real_accept_proposal, side_effect=_accept_proposal)
     proposals_mod.AcceptProposalRequest = _AcceptReq
     proposals_mod.PROPOSAL_STATUS_ACCEPT_FAILED = "accept_failed"
     proposals_mod._ACCEPT_IN_PROGRESS_STATUSES = ("accepting", "embeddings_sync")
@@ -121,11 +162,16 @@ def _install_fake_proposals(monkeypatch, *, accept_status, poll_statuses):
             status = next(poll_iter)
         except StopIteration:
             status = last["status"]
-        return {
+        record = {
             "status": status,
             "ontology_id": "https://ont/x",
-            "accept_error": "boom step 'ingest'" if status == "accept_failed" else "",
+            "accept_error": "boom step 'publish'" if status == "accept_failed" else "",
         }
+        if status == "accepted":
+            if published_version is not None:
+                record["published_version"] = published_version
+            record.update({"auto_deploy_id": "d-1"} if accepted_fields is None else accepted_fields)
+        return record
 
     dynamo_mod = types.ModuleType("coa_ontology.dynamo_store")
     dynamo_mod.get_proposal_by_id = _get_proposal_by_id
@@ -143,6 +189,25 @@ def _install_fake_proposals(monkeypatch, *, accept_status, poll_statuses):
     monkeypatch.setattr(coa_ontology_pkg, "dynamo_store", dynamo_mod, raising=False)
     monkeypatch.setattr(coa_ontology_pkg, "proposals", proposals_mod, raising=False)
     monkeypatch.setitem(sys.modules, "coa_ontology", coa_ontology_pkg)
+
+    deployment_iter = iter(deployment_statuses)
+    deployment_calls = []
+
+    def _get_deployment(namespace, deployment_id):
+        deployment_calls.append((namespace, deployment_id))
+        status = next(deployment_iter, deployment_statuses[-1])
+        return {"deployment_id": deployment_id, "version": 1, "status": status, "error": "staging failed"}
+
+    registry_mod = types.ModuleType("coa_ontology.versions.registry")
+    registry_mod.DEPLOYED = "DEPLOYED"
+    registry_mod.DEPLOY_FAILED = "DEPLOY_FAILED"
+    registry_mod.get_deployment = _get_deployment
+    registry_mod.deployment_calls = deployment_calls
+    versions_pkg = types.ModuleType("coa_ontology.versions")
+    versions_pkg.registry = registry_mod
+    monkeypatch.setitem(sys.modules, "coa_ontology.versions", versions_pkg)
+    monkeypatch.setitem(sys.modules, "coa_ontology.versions.registry", registry_mod)
+    monkeypatch.setattr(coa_ontology_pkg, "versions", versions_pkg, raising=False)
 
     ndg_mod = types.ModuleType("coa_ontology.stores.neptune_db_graph")
     ndg_mod._ontology_graph_uri = lambda oid, ns: f"urn:graph:{ns}:{oid}"
@@ -172,6 +237,109 @@ def test_accept_polls_accepting_to_accepted(harness, monkeypatch):
     assert result["ontology_id"] == "https://ont/x"
     assert result["graph_uri"] == "urn:graph:ns:https://ont/x"
     assert result["embeddings"]["count"] == 7
+    assert result["deployment"]["status"] == "DEPLOYED"
+
+
+def test_accept_waits_for_the_auto_deploy_to_finish(harness, monkeypatch):
+    """Neptune / OSS are only checked once the version the accept published is DEPLOYED."""
+    monkeypatch.setattr(harness, "_ACCEPT_POLL_INTERVAL_S", 0, raising=False)
+    _install_fake_proposals(
+        monkeypatch,
+        accept_status="accepting",
+        poll_statuses=["accepting", "accepted"],
+        deployment_statuses=("DEPLOYING", "DEPLOYING", "DEPLOYED"),
+    )
+    import coa_ontology.versions.registry as registry
+
+    result = harness.accept_proposal_direct("p-1", namespace="ns")
+
+    assert result["deployment"] == {
+        "deployment_id": "d-1",
+        "version": 1,
+        "status": "DEPLOYED",
+        "error": "staging failed",
+    }
+    assert registry.deployment_calls == [("ns", "d-1")] * 3
+
+
+def test_accept_waits_for_the_auto_deploy_id_to_be_recorded(harness, monkeypatch):
+    """The worker records ``auto_deploy_id`` just after flipping to accepted; an earlier poll may not see it."""
+    monkeypatch.setattr(harness, "_ACCEPT_POLL_INTERVAL_S", 0, raising=False)
+    calls = {"n": 0}
+
+    def _fields():
+        calls["n"] += 1
+        return {} if calls["n"] == 1 else {"auto_deploy_id": "d-1"}
+
+    _install_fake_proposals(monkeypatch, accept_status="accepting", poll_statuses=["accepted"], accepted_fields={})
+    import coa_ontology.dynamo_store as ds
+
+    real_get = ds.get_proposal_by_id
+    monkeypatch.setattr(ds, "get_proposal_by_id", lambda *a, **kw: {**real_get(*a, **kw), **_fields()})
+
+    assert harness.accept_proposal_direct("p-1", namespace="ns")["deployment"]["status"] == "DEPLOYED"
+
+
+def test_failed_deployment_raises(harness, monkeypatch):
+    monkeypatch.setattr(harness, "_ACCEPT_POLL_INTERVAL_S", 0, raising=False)
+    _install_fake_proposals(
+        monkeypatch, accept_status="accepting", poll_statuses=["accepted"], deployment_statuses=("DEPLOY_FAILED",)
+    )
+    with pytest.raises(RuntimeError, match="deployment d-1 failed: staging failed"):
+        harness.accept_proposal_direct("p-1", namespace="ns")
+
+
+def test_held_auto_deploy_raises(harness, monkeypatch):
+    """A held deploy (breaking metrics, another deployment, na_only…) leaves nothing new to verify."""
+    monkeypatch.setattr(harness, "_ACCEPT_POLL_INTERVAL_S", 0, raising=False)
+    _install_fake_proposals(
+        monkeypatch,
+        accept_status="accepting",
+        poll_statuses=["accepted"],
+        accepted_fields={"auto_deploy_held": {"reason": "DEPLOY_IN_PROGRESS"}},
+    )
+    with pytest.raises(RuntimeError, match="DEPLOY_IN_PROGRESS"):
+        harness.accept_proposal_direct("p-1", namespace="ns")
+
+
+def test_deployment_wait_times_out(harness, monkeypatch):
+    monkeypatch.setattr(harness, "_ACCEPT_POLL_INTERVAL_S", 0, raising=False)
+    monkeypatch.setattr(harness, "_DEPLOY_POLL_TIMEOUT_S", 0, raising=False)
+    _install_fake_proposals(
+        monkeypatch, accept_status="accepting", poll_statuses=["accepted"], deployment_statuses=("DEPLOYING",)
+    )
+    with pytest.raises(TimeoutError, match="d-1"):
+        harness.accept_proposal_direct("p-1", namespace="ns")
+
+
+@pytest.mark.parametrize("accept_status", ["accepting", "accepted"])
+def test_accept_that_published_no_version_does_not_wait_for_a_deploy(harness, monkeypatch, accept_status):
+    """Only a published version is deployed, so an accept that published none has nothing to wait for.
+
+    The live integ test's stand-in accept moves the proposal to ``accepted`` (or finds it there)
+    without publishing. The zero deploy timeout makes any wait fail.
+    """
+    monkeypatch.setattr(harness, "_ACCEPT_POLL_INTERVAL_S", 0, raising=False)
+    monkeypatch.setattr(harness, "_DEPLOY_POLL_TIMEOUT_S", 0, raising=False)
+    _install_fake_proposals(
+        monkeypatch, accept_status=accept_status, poll_statuses=["accepted"], accepted_fields={}, published_version=None
+    )
+    import coa_ontology.versions.registry as registry
+
+    result = harness.accept_proposal_direct("p-1", namespace="ns")
+
+    assert result["status"] == "accepted"
+    assert result["deployment"] is None
+    assert registry.deployment_calls == []
+
+
+def test_accept_conflict_raises_a_clear_error(harness, monkeypatch):
+    """A namespace that publishes versions of another ontology rejects the accept with 409."""
+    monkeypatch.setenv("INDUCTION_TARGET_ONTOLOGY_ID", "merged")
+    conflict = HTTPException(409, "Namespace 'ns' publishes versions of ontology 'https://ont/x'; accept into ...")
+    _install_fake_proposals(monkeypatch, accept_status="accepting", poll_statuses=["accepted"], accept_error=conflict)
+    with pytest.raises(RuntimeError, match="publishes versions of ontology 'https://ont/x'.*INDUCTION_NAMESPACE"):
+        harness.accept_proposal_direct("p-1", namespace="ns")
 
 
 def test_accept_already_accepted_short_circuits(harness, monkeypatch):
