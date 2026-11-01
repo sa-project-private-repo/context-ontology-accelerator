@@ -62,6 +62,9 @@ class ToolResult:
             successful structured tool is not mis-scored as no-progress.
         detail: Human-readable trace detail for this invocation, including any
             degradation reason.
+        degraded_reason: Stable machine-readable reason when the Tool returned a
+            degraded result while still completing normally. The controller
+            records it in ``degraded_sources`` and marks the session partial.
         produced_directions: Candidate sub-question seeds this result surfaced
             (e.g. one per discovered competitor) that the controller may open as
             Exploration_Branches subject to the fan-out cap (Req 13.4).
@@ -78,6 +81,7 @@ class ToolResult:
     entities: tuple[Any, ...] = ()
     rows: tuple[dict, ...] = ()
     detail: str = ""
+    degraded_reason: str = ""
     produced_directions: tuple[str, ...] = ()
     executed_queries: tuple[ExecutedQuery, ...] = ()
 

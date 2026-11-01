@@ -19,6 +19,7 @@ import {
 } from "@cloudscape-design/components";
 import type { ExecutionMode, TraceStep } from "@app-types";
 import {
+  localizeTraceStatus,
   localizeTraceStep,
   mapTraceStatus,
   tier2Title,
@@ -86,7 +87,11 @@ export function TraceDetail() {
   useBreadcrumbTrail([
     { text: t("Serve") },
     { text: t("Playground"), href: "/playground" },
-    { text: `Trace ${requestId ?? ""}`.trim() },
+    {
+      text: requestId
+        ? t("Trace {requestId}", { requestId })
+        : t("Trace detail"),
+    },
   ]);
 
   if (!resolvedTrace) {
@@ -395,7 +400,7 @@ function TraceTable({ trace }: { trace: TraceStep[] }) {
           header: t("Status"),
           cell: (item: IndexedTraceStep) => (
             <StatusIndicator type={mapTraceStatus(item.status)}>
-              {statusLabel(item.status, t)}
+              {localizeTraceStatus(t, item.status)}
             </StatusIndicator>
           ),
         },
@@ -483,22 +488,6 @@ function extractTier(stepId: string): number | null {
   if (stepId.startsWith("t2.") || stepId.startsWith("tier2")) return 2;
   if (stepId.startsWith("t3.") || stepId.startsWith("tier3")) return 3;
   return null;
-}
-
-function statusLabel(status: string, t: AppTranslate): string {
-  switch (status) {
-    case "success":
-      return t("Resolved");
-    case "miss":
-    case "skipped":
-      return t("Skipped");
-    case "error":
-      return t("Failed");
-    case "denied":
-      return t("Denied");
-    default:
-      return status;
-  }
 }
 
 function formatDetail(

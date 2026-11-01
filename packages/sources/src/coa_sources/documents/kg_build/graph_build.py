@@ -27,7 +27,7 @@ Environment variables:
 
   Optional:
     EXTRACTION_MODE          — "continuous" (default) or "separated"
-    USE_BATCH_INFERENCE      — "true" or "false" (default) — uses Bedrock batch inference
+    USE_BATCH_INFERENCE      — "true" (default) or "false" — uses Bedrock batch inference
     BATCH_INFERENCE_ROLE_ARN — IAM role for Bedrock batch inference (required if USE_BATCH_INFERENCE=true)
     ENABLE_VERSIONING        — "true" (default) or "false"
     ENABLE_PROPOSITION_EXTRACTION — "true" (default) or "false" — skip for ~50% fewer LLM calls
@@ -111,6 +111,7 @@ from coa_common.logging import setup_logging
 from coa_common.s3 import get_s3_client, list_objects, read_file_bytes
 from coa_control_plane_server.models.source_status import SourceStatus
 
+from coa_sources.documents.kg_build import batch_patches
 from coa_sources.namespace_language import NAMESPACE_LANGUAGE_ENV, require_language_snapshot
 
 # ---------------------------------------------------------------------------
@@ -678,21 +679,22 @@ def _extraction_language_instruction(namespace_language: str) -> str:
 
 Write your output in {target}, the language of this knowledge graph.
 
-- Write every title, proposition, topic, entity, classification, relationship and \
-attribute name you produce in that language, using the words the source text itself \
-uses. Do not translate them into English and do not append an English gloss.
-- Where these instructions ask for relationship or attribute names in uppercase with \
-underscores (for example WORKS_FOR), that rule sets the format, not the language: write \
-each such name in the output language. Uppercase applies only to letters that have case, \
-and an underscore stands only where the name would otherwise contain a space.
-- When a preferred topic or entity-classification list is provided in English, treat \
-each entry as a concept, not a spelling: name the matching concept in the output language.
-- Copy identifiers exactly as printed, whatever script they use: model, type, part, \
-drawing and option numbers; standard and regulation designations; company, brand and \
-product names; signal and terminal names; units; codes and IRIs. An identifier that is \
-ASCII in the source stays ASCII.
-- These instructions are in English for your benefit. Do not echo them, and do not \
-treat them as evidence about the language of the output.
+- The response format is a fixed template read by a program. Keep its fixed labels \
+(`topic:`, `entities:`, `proposition:`, `entity-entity relationships:`, `entity-attributes:`), \
+colons, `|` separators and layout exactly as written, in English. Write only the values that \
+fill its placeholders in {target}, using the words the source text uses. The classification \
+after the `|` separator is a value: write it in {target}.
+- Relationship and attribute names keep the uppercase-with-underscores format, written in \
+{target}. Uppercase applies only to letters that have case, and an underscore stands only \
+where the name would otherwise contain a space.
+- Treat English preferred topics and classifications as concepts, not spellings; name the \
+matching concept in {target}. Do not append an English gloss.
+- Copy identifiers exactly as printed, whatever script they use: model, type, part, drawing \
+and option numbers; standard and regulation designations; company, brand and product names; \
+signal and terminal names; units; codes and IRIs. An identifier that is ASCII in the source \
+stays ASCII.
+- These instructions are in English for your benefit. Do not echo them, and do not treat \
+them as evidence about the language of the output.
 
 """
 
@@ -1071,6 +1073,17 @@ def _setup_graphrag(tenant_id: str):
     # llama_index's OpensearchVectorClient at import time, so our retry wrapper
     # must be assigned last to win.
     _patch_graphrag_bulk_ingest_retry()
+    # AFTER the import: wraps get_request_body in every module that binds it so
+    # batch serialization omits temperature for models that reject it (default is
+    # Sonnet 5). Safe to run post-import — the serializer is read at job build.
+    # Lives in the thin batch_patches module so spawn-started workers that import
+    # the initializer do not pull all of graph_build with them.
+    batch_patches._patch_graphrag_batch_request_body()
+    # AFTER the import: the serializer patch above lives only in THIS process, but
+    # extraction transforms run in spawn-started workers that re-import the toolkit
+    # fresh. Route those workers through our initializer so the patch re-applies in
+    # each one; otherwise the no-temp KeyError resurfaces per worker.
+    batch_patches._patch_graphrag_worker_init()
 
     GraphRAGConfig.aws_region = AWS_REGION
     GraphRAGConfig.enable_versioning = ENABLE_VERSIONING
@@ -1351,6 +1364,41 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
     if chunking is not None:
         kwargs["chunking"] = chunking
     return IndexingConfig(**kwargs)
+
+
+def _warn_if_no_topics(graph_store_uri: str, tenant_id: str, doc_source_id: str, docs: int) -> None:
+    """Log ``kg_build_zero_topics_extracted`` when a finished build left the tenant with no topics.
+
+    An extraction reply the toolkit cannot parse (for example translated response labels)
+    yields no topics and no error, so the source would otherwise end COMPLETED with an
+    empty graph. Best-effort: never fails the build.
+
+    ponytail: counts the whole tenant, so an empty source in a namespace that already has
+    topics from a *different* source is not flagged. The caller runs this after
+    DELETE_PREV_VERSIONS, so a re-ingest that regresses to zero is no longer masked by the
+    source's own prior good version. Scoping to this source's current version
+    (``__EXTRACTED_FROM__``/``__MENTIONED_IN__`` as the toolkit's delete_sources.py does, keyed
+    on the toolkit-assigned sourceId — not doc_source_id) would close the cross-source case too.
+    """
+    from graphrag_toolkit.lexical_graph import TenantId
+    from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory
+
+    try:
+        tenant = TenantId(tenant_id)
+        with GraphStoreFactory.for_graph_store(graph_store_uri) as graph_store:
+            topics = graph_store.execute_query(f"MATCH (t:{tenant.format_label('__Topic__')}) RETURN count(t) AS n")
+            if topics[0]["n"] != 0:
+                return
+            chunks = graph_store.execute_query(f"MATCH (c:{tenant.format_label('__Chunk__')}) RETURN count(c) AS n")
+        logger.warning(
+            "kg_build_zero_topics_extracted",
+            doc_source_id=doc_source_id,
+            docs=docs,
+            chunks=chunks[0]["n"],
+            hint="extraction replies were not parsed; check the response format labels in the model output",
+        )
+    except Exception as e:  # noqa: BLE001 — diagnostics must never fail the build
+        logger.debug("kg_build_zero_topics_check_failed", error=type(e).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1832,6 +1880,11 @@ def main() -> None:
         except Exception:
             tb = traceback.format_exc()
             logger.warning("Failed to delete previous versions (non-fatal)", error=tb)
+
+    # Counts topics only after prior archived versions are deleted, so a re-ingest
+    # that regresses to zero topics is not masked by the previous good version.
+    if docs_ok > 0:
+        _warn_if_no_topics(graph_store_uri, tenant_id, doc_source_id, docs_ok)
 
     elapsed = round(time.time() - start_ts, 2)
 

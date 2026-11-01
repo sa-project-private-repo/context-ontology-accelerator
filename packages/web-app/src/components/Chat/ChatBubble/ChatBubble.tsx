@@ -24,6 +24,7 @@ import type {
 } from "@app-types";
 import { LiveSteps } from "./LiveSteps";
 import { EvidencePanel } from "./EvidencePanel";
+import { describePlaygroundError } from "../playground-errors";
 import { useAppI18n } from "../../../i18n/LocaleProvider";
 import "../chat.css";
 
@@ -103,12 +104,21 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
         />
       );
     }
+    const errorText = describePlaygroundError(
+      errorDetails?.error,
+      errorMessage || content,
+      locale,
+      t,
+    );
     return (
       <SpaceBetween size="xs">
-        <StatusIndicator type="error">
-          {errorMessage || content}
-        </StatusIndicator>
-        {onRetry && (
+        <StatusIndicator type="error">{errorText.summary}</StatusIndicator>
+        {errorText.detail && (
+          <Box variant="small" color="text-body-secondary">
+            {errorText.detail}
+          </Box>
+        )}
+        {onRetry && errorText.retryable && (
           <Button variant="inline-link" onClick={onRetry}>
             {t("Retry")}
           </Button>

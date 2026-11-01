@@ -4,18 +4,23 @@
 """Unit tests for the Orchestrator — tiered resolution pipeline."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import structlog
 from coa_serve.clients.base import QueryResult
 from coa_serve.exceptions import AccessDeniedError, NoResultError
+from coa_serve.graph_context import encode_supporting_statements
 from coa_serve.models import InvokeRequest, InvokeResponse
 from coa_serve.orchestrator import Orchestrator, TierGating
 from coa_serve.tier1.metric_resolver import MetricMatch
 from coa_serve.tier2.sql_firewall import FirewallResult, SQLFirewall
 from coa_serve.tier2.strategy import StrategyOption, StrategyResult, StructuredQueryTier
+from coa_serve.tier3.agentic.context import AccumulatedContext
+from coa_serve.tier3.agentic.retriever import AgenticRetriever
 from coa_serve.tier3.knowledge_retriever import Tier3Result
+from coa_serve.tier3.vector_retriever import ChunkResult
 from coa_serve.trace import TraceCollector
 
 
@@ -1189,6 +1194,151 @@ class TestIncludeSupporting:
         result = _serialized_result(response)
         assert result["metadata"]["mode"] == "deep-reasoning"
         assert "supportingContent" not in result
+
+
+_CONTRACT_SOURCE_DOC = "aws:tenant:source:document-17"
+_CONTRACT_CHUNK_TEXT = "Claims must be filed within 30 days of the incident."
+_CONTRACT_LEGACY_LABEL = "Legacy display label"
+_CONTRACT_GRAPH_STATEMENT = "A claim filed late is reviewed by the appeals board."
+_CONTRACT_RELATIONSHIP = {
+    "sourceUri": "urn:Claim",
+    "predicateUri": "urn:coveredBy",
+    "targetUri": "urn:Policy",
+    "predicateLabel": "covered by",
+}
+
+
+def _contract_tier3_result() -> Tier3Result:
+    """A Tier3Result whose supportingContent comes from the real #984 mapper.
+
+    ``AgenticRetriever._supporting_content`` applies the document-provenance filter
+    (the graph-only chunk is not a citation) and ``_supporting_content_from_chunk``
+    emits the Smithy fields plus the deprecated ``sourceDoc`` / ``label`` aliases.
+    """
+    document_chunk = ChunkResult(
+        chunk_id="c-contract",
+        text=_CONTRACT_CHUNK_TEXT,
+        source_doc=_CONTRACT_SOURCE_DOC,
+        source_doc_name="policy.pdf",
+        relevance_score=0.81,
+        label=_CONTRACT_LEGACY_LABEL,
+    )
+    graph_only_chunk = ChunkResult(
+        chunk_id="g-statement",
+        text="A graph-only statement.",
+        source_doc="",
+        relevance_score=0.5,
+        uri="urn:Claim",
+    )
+    return Tier3Result(
+        synthesized_answer="Filing deadline answer.",
+        supporting_content=AgenticRetriever._supporting_content(
+            AccumulatedContext(chunks=[document_chunk, graph_only_chunk])
+        ),
+        graph_context=(
+            {
+                "uri": "urn:Claim",
+                "label": "Claim",
+                "type": "owl:Class",
+                "properties": {
+                    "jurisdiction": "EU",
+                    "supportingStatements": encode_supporting_statements([_CONTRACT_GRAPH_STATEMENT]),
+                },
+                "relationships": (_CONTRACT_RELATIONSHIP,),
+            },
+        ),
+        confidence=0.7,
+        trace_steps=(),
+    )
+
+
+def _contract_orchestrator(*, deep_reasoning: bool) -> Orchestrator:
+    orch = _make_orchestrator(tier2_success=False)
+    if deep_reasoning:
+        orch._agentic_retriever = AsyncMock()
+        orch._agentic_retriever.resolve.return_value = _contract_tier3_result()
+    else:
+        orch._knowledge_retriever.resolve.return_value = _contract_tier3_result()
+    return orch
+
+
+def _mode_options(deep_reasoning: bool) -> dict:
+    return {"mode": "deep-reasoning"} if deep_reasoning else {}
+
+
+@pytest.mark.unit
+class TestIncludeSupportingWireContract:
+    """includeSupporting gates the #984 Smithy-shaped supportingContent as a whole.
+
+    The fixtures above carry pre-shaped dicts. These go through the real mapper, so
+    the deprecated aliases are on each item, and through the canonical graph
+    mapping, so the top-level ``relationships`` list is on the response. The graph
+    entity also carries ``supportingStatements``, the graph-only text #984 moved out
+    of ``supportingContent``, which the opt-out has to drop as well.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("deep_reasoning", [False, True], ids=["standard", "deep-reasoning"])
+    async def test_resolve_include_supporting_false_omits_contract_fields_and_aliases(self, deep_reasoning):
+        orch = _contract_orchestrator(deep_reasoning=deep_reasoning)
+        options = {**_mode_options(deep_reasoning), "includeSupporting": False}
+        response = await orch.resolve(InvokeRequest(query="q", namespace="demo", options=options))
+
+        result = _serialized_result(response)
+        assert result["tier"] == 3
+        assert result["synthesizedAnswer"] == "Filing deadline answer."
+        assert "supportingContent" not in result
+        # Neither the Smithy fields nor the deprecated aliases leak anywhere else.
+        wire = json.dumps(result)
+        for leaked in (
+            '"sourceDoc"',
+            '"sourceDocumentId"',
+            '"sourceDocumentName"',
+            '"relevanceScore"',
+            _CONTRACT_SOURCE_DOC,
+            _CONTRACT_CHUNK_TEXT,
+            _CONTRACT_LEGACY_LABEL,
+        ):
+            assert leaked not in wire
+        # The graph statement is retrieved text that was a supportingContent
+        # item before #984, so it goes with the opt-out too.
+        assert _CONTRACT_GRAPH_STATEMENT not in wire
+        assert "supportingStatements" not in wire
+        # The rest of graphContext is not governed by includeSupporting: the
+        # entity, its other properties and the top-level relationships ship.
+        [entity] = result["graphContext"]["entities"]
+        assert entity["properties"] == {"jurisdiction": "EU"}
+        assert result["graphContext"]["relationships"] == [_CONTRACT_RELATIONSHIP]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("deep_reasoning", [False, True], ids=["standard", "deep-reasoning"])
+    @pytest.mark.parametrize("options", _INCLUDE_SUPPORTING_KEEPS)
+    async def test_resolve_include_supporting_not_false_keeps_contract_fields_and_aliases(
+        self, deep_reasoning, options
+    ):
+        orch = _contract_orchestrator(deep_reasoning=deep_reasoning)
+        request = InvokeRequest(query="q", namespace="demo", options={**_mode_options(deep_reasoning), **options})
+        response = await orch.resolve(request)
+
+        result = _serialized_result(response)
+        # Only the document-backed chunk is a citation; the graph-only one is not.
+        assert result["supportingContent"] == [
+            {
+                "chunkId": "c-contract",
+                "text": _CONTRACT_CHUNK_TEXT,
+                "sourceDocumentId": _CONTRACT_SOURCE_DOC,
+                "sourceDocumentName": "policy.pdf",
+                "relevanceScore": 0.81,
+                "sourceDoc": _CONTRACT_SOURCE_DOC,
+                "label": _CONTRACT_LEGACY_LABEL,
+            }
+        ]
+        [entity] = result["graphContext"]["entities"]
+        assert entity["properties"] == {
+            "jurisdiction": "EU",
+            "supportingStatements": encode_supporting_statements([_CONTRACT_GRAPH_STATEMENT]),
+        }
+        assert result["graphContext"]["relationships"] == [_CONTRACT_RELATIONSHIP]
 
 
 # ── startTier option ─────────────────────────────────────────────────────

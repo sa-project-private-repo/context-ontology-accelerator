@@ -45,6 +45,9 @@ cdk.context.json
 smithy-generated/
 models/bin/
 
+# Maven output (connectors/ is a multi-module Maven build)
+connectors/**/target/
+
 # IDE
 .idea/
 .vscode/

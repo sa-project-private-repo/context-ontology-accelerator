@@ -217,7 +217,7 @@ EXTRACTION_BATCH_SIZE: int = 1000
 # ---------------------------------------------------------------------------
 
 DEFAULT_EXTRACTION_MODE: str = ExtractionMode.CONTINUOUS
-DEFAULT_USE_BATCH_INFERENCE: str = "false"
+DEFAULT_USE_BATCH_INFERENCE: str = "true"
 DEFAULT_ENABLE_VERSIONING: str = "true"
 DEFAULT_ENABLE_PROPOSITION_EXTRACTION: str = "true"
 DEFAULT_DELETE_PREV_VERSIONS: str = "false"
