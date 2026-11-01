@@ -25,12 +25,11 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 
 from coa_ontology.catalog.ingest import schema_subjects
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
+from coa_ontology.studio import agent, changes, changesets, chat_store, checks, graph_view, queries, questions, rebase
+from coa_ontology.studio import draft as store
+from coa_ontology.studio.iris import MAX_IRI_LENGTH, IriError, check_iri
 from coa_ontology.versions import deploy as version_deploy
 from coa_ontology.versions import principal, snapshot, storage
-
-from . import agent, changes, changesets, chat_store, checks, graph_view, queries, questions, rebase
-from . import draft as store
-from .iris import MAX_IRI_LENGTH, IriError, check_iri
 
 _log = logging.getLogger("studio.router")
 # What the accept preview says when the governed metrics could not be listed; the details are only logged.
@@ -362,33 +361,6 @@ def rebase_studio_draft(
     )
 
 
-def _renames(namespace: str, proposal_id: str, state: store.StudioState) -> list[dict[str, str]]:
-    """Where each IRI the change sets in effect renamed or merged away ended up, oldest first.
-
-    Every op moves the IRIs that had ended up at its ``old`` IRI on to its ``new`` one, and a merge
-    makes them ``merged``. ``old`` itself is listed too, unless an earlier ``change_iri`` introduced
-    it: that IRI was never in the base, so only the IRIs that reached it are listed.
-    """
-    moved: dict[str, tuple[str, str]] = {}  # an IRI -> (where it ended up, "renamed" or "merged")
-    introduced: set[str] = set()  # the ``newIri`` of every ``change_iri`` so far
-    for n in state.applied:
-        for op in store.get_record(namespace, proposal_id, n).get("ops") or []:
-            if op.get("op") == "change_iri":
-                old, new, kind = op["iri"], op["newIri"], "renamed"
-            elif op.get("op") == "merge_classes":
-                old, new, kind = op["source"], op["target"], "merged"
-            else:
-                continue
-            for origin, (to, was) in moved.items():
-                if to == old:
-                    moved[origin] = (new, "merged" if "merged" in (was, kind) else "renamed")
-            if old not in introduced:
-                moved[old] = (new, kind)
-            if kind == "renamed":
-                introduced.add(new)
-    return [{"fromIri": o, "toIri": to, "kind": kind} for o, (to, kind) in moved.items() if o != to]
-
-
 @router.get("/accept-preview")
 def get_studio_accept_preview(proposal_id: str, namespace: str = "default") -> dict[str, Any]:
     """What accepting the current revision would publish: the diff, renames and governed metrics it breaks.
@@ -412,7 +384,7 @@ def get_studio_accept_preview(proposal_id: str, namespace: str = "default") -> d
         present = {str(t) for t in (*class_iris, *object_props, *datatype_props)}
         renames = [
             r
-            for r in _renames(namespace, proposal_id, state)
+            for r in store.renames(namespace, proposal_id, state)
             if r["fromIri"] in removed and r["toIri"] in present  # a class renamed and then deleted is just removed
         ]
         classes = {str(c) for c in class_iris}

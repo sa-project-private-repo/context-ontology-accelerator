@@ -324,7 +324,10 @@ class TestProjectionSpecs:
 class TestClassDocuments:
     def test_a_relabelled_class_keeps_its_table_and_lists_the_label_as_a_synonym(self):
         doc = _documents()[CUSTOMER]
-        assert doc["text"] == "Table: customers | Synonyms: Client, buyer | Columns: id, email"
+        # A column the mapping names otherwise carries its label in the embedded text as well.
+        assert doc["text"] == (
+            "Table: customers | Synonyms: Client, buyer | Columns: id, email [label: E-mail address]"
+        )
         assert _context(doc) == (
             "Table: customers | Synonyms: Client, buyer | Primary key: id | "
             "Columns: id:integer, email:string [label: E-mail address]"

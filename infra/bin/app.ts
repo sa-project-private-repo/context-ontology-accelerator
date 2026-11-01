@@ -515,6 +515,8 @@ async function deploy(): Promise<void> {
     // construct properties, so this stack has no direct reference into the
     // auth stack's resource tree (see PR for the export-lock this avoids).
     isCognitoMode: config.idpType !== IdpType.OIDC,
+    federatedIdentityProviderNames:
+      IdpAuthenticationStack.federatedProviderNames(authProps),
     apiEndpoint: api.api.url,
     apiRestApiId: api.api.restApiId,
     apiStageName: api.api.deploymentStage.stageName,

@@ -37,18 +37,21 @@ from threading import Thread
 from typing import Any, NoReturn
 from urllib.parse import urlencode
 
+import boto3
 import httpx
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, ReadTimeoutError
+from coa_common.constants import to_graphrag_tenant_id
 from coa_control_plane_server.models.proposal_status import ProposalStatus
 from rdflib import BNode, Graph, Literal, URIRef
 from rdflib.term import Node
 
 from coa_ontology import dynamo_store
+from coa_ontology.abox import lexical as abox_lexical
 from coa_ontology.abox import store as abox_store
 from coa_ontology.stores import neptune_db_graph as ndb
-
-from . import draft as store
-from .query_safety import QueryRefused, prepare_cypher, prepare_sparql
+from coa_ontology.studio import draft as store
+from coa_ontology.studio.query_safety import QueryRefused, prepare_cypher, prepare_sparql
 
 _log = logging.getLogger("studio.queries")
 QUERY_SECONDS = float(os.getenv("STUDIO_QUERY_SECONDS", "20"))
@@ -595,12 +598,7 @@ def _sparql(text: str, form: str, graph: str) -> dict[str, Any]:
 
 
 def _cypher_client() -> Any:
-    import boto3
-    from botocore.config import Config
-
-    from coa_ontology.abox.lexical import _endpoint
-
-    host, port = _endpoint()
+    host, port = abox_lexical._endpoint()
     config = Config(retries={"total_max_attempts": 1, "mode": "standard"}, read_timeout=QUERY_SECONDS)
     return boto3.Session(region_name=os.getenv("AWS_REGION", "us-east-1")).client(
         "neptunedata", endpoint_url=f"https://{host}:{port}", config=config
@@ -618,8 +616,6 @@ def _value_cell(value: Any) -> dict[str, Any] | None:
 
 
 def _tenant(namespace: str) -> str:
-    from coa_common.constants import to_graphrag_tenant_id
-
     try:
         tenant = to_graphrag_tenant_id(namespace)
     except ValueError:

@@ -10,6 +10,8 @@ namespace to every call so the underlying queries filter on it.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from coa_common.label_language import LabelPreference
 
 from coa_ontology.catalog import na_store
@@ -102,7 +104,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         comments=None,
         super_classes=None,
         is_mapped=False,
-        physical_name="",
+        physical_name: str = "",
     ):
         """Persist a class into the ontology's graph in the bound namespace.
 
@@ -151,10 +153,10 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         comment="",
         domains=None,
         ranges=None,
-        unmapped=False,
-        physical_name="",
-        mapped_domains=(),
-        mapped_ranges=(),
+        unmapped: bool = False,
+        physical_name: str = "",
+        mapped_domains: Sequence[str] = (),
+        mapped_ranges: Sequence[str] = (),
     ):
         """Persist a property into the ontology's graph in the bound namespace.
 

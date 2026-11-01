@@ -32,15 +32,14 @@ import httpx
 from rdflib import Graph, Literal, URIRef
 from rdflib.namespace import XSD
 
+from coa_ontology.abox import extract, mapping, matcher, store
+from coa_ontology.abox import model as m
+from coa_ontology.abox.assemble import assemble
+from coa_ontology.abox.lexical import read_lexical
+from coa_ontology.abox.tbox import TBox, load_tbox
 from coa_ontology.stores.neptune_db_graph import _esc, _gsp_post_turtle, _iri, _sparql_query, _sparql_update
 from coa_ontology.versions import deploy, registry, storage
 from coa_ontology.versions.snapshot import canonical_nt, sha256_hex
-
-from . import extract, mapping, matcher, store
-from . import model as m
-from .assemble import assemble
-from .lexical import read_lexical
-from .tbox import TBox, load_tbox
 
 _log = logging.getLogger("abox.build")
 _LOAD_BATCH_LINES = 5000

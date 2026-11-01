@@ -58,3 +58,23 @@
   white-space: nowrap;
   transition: opacity 150ms ease-out;
 }
+
+/* A class node's badge, its instance count, centred at the top of the node.
+ * It is drawn on the node, whose colours are the same in light and dark mode,
+ * so its own colours are fixed as well. Its opacity, lower while the count is
+ * dimmed, is set on the element. */
+.coa-graph-node-badge {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  min-width: 20px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: #0f172a;
+  color: #ffffff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+}

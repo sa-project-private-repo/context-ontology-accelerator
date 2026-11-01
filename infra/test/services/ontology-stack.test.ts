@@ -9,6 +9,11 @@ import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
 import { OntologyStack } from "../../lib/stacks/services/ontology-stack";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
+import {
+  LONG_PREFIX_CONTEXT,
+  expectValidAossNames,
+} from "../utils/aoss-name-assertions";
+import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
 
 const TEST_CONTEXT = {
   resource_prefix: DEFAULT_RESOURCE_PREFIX,
@@ -276,6 +281,10 @@ describe("OntologyStack", () => {
     );
   });
 
+  test("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
+    expectAossGrantsCoveredByDataPolicies(template);
+  });
+
   it("wires only the create-operation Lambda(s) to the idempotency table", () => {
     // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
     expectIdempotencyWiring(template, ["-ontology-api-proxy"]);
@@ -394,6 +403,22 @@ describe("OntologyStack", () => {
           }),
         ]),
       }),
+    });
+  });
+
+  test("task role cannot write or delete over openCypher, only read", () => {
+    const statements = Object.values(
+      template.findResources("AWS::IAM::Policy"),
+    ).flatMap((p) => p.Properties.PolicyDocument.Statement);
+    const deny = statements.filter((s) => s.Sid === "NoOpenCypherWrites");
+    expect(deny).toHaveLength(1);
+    expect(deny[0].Effect).toBe("Deny");
+    expect(deny[0].Action).toEqual([
+      "neptune-db:WriteDataViaQuery",
+      "neptune-db:DeleteDataViaQuery",
+    ]);
+    expect(deny[0].Condition).toEqual({
+      StringEquals: { "neptune-db:QueryLanguage": "OpenCypher" },
     });
   });
 
@@ -670,5 +695,13 @@ describe("ontology-engine Dockerfile CVE hygiene", () => {
 
   test("upgrades pip so its own advisories are picked up", () => {
     expect(dockerfile).toMatch(/pip install[^\n]*--upgrade pip/);
+  });
+});
+
+describe("OntologyStack with a long resource_prefix", () => {
+  it("keeps every OpenSearch Serverless name valid", () => {
+    expectValidAossNames(
+      renderOntology({}, "TestOntologyLongPrefix", LONG_PREFIX_CONTEXT),
+    );
   });
 });

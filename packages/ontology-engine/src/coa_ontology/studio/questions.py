@@ -20,8 +20,7 @@ from coa_common import validate_namespace_name
 
 from coa_ontology import dynamo_store
 from coa_ontology.abox.store import from_dynamo
-
-from . import draft as store
+from coa_ontology.studio import draft as store
 
 SK_PREFIX = "STUDIOCQ#"
 MAX_QUESTIONS = 200

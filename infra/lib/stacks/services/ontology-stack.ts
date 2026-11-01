@@ -20,8 +20,8 @@ import { Construct } from "constructs";
 
 import { SCLStack } from "../../constructs/scl-stack";
 import { SclMonitoring } from "../../constructs";
-import { Paths } from "../../paths";
-import { resolveContext } from "../../context";
+import { fromRoot, Paths } from "../../paths";
+import { resolveContext, guardrailProfileResources } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
 import { grantIdempotencyTable } from "../../utils/idempotency";
 import { NetworkStack } from "../foundation/network-stack";
@@ -350,6 +350,23 @@ export class OntologyStack extends SCLStack {
         resources: [props.neptuneClusterArn],
       }),
     );
+    // The designer's query console runs user- and assistant-written openCypher on the lexical graph
+    // every namespace shares. The engine only reads openCypher, so Neptune refuses an openCypher
+    // write from this role whatever gets past the console's guard; SPARQL writes are unaffected.
+    taskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: "NoOpenCypherWrites",
+        effect: iam.Effect.DENY,
+        actions: [
+          "neptune-db:WriteDataViaQuery",
+          "neptune-db:DeleteDataViaQuery",
+        ],
+        resources: [props.neptuneClusterArn],
+        conditions: {
+          StringEquals: { "neptune-db:QueryLanguage": "OpenCypher" },
+        },
+      }),
+    );
 
     // OpenSearch Serverless — API access
     taskDef.taskRole.addToPrincipalPolicy(
@@ -364,7 +381,7 @@ export class OntologyStack extends SCLStack {
       this,
       "OSSDataAccessPolicy",
       {
-        name: this.prefixed("ontology-oss"),
+        name: this.aossName("ontology-oss"),
         type: "data",
         policy: JSON.stringify([
           {
@@ -434,6 +451,7 @@ export class OntologyStack extends SCLStack {
           `arn:aws:bedrock:*::foundation-model/*`,
           `arn:aws:bedrock:*:${account}:inference-profile/*`,
           `arn:aws:bedrock:${region}:${account}:guardrail/*`,
+          ...guardrailProfileResources(this),
         ],
       }),
     );
@@ -1102,23 +1120,14 @@ export class OntologyStack extends SCLStack {
       handler: "coa_ontology.api_proxy_handler.handler",
       // Merges libs/common/src into the asset root so
       // `coa_common` (used for resolve_region) is importable.
-      // Its transitive deps (structlog, pydantic-settings, etc. — see
-      // libs/common/pyproject.toml) must be installed explicitly since this
-      // Lambda has no requirements.txt of its own; mirrors the pipDeps used
-      // wherever else commonLib is bundled (e.g. api-stack.ts).
+      // Its runtime deps (structlog, pydantic-settings, etc. — see
+      // libs/common/pyproject.toml) are listed in the requirements file next
+      // to the handler's lock, since the Lambda has no package of its own.
       code: bundlePython({
         srcDirs: [Paths.ontologyEngineSrc, Paths.commonLib],
-        pipDeps: [
-          "cedarpy>=4.8.0",
-          "pydantic>=2.0",
-          "pydantic-settings>=2.0",
-          "structlog>=24.0",
-          "cryptography>=43.0",
-          "PyJWT>=2.9.0",
-          "requests>=2.32.0",
-          // First certifi without the roots behind the compromised emSign intermediates.
-          "certifi>=2026.10.19",
-        ],
+        requirementsFile: fromRoot(
+          "packages/ontology-engine/lambda/api-proxy/requirements.lock.txt",
+        ),
       }),
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,

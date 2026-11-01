@@ -655,3 +655,44 @@ class TestRoute:
             http.post("/ontology/proposals/p-1/accept")
         assert _proposal(aws)["status"] == "pending"
         fake_publish.assert_not_called()
+
+
+class TestGetProposalMemberNames:
+    """GET /proposals/{id} carries the accept outcome under the model's member names next to the stored keys."""
+
+    def test_an_accepted_proposal_reads_its_version_deployment_and_progress_in_both_spellings(self, client):
+        http, _, aws = client
+        _seed(aws)
+        http.post("/ontology/proposals/p-1/accept")
+        body = http.get("/ontology/proposals/p-1").json()
+        assert body["publishedVersion"] == body["published_version"] == 1
+        assert body["autoDeployId"] == body["auto_deploy_id"] == "d-1"
+        assert body["acceptProgress"] == body["accept_progress"] == {"step": "publish", "state": "done"}
+        assert "autoDeployHeld" not in body and "auto_deploy_held" not in body
+
+    def test_a_held_auto_deploy_reads_in_both_spellings(self, client):
+        http, start, aws = client
+        start.side_effect = registry.DeployLockHeldError("d-0")
+        _seed(aws)
+        http.post("/ontology/proposals/p-1/accept")
+        body = http.get("/ontology/proposals/p-1").json()
+        assert body["autoDeployHeld"] == body["auto_deploy_held"] == {"reason": "DEPLOY_IN_PROGRESS"}
+        assert "autoDeployId" not in body
+
+    def test_a_failed_accept_reads_its_code_as_accept_progress_code(self, client, fake_publish):
+        http, _, aws = client
+        fake_publish.side_effect = publish.RebaseRequiredError("v2 was published after the draft was built")
+        _seed(aws)
+        http.post("/ontology/proposals/p-1/accept")
+        body = http.get("/ontology/proposals/p-1").json()
+        assert body["status"] == "accept_failed"
+        progress = {"step": "publish", "state": "failed", "code": "RebaseRequired"}
+        assert body["acceptProgress"] == body["accept_progress"] == progress
+        assert "publishedVersion" not in body
+
+    def test_a_proposal_never_accepted_carries_none_of_them(self, client):
+        http, _, aws = client
+        _seed(aws)
+        body = http.get("/ontology/proposals/p-1").json()
+        assert body["status"] == "pending"
+        assert not {"publishedVersion", "autoDeployId", "autoDeployHeld", "acceptProgress"} & body.keys()

@@ -25,11 +25,10 @@ from rdflib.term import Node
 
 from coa_ontology.abox.model import iri_tail, norm
 from coa_ontology.datatype_canonicalizer import _canonical_for
+from coa_ontology.studio import iris
+from coa_ontology.studio.iris import IriError, IriScheme
+from coa_ontology.studio.messages import Message, english, message
 from coa_ontology.versions import snapshot
-
-from . import iris
-from .iris import IriError, IriScheme
-from .messages import Message, english, message
 
 RR = snapshot.RR
 CLASS = "class"
@@ -288,6 +287,41 @@ def maps_of_class(r2rml: Graph, c: URIRef) -> set[Node]:
 def triples_maps_of_class(r2rml: Graph, c: URIRef) -> set[Node]:
     """The nodes typed ``rr:TriplesMap`` whose subject map declares ``rr:class c``; ``c`` is mapped if any."""
     return {t for t in maps_of_class(r2rml, c) if (t, RDF.type, RR.TriplesMap) in r2rml}
+
+
+def mapped_classes(r2rml: Graph) -> set[URIRef]:
+    """The classes the mapping maps: each is the ``rr:class`` of the subject map of a node typed ``rr:TriplesMap``."""
+    return {
+        c
+        for t in r2rml.subjects(RDF.type, RR.TriplesMap)
+        for sm in r2rml.objects(t, RR.subjectMap)
+        for c in r2rml.objects(sm, RR["class"])
+        if isinstance(c, URIRef)
+    }
+
+
+def answered_classes(g: Graph, mapped: set[URIRef]) -> set[URIRef]:
+    """The mapped classes and the unmapped ones structured queries still answer, by serve's rule.
+
+    Serve's rule (``coa_serve.tier2.unmapped_terms``, whose ``coa:isMapped true`` is this ``mapped``):
+    a class without a mapping is answered when a mapped class reaches it by a forward
+    ``rdfs:subClassOf|owl:equivalentClass`` path, or when the class itself states
+    ``owl:equivalentClass`` to a mapped class. A class whose own ``owl:equivalentClass``
+    names a class that is only answered, not a mapped one, is not answered (an equivalence the
+    answered class states is part of the forward path, and does answer the other class): serve lists
+    it as a term no table maps, and both Tier 2 writers decline a question about it. The query console
+    (``refuse_vkg_terms``) is looser and refuses no such class.
+    """
+    answered = set(mapped)
+    stack = list(mapped)
+    while stack:
+        c = stack.pop()
+        for n in (*g.objects(c, RDFS.subClassOf), *g.objects(c, OWL.equivalentClass)):
+            if isinstance(n, URIRef) and n not in answered:  # a class already answered ends a cycle
+                answered.add(n)
+                stack.append(n)
+    # The one hop serve allows the other way round, stated on the unmapped class's own side.
+    return answered | {c for m in mapped for c in g.subjects(OWL.equivalentClass, m) if isinstance(c, URIRef)}
 
 
 def property_maps(r2rml: Graph, p: Node) -> list[tuple[Node, Node]]:

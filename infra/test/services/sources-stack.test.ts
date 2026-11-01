@@ -10,6 +10,7 @@ import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { StorageStack } from "../../lib/stacks/foundation/storage-stack";
 import { SourcesStack } from "../../lib/stacks/services/sources-stack";
+import { expectAossGrantsCoveredByDataPolicies } from "../utils/aoss-access-assertions";
 
 // Mock bundlePython to avoid fingerprinting the entire repo root during tests.
 jest.mock("../../lib/utils/python-bundling", () => ({
@@ -52,6 +53,10 @@ describe("SourcesStack", () => {
         env: TEST_ENV,
       }),
     );
+  });
+
+  it("names every aoss:APIAccessAll role in an AOSS data-access policy", () => {
+    expectAossGrantsCoveredByDataPolicies(template);
   });
 
   it("wires only the create-operation Lambda(s) to the idempotency table", () => {
@@ -2259,6 +2264,15 @@ describe("SourcesStack", () => {
         },
       });
     });
+
+    it("SourcesDocAboxRequestFn has the 30 s timeout its two 10 s attempts fit in", () => {
+      // The handler tries the request twice, 10 s each with a 1 s pause, so a
+      // shorter timeout would cut the retry off.
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp(".*sources-doc-abox-request$"),
+        Timeout: 30,
+      });
+    });
   });
 
   describe("KG Build Observability", () => {
@@ -2327,6 +2341,14 @@ describe("SourcesStack", () => {
       const resourceStr = JSON.stringify(batchJobStatement.Resource);
       expect(resourceStr).toContain("foundation-model/*");
       expect(resourceStr).toContain("inference-profile/*");
+      // CreateModelInvocationJob authorizes against the job resource it creates
+      // too; omitting it fails every batch submit with AccessDenied. Batch
+      // inference is the default ingestion path, so this ARN must stay.
+      expect(resourceStr).toContain("model-invocation-job/*");
+      // The job resource is account-scoped (the account segment is an
+      // AWS::AccountId Ref), never the cross-account wildcard
+      // `arn:aws:bedrock:*::model-invocation-job/*`.
+      expect(resourceStr).not.toContain("*::model-invocation-job");
     });
 
     it("Bedrock InvokeModel is scoped to specific model ARNs", () => {

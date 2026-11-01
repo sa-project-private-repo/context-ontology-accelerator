@@ -267,9 +267,9 @@ def _context() -> StrategyContext:
 
 
 def _executor() -> AsyncMock:
-    """An executor with no dialect or placement lookup, so the strategy writes Athena SQL for one database."""
+    """An executor with no dialect, placement or same-name lookup: the strategy writes Athena SQL for one database."""
     executor = AsyncMock()
-    del executor.resolve_target_dialect, executor.resolve_table_placements
+    del executor.resolve_target_dialect, executor.resolve_table_placements, executor.resolve_same_name_databases
     return executor
 
 

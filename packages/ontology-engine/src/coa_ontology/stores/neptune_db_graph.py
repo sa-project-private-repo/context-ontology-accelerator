@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -873,7 +873,7 @@ class NeptuneDBGraphStore(GraphStore):
         comments=None,
         super_classes=None,
         is_mapped=False,
-        physical_name="",
+        physical_name: str = "",
     ):
         """Project a class (and its labels, comments, superclasses) into a graph.
 
@@ -933,10 +933,10 @@ class NeptuneDBGraphStore(GraphStore):
         comment="",
         domains=None,
         ranges=None,
-        unmapped=False,
-        physical_name="",
-        mapped_domains=(),
-        mapped_ranges=(),
+        unmapped: bool = False,
+        physical_name: str = "",
+        mapped_domains: Sequence[str] = (),
+        mapped_ranges: Sequence[str] = (),
     ):
         """Project a property (label, comment, domains, ranges) into a graph.
 

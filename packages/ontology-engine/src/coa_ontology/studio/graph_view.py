@@ -25,20 +25,21 @@ from rdflib.term import Node
 from coa_ontology.abox import store as abox_store
 from coa_ontology.abox.model import iri_tail, norm
 from coa_ontology.catalog.ingest import schema_subjects
-from coa_ontology.versions import registry, snapshot, storage
-
-from .iris import IriScheme
-from .ops import (
+from coa_ontology.studio.iris import IriScheme
+from coa_ontology.studio.ops import (
     CLASS,
     DATATYPE_PROPERTY,
     OBJECT_PROPERTY,
     RR,
     Draft,
+    answered_classes,
     kind_of,
     label_of,
+    mapped_classes,
     maps_of_class,
     poms_mentioning,
 )
+from coa_ontology.versions import registry, snapshot, storage
 
 _log = logging.getLogger(__name__)
 MAX_FULL_CLASSES = int(os.getenv("STUDIO_GRAPH_MAX_CLASSES", "150"))
@@ -296,9 +297,6 @@ def term_view(d: Draft, scheme: IriScheme, iri: str, badges: AboxBadges | None) 
             for m in sorted(maps_of_class(d.r2rml, t), key=str)
         ]
         view["abox"] = badges.badge(iri) if badges else None
-        # Imported here: checks imports this module, so a module-level import would be circular.
-        from .checks import answered_classes, mapped_classes
-
         view["structuredAnswered"] = t in answered_classes(g, mapped_classes(d.r2rml))
     else:
         view["domain"] = [_ref(g, x) for x in sorted(g.objects(t, RDFS.domain), key=str) if isinstance(x, URIRef)]

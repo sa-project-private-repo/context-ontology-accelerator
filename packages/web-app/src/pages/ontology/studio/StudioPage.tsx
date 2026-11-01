@@ -76,10 +76,10 @@ import {
   type StudioTermKind,
 } from "../../../services/studio";
 import { useAppI18n, type AppTranslate } from "../../../i18n/LocaleProvider";
-import { proposalStatusText } from "../../OntologyPage";
-import { isPolling } from "../abox/abox-helpers";
-import { isAcceptTerminalFailure } from "../induce/helpers";
-import { autoDeployHeldMessage } from "../versions/versions-helpers";
+import { proposalStatusText } from "@pages/OntologyPage";
+import { isPolling } from "@pages/ontology/abox/abox-helpers";
+import { isAcceptTerminalFailure } from "@pages/ontology/induce/helpers";
+import { autoDeployHeldMessage } from "@pages/ontology/versions/versions-helpers";
 import { AcceptDialog } from "./AcceptDialog";
 import { ChatPanel } from "./ChatPanel";
 import { ChecksPanel } from "./ChecksPanel";
@@ -1147,9 +1147,11 @@ export function StudioPage({
     );
   }
 
+  const proposalLabel = proposal?.metadata?.label;
   const title =
-    (proposal?.metadata?.label as string | undefined) ??
-    t("Proposal {id}", { id: proposalId.slice(0, 8) });
+    typeof proposalLabel === "string"
+      ? proposalLabel
+      : t("Proposal {id}", { id: proposalId.slice(0, 8) });
   const flashbar = flash.length > 0 && <Flashbar items={flash} />;
 
   if (notOpen) {

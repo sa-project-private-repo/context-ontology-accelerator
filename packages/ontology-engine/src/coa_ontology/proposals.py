@@ -35,6 +35,7 @@ from urllib.parse import urlsplit
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common import sql_ident as _sql_ident
 from coa_common.constants import VOCAB_URI, split_sql_ident_path
+from coa_control_plane_server.models.induction_source_type import InductionSourceType
 from coa_control_plane_server.models.proposal_status import ProposalStatus
 from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -43,6 +44,7 @@ from rdflib import Graph
 
 from coa_ontology import dynamo_store
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
+from coa_ontology.query_params import require_enum_value
 from coa_ontology.stores import build_stores as _build_stores  # noqa: F401 (re-exported for tests)
 from coa_ontology.studio import changes as studio_changes
 from coa_ontology.studio import draft as studio_draft
@@ -71,7 +73,7 @@ router = APIRouter()
 # accept in progress for the accept guard, the stale-sweep and the induction lock.
 PROPOSAL_STATUS_EMBEDDINGS_SYNC = ProposalStatus.EMBEDDINGS_SYNC.value
 
-# Terminal state for an accept whose publish failed (#456/#466/#467). Distinct
+# Terminal state for an accept whose publish failed. Distinct
 # from ``pending`` (never attempted) so the UI can say "accept failed, fix and
 # retry" and the stale-sweep / accept guard can tell a broken attempt from a
 # fresh proposal. A failed publish changed nothing, so re-accepting from this
@@ -399,7 +401,7 @@ def _generate_schema_sql(
     except SchemaSqlCoverageError:
         raise
     except Exception as e:
-        # Genuine failure — do NOT mask as the ``None`` empty state (#457).
+        # Genuine failure: do NOT mask as the ``None`` empty state.
         raise SchemaSqlGenerationError(f"{type(e).__name__}: {e}") from e
 
 
@@ -828,18 +830,19 @@ def list_proposals(
     ``ontology_id`` still bind for existing callers; the contract spelling wins
     when both are sent.
 
-    The ``source_type`` query parameter is forwarded to
+    ``status`` and ``source_type`` must be a ``ProposalStatus`` /
+    ``InductionSourceType`` value; anything else is a 400, so a typo is not
+    mistaken for "no proposals". ``source_type`` is then forwarded to
     :func:`dynamo_store.list_proposals` unchanged — see that function's
     docstring for the filter semantics, including the backfill rule
-    for pre-schema-delta items that lack the attribute. The route does
-    not validate the value (no ``Literal`` restriction): unknown values
-    simply produce no matches, which lets the route degrade gracefully
-    if a client sends a stale enum member.
+    for pre-schema-delta items that lack the attribute.
 
     Proposals are returned newest first (by ``created_at``); ``limit`` /
     ``maxResults`` therefore keep the newest matches, and later pages continue
     with older ones.
     """
+    require_enum_value("status", status, ProposalStatus)
+    require_enum_value("source_type", source_type, InductionSourceType)
     scope = proposals_list_scope(namespace)
     try:
         start_key = decode_next_token(next_token, scope=scope)
@@ -860,6 +863,16 @@ def list_proposals(
         item.pop("ontology_turtle", None)
         item.pop("r2rml_turtle", None)
     return page_body("proposals", items, next_key, scope=scope)
+
+
+# GetProposal's members for the accept outcome, by the stored key each one repeats. The model names
+# them in camelCase; the stored snake_case keys stay in the response for the clients that read them.
+_ACCEPT_OUTCOME_MEMBERS = {
+    "published_version": "publishedVersion",
+    "auto_deploy_id": "autoDeployId",
+    "auto_deploy_held": "autoDeployHeld",
+    "accept_progress": "acceptProgress",
+}
 
 
 @router.get("/{proposal_id}")
@@ -883,6 +896,9 @@ def get_proposal(proposal_id: str, namespace: str = "default"):
     ``[:50]``-capped) match list inline in ``metadata.matches`` and have no S3
     object; for those ``matches_url`` is ``null`` and the inline list is left in
     place so the client's inline-else-URL fallback still renders their grounding.
+
+    The accept outcome is returned under the model's member names as well (``publishedVersion``,
+    ``autoDeployId``, ``autoDeployHeld``, ``acceptProgress``), next to the stored snake_case keys.
     """
     item = dynamo_store.get_proposal_by_id(
         proposal_id, namespace=namespace, hydrate_turtle=False, hydrate_matches=False, hydrate_constraints=False
@@ -924,6 +940,9 @@ def get_proposal(proposal_id: str, namespace: str = "default"):
     item["constraints_url"] = constraints_url
     if constraints_url:
         (item.get("metadata") or {}).pop("constraint_config", None)
+    for stored, member in _ACCEPT_OUTCOME_MEMBERS.items():
+        if stored in item:
+            item[member] = item[stored]
     return item
 
 

@@ -76,5 +76,6 @@ export default defineConfig({
     featureProject("playground"),
     featureProject("system-health"),
     featureProject("settings"),
+    featureProject("ontology-designer"),
   ],
 });

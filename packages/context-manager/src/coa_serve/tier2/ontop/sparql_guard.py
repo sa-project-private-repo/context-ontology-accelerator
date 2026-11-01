@@ -11,10 +11,19 @@ a query names, which the console checks against the namespace's graph before the
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+from rdflib import RDF, URIRef
+from rdflib.paths import AlternativePath, InvPath, MulPath, SequencePath
+from rdflib.plugins.sparql.algebra import translateQuery
+from rdflib.plugins.sparql.parser import parseQuery
+from rdflib.plugins.sparql.parserutils import CompValue
 
 MAX_SPARQL_CHARS = 20_000
 VKG_FORMS = ("SELECT", "ASK")
+# A line break other than LF or CRLF; Java lexers also end a line at U+0085, U+2028 and U+2029.
+_LINE_BREAK = re.compile("\r(?!\n)|[\x85\u2028\u2029]")
 _FORM_NAMES = {"SelectQuery": "SELECT", "AskQuery": "ASK", "ConstructQuery": "CONSTRUCT", "DescribeQuery": "DESCRIBE"}
 
 
@@ -23,8 +32,6 @@ class SparqlRefused(ValueError):
 
 
 def _names(node: Any, out: set[str]) -> set[str]:
-    from rdflib.plugins.sparql.parserutils import CompValue
-
     if isinstance(node, CompValue):
         out.add(node.name)
         for value in node.values():
@@ -37,12 +44,13 @@ def _names(node: Any, out: set[str]) -> set[str]:
 
 def check_vkg_sparql(query: Any) -> str:
     """The form of a query that may run over the VKG (``SELECT`` or ``ASK``); :class:`SparqlRefused` otherwise."""
-    from rdflib.plugins.sparql.parser import parseQuery
-
     if not isinstance(query, str) or not query.strip():
         raise SparqlRefused("The query is empty")
     if len(query) > MAX_SPARQL_CHARS:
         raise SparqlRefused(f"A query is at most {MAX_SPARQL_CHARS} characters")
+    if _LINE_BREAK.search(query):
+        # SPARQL ends a comment at a lone CR too, rdflib only at LF: the VKG would run what rdflib took for a comment.
+        raise SparqlRefused("Line breaks must be LF or CRLF")
     if "\\u" in query or "\\U" in query:
         # rdflib expands them before it parses; the VKG might not, and then the two read different queries.
         raise SparqlRefused("Unicode escapes (\\u, \\U) are not allowed; write the characters themselves")
@@ -71,9 +79,6 @@ def _path_needs(path: Any) -> frozenset[str]:
     An alternative needs what all its alternatives need; ``*`` and ``?`` also match with no step, and a
     negated path names what it excludes, so neither needs anything.
     """
-    from rdflib import URIRef
-    from rdflib.paths import AlternativePath, InvPath, MulPath, SequencePath
-
     if isinstance(path, URIRef):
         return frozenset([str(path)])
     if isinstance(path, SequencePath):
@@ -96,9 +101,6 @@ def _needs(node: Any) -> frozenset[tuple[bool, str]]:
     included) and a subquery are left to the VKG: a subquery that aggregates without ``GROUP BY`` has a
     row whatever it matches. Every other node needs what its pattern needs.
     """
-    from rdflib import RDF, URIRef
-    from rdflib.plugins.sparql.parserutils import CompValue
-
     if not isinstance(node, CompValue):
         return frozenset()
     if node.name == "BGP":
@@ -129,9 +131,6 @@ def vkg_terms(query: str) -> tuple[list[str], list[str]]:
     have answers without it, so the VKG decides. Standard vocabularies are kept; the caller leaves
     them out. Nothing when the query does not translate to an algebra.
     """
-    from rdflib.plugins.sparql.algebra import translateQuery
-    from rdflib.plugins.sparql.parser import parseQuery
-
     try:
         algebra = translateQuery(parseQuery(query)).algebra
     except Exception:  # noqa: BLE001 - such a query goes to the VKG unchecked, as before

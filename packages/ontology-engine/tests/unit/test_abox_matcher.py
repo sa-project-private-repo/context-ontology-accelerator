@@ -1,5 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import json
 import logging
 import math
@@ -102,7 +104,7 @@ class _FakeBedrock:
 
 
 def test_bedrock_judge_leaves_temperature_unset_unless_configured(monkeypatch):
-    monkeypatch.setattr("coa_common.bedrock.BedrockClient", _FakeBedrock)
+    monkeypatch.setattr("coa_ontology.abox.matcher.BedrockClient", _FakeBedrock)
     monkeypatch.delenv("ABOX_LLM_TEMPERATURE", raising=False)
     monkeypatch.delenv("ABOX_LLM_MAX_TOKENS", raising=False)
     assert matcher.bedrock_judge("m")("s", "u") == {"decisions": []}
@@ -114,7 +116,7 @@ def test_bedrock_judge_leaves_temperature_unset_unless_configured(monkeypatch):
 
 
 def test_bedrock_judge_takes_its_output_budget_from_the_env_once(monkeypatch):
-    monkeypatch.setattr("coa_common.bedrock.BedrockClient", _FakeBedrock)
+    monkeypatch.setattr("coa_ontology.abox.matcher.BedrockClient", _FakeBedrock)
     monkeypatch.delenv("ABOX_LLM_TEMPERATURE", raising=False)
     monkeypatch.setenv("ABOX_LLM_MAX_TOKENS", "32000")
     judge = matcher.bedrock_judge("m")
@@ -145,14 +147,14 @@ def _not_json() -> ValueError:
 
 def test_bedrock_judge_asks_once_more_when_the_reply_is_not_json(monkeypatch):
     """One reply with prose instead of JSON failed a whole domain ABox build on dev."""
-    monkeypatch.setattr("coa_common.bedrock.BedrockClient", _ScriptedBedrock)
+    monkeypatch.setattr("coa_ontology.abox.matcher.BedrockClient", _ScriptedBedrock)
     _ScriptedBedrock.replies = [_not_json(), {"decisions": [{"id": 0, "choice": "c0"}]}]
     assert matcher.bedrock_judge("m")("s", "u") == {"decisions": [{"id": 0, "choice": "c0"}]}
     assert _ScriptedBedrock.replies == []
 
 
 def test_bedrock_judge_gives_up_after_a_second_reply_that_is_not_json(monkeypatch):
-    monkeypatch.setattr("coa_common.bedrock.BedrockClient", _ScriptedBedrock)
+    monkeypatch.setattr("coa_ontology.abox.matcher.BedrockClient", _ScriptedBedrock)
     _ScriptedBedrock.replies = [_not_json(), _not_json(), {"decisions": []}]
     with pytest.raises(ValueError, match="Invalid Bedrock response format"):
         matcher.bedrock_judge("m")("s", "u")
@@ -161,7 +163,7 @@ def test_bedrock_judge_gives_up_after_a_second_reply_that_is_not_json(monkeypatc
 
 def test_bedrock_judge_does_not_ask_again_after_a_truncated_reply(monkeypatch):
     """A truncated batch is split by ``decide``; asking the same batch again would only truncate again."""
-    monkeypatch.setattr("coa_common.bedrock.BedrockClient", _ScriptedBedrock)
+    monkeypatch.setattr("coa_ontology.abox.matcher.BedrockClient", _ScriptedBedrock)
     truncated = BedrockTruncationError(model_id="m", output_tokens=8000, max_tokens=8000)
     _ScriptedBedrock.replies = [truncated, {"decisions": []}]
     with pytest.raises(BedrockTruncationError):
@@ -171,7 +173,7 @@ def test_bedrock_judge_does_not_ask_again_after_a_truncated_reply(monkeypatch):
 
 @pytest.mark.parametrize("bad", ["lots", "0", "-5", "1.5"])
 def test_bedrock_judge_rejects_a_bad_max_tokens_when_created(monkeypatch, bad):
-    monkeypatch.setattr("coa_common.bedrock.BedrockClient", _FakeBedrock)
+    monkeypatch.setattr("coa_ontology.abox.matcher.BedrockClient", _FakeBedrock)
     monkeypatch.setenv("ABOX_LLM_MAX_TOKENS", bad)
     with pytest.raises(ValueError, match="ABOX_LLM_MAX_TOKENS"):
         matcher.bedrock_judge("m")
@@ -465,7 +467,7 @@ def test_mapping_embeddings_keep_one_size_whatever_the_chunk_index_uses(monkeypa
         def embed_texts(self, texts):
             return []
 
-    monkeypatch.setattr("coa_ontology.bedrock_embeddings.BedrockEmbeddingClient", FakeClient)
+    monkeypatch.setattr("coa_ontology.abox.matcher.BedrockEmbeddingClient", FakeClient)
     monkeypatch.setenv("BEDROCK_EMBED_DIMENSIONS", "512")
     matcher.bedrock_embed()
     assert made[0]["dimensions"] == DEFAULT_EMBED_DIMENSIONS  # ranking, so candidate_hash, never depends on it
@@ -473,7 +475,7 @@ def test_mapping_embeddings_keep_one_size_whatever_the_chunk_index_uses(monkeypa
 
 @pytest.mark.parametrize("bad", ["hot", "2", "-0.1", "nan"])
 def test_bedrock_judge_rejects_a_bad_temperature_when_created(monkeypatch, bad):
-    monkeypatch.setattr("coa_common.bedrock.BedrockClient", _FakeBedrock)
+    monkeypatch.setattr("coa_ontology.abox.matcher.BedrockClient", _FakeBedrock)
     monkeypatch.setenv("ABOX_LLM_TEMPERATURE", bad)
     with pytest.raises(ValueError, match="ABOX_LLM_TEMPERATURE"):
         matcher.bedrock_judge("m")

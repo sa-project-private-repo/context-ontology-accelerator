@@ -118,9 +118,10 @@ When you create a namespace, the platform:
 ## Retrying Creates Safely
 
 Create calls accept an optional `clientToken` in the request body: 1–64
-printable ASCII characters (a UUID works well). Retrying the same request with
-the same token within 24 hours returns the original response, marked with the
-`X-Idempotent-Replay: true` header, instead of creating a duplicate.
+printable ASCII characters with no spaces (a UUID works well). Retrying the
+same request with the same token within 24 hours returns the original response,
+marked with the `X-Idempotent-Replay: true` header, instead of creating a
+duplicate.
 
 - Reusing a token with different parameters, or while the first call is still
   running, returns `409`.
@@ -288,13 +289,22 @@ reports the current state of that service in two fields:
 |-------------|---------|-----------|
 | `HEALTHY` | A running VKG task is passing its container health check and can answer queries. | Nothing — normal operation. |
 | `DEGRADED` | A VKG task **is running** but its container health check is failing (e.g. Ontop could not load the R2RML mappings, or the OWL2QL translation is not completing). Distinct from `UNAVAILABLE`. | Check the VKG service logs in CloudWatch. Common causes: an under-provisioned task (see [VKG Task Sizing](deploying.md#vkg-task-sizing)) or a malformed mapping. |
-| `UNAVAILABLE` | No VKG task is running for this namespace (desired count 0, or all tasks stopped). | Trigger a reload, or check for a failed deployment / circuit-breaker rollback. |
+| `UNAVAILABLE` | No VKG task is running for this namespace (desired count 0, or all tasks stopped). | With the reason "VKG is scaled to zero.", see below. Otherwise trigger a reload, or check for a failed deployment / circuit-breaker rollback. |
 | `PROVISIONING` | A VKG task is starting up or a new deployment is rolling out; health is not yet confirmed. | Wait — this is transient during create/reload. |
 | `UNKNOWN` | No VKG service exists for this namespace (e.g. no accepted ontology yet), or the health could not be determined. | Expected before an ontology is accepted; otherwise verify the service was provisioned. |
 
 `DEGRADED` and `UNAVAILABLE` are deliberately **disjoint**: a running-but-broken
 VKG reports `DEGRADED` (not a false `HEALTHY` and not `UNAVAILABLE`), so a
 silently-broken graph is visible rather than masked.
+
+**Scaled to zero.** `vkgHealthReason` reads "VKG is scaled to zero." when the
+VKG service was scaled down to no tasks on purpose; `vkgHealth` is then
+`UNAVAILABLE`. This is expected when the namespace has nothing for the VKG to
+load: after its induced ontology was deleted (nothing stays deployed, see
+[Ontology versions](ontologies.md#ontology-versions)), or while the deployed
+version has no table mappings. A reload does not bring it back in that case.
+Deploying a version with table mappings does: after a delete, induce again and
+accept the new proposal; by default the accept deploys the version it publishes.
 
 ## Authorization
 

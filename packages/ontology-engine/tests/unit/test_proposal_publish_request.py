@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """``proposals.publish_request_for`` builds exactly the request an accept hands to publish."""
 
+from __future__ import annotations
+
 from unittest.mock import MagicMock, patch
 
 import pytest

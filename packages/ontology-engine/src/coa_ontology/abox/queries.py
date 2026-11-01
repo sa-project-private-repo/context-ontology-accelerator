@@ -7,11 +7,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from coa_ontology.abox import model as m
+from coa_ontology.abox import store
+from coa_ontology.abox.lexical import chunk_texts
 from coa_ontology.stores.neptune_db_graph import _esc, _iri, _sparql_query
-
-from . import model as m
-from . import store
-from .lexical import chunk_texts
 
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 RDFS_LABEL = "http://www.w3.org/2000/01/rdf-schema#label"

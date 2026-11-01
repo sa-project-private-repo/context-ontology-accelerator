@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Designer drafts live under proposals/{ns}/{id}/studio/ and go with the proposal and the namespace."""
 
+from __future__ import annotations
+
 import pytest
 from coa_ontology import dynamo_store
 from coa_ontology.studio import draft as store

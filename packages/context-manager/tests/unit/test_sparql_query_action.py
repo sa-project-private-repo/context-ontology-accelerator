@@ -24,7 +24,10 @@ NS = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
 SELECT = "SELECT ?p ?name WHERE { ?p <http://e/o#name> ?name }"
 
 
-@pytest.mark.parametrize(("query", "form"), [(SELECT, "SELECT"), ("ASK { ?s ?p ?o }", "ASK")])
+@pytest.mark.parametrize(
+    ("query", "form"),
+    [(SELECT, "SELECT"), ("ASK { ?s ?p ?o }", "ASK"), ("SELECT *\r\nWHERE { ?s ?p ?o } # x\r\n", "SELECT")],
+)
 def test_select_and_ask_pass_the_guard(query, form):
     assert check_vkg_sparql(query) == form
 
@@ -44,6 +47,10 @@ def test_select_and_ask_pass_the_guard(query, form):
         None,
         "SELECT * WHERE { ?s ?p ?o }" + " " * MAX_SPARQL_CHARS,
         'SELECT * WHERE { ?s ?p "x" , "\\u0022 . GRAPH ?g { ?a ?b ?c } . ?s ?p \\u0022" . }',
+        # SPARQL ends a comment at a lone CR, rdflib only at LF: the VKG would run what rdflib skipped.
+        "SELECT * # x\rFROM <http://other>\nWHERE { ?s ?p ?o }",
+        "SELECT * WHERE { ?s ?p ?o # x\rGRAPH ?g { ?a ?b ?c }\n}",
+        "SELECT * WHERE { ?s ?p ?o # x\u2028SERVICE <http://evil/sparql> { ?a ?b ?c }\n}",
     ],
 )
 def test_the_guard_refuses_other_forms_own_graphs_and_updates(query):

@@ -249,6 +249,14 @@ operation GetOntology {
 /// as a query parameter rather than a path label — API Gateway mangles a
 /// URL-encoded ``#`` in a path segment (falls through to IAM auth → 403). This
 /// mirrors the graph vertex-lookup endpoints (``/graph/class?uri=``).
+///
+/// Returns 409 (ConflictError) while a deployment or another ontology's delete holds the
+/// namespace's deploy lock, and while a version publish runs that snapshots this ontology or
+/// would land while this delete stops serving it. Re-issued while this ontology's own delete
+/// still runs, it returns 202 without starting a second one; if that delete failed but has not
+/// released the lock yet, it returns 409 until it has. An ontology that exists only in the graph
+/// (no registry entry) has no row to record its delete on, so a re-issue while that delete still
+/// runs returns 409 until its graph is dropped, then 404.
 @idempotent
 @http(method: "DELETE", uri: "/namespaces/{namespaceId}/ontologies", code: 202)
 operation DeleteOntology {
@@ -262,6 +270,10 @@ operation DeleteOntology {
         @httpQuery("ontology_id")
         ontologyId: OntologyId
     }
+
+    errors: [
+        ConflictError
+    ]
 }
 
 /// Upload an ontology file (Turtle, RDF/XML, or JSON-LD).
@@ -296,6 +308,10 @@ operation UploadOntology {
 }
 
 /// Download an ontology as Turtle.
+///
+/// Returns 404 when the ontology does not exist or its graph holds no triples
+/// and no cached file is available; nothing is written to the artifacts bucket
+/// in that case.
 @readonly
 @http(method: "GET", uri: "/namespaces/{namespaceId}/ontologies/{ontologyId}/download", code: 200)
 operation DownloadOntology {
@@ -690,10 +706,12 @@ operation GraphSearch {
         @httpLabel
         namespaceId: Uuid
 
-        /// Substring search term matched against entity IRIs and labels.
+        /// Substring search term matched against entity IRIs and labels. An
+        /// empty value or `*` lists the namespace's entities; a value over 4000
+        /// characters returns 400.
         @required
         @httpQuery("q")
-        @length(min: 1, max: 4000)
+        @length(max: 4000)
         q: String
 
         @httpQuery("kind")

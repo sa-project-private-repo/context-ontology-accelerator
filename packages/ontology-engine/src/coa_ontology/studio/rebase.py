@@ -22,12 +22,11 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
+from coa_ontology.studio import changes
+from coa_ontology.studio import draft as store
+from coa_ontology.studio.messages import Message, english, message
+from coa_ontology.studio.ops import ANY_OPS, ChangeIri, ChangeSetError, apply_ops
 from coa_ontology.versions import snapshot
-
-from . import changes
-from . import draft as store
-from .messages import Message, english, message
-from .ops import ANY_OPS, ChangeIri, ChangeSetError, apply_ops
 
 
 class NothingToRebase(store.StudioError):

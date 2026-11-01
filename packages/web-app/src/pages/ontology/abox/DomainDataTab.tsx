@@ -30,6 +30,7 @@ import Table from "@cloudscape-design/components/table";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import { useCanManageOntology } from "@api-hooks/use-can-manage-ontology";
 import { formatTimestamp } from "@utils/helpers";
+import { objectField } from "@utils/object-field";
 import { ApiError, type ApiClient } from "@components/ApiClientProvider";
 import type { AppMessage } from "../../../i18n/appMessages";
 import { useAppI18n, type AppTranslate } from "../../../i18n/LocaleProvider";
@@ -48,6 +49,7 @@ import {
   type DomainInstanceSummary,
 } from "../../../services/ontology-engine";
 import {
+  ABOX_MAPPING_DIRECTIONS,
   ABOX_MAPPING_KINDS,
   ABOX_MAPPING_STATUSES,
   type AboxMappingDirection,
@@ -149,10 +151,9 @@ interface ChangeDialog {
 /** The engine's `detail` for a refused call, else the error's own message. */
 function errorMessage(e: unknown): string {
   const detail =
-    e instanceof ApiError
-      ? (e.body as { detail?: unknown } | null | undefined)?.detail
-      : undefined;
-  return typeof detail === "string" ? detail : (e as Error).message;
+    e instanceof ApiError ? objectField(e.body, "detail") : undefined;
+  if (typeof detail === "string") return detail;
+  return e instanceof Error ? e.message : String(e);
 }
 
 /** A refused edit after which the listed rows are out of date: the row changed meanwhile (409) or is gone (404). */
@@ -203,25 +204,26 @@ function NamespaceDomainData({ apiClient, namespace }: DomainDataTabProps) {
     const refreshLists = () => {
       if (!reload.background) setListsReload((n) => n + 1);
     };
-    getDomainAbox(apiClient, namespace)
-      .then((state) => {
+    void (async () => {
+      try {
+        const state = await getDomainAbox(apiClient, namespace);
         if (cancelled) return;
         setAbox(state);
         setLoadError(null);
         setFailedPolls(0);
         refreshLists();
-      })
-      .catch((e: Error) => {
+      } catch (e) {
         if (cancelled) return;
-        setLoadError(e.message);
+        setLoadError(errorMessage(e));
         setFailedPolls((n) => n + 1);
         refreshLists();
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setLoading(false);
-        setSettled((n) => n + 1);
-      });
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+          setSettled((n) => n + 1);
+        }
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -298,26 +300,26 @@ function NamespaceDomainData({ apiClient, namespace }: DomainDataTabProps) {
     const request = ++instancesRequest.current;
     setInstancesLoading(true);
     setLoadingMore(false);
-    listDomainInstances(apiClient, namespace, {
-      classIri: classIri ?? undefined,
-      q: query.trim() || undefined,
-      maxResults: PAGE_SIZE,
-    })
-      .then((list) => {
+    void (async () => {
+      try {
+        const list = await listDomainInstances(apiClient, namespace, {
+          classIri: classIri ?? undefined,
+          q: query.trim() || undefined,
+          maxResults: PAGE_SIZE,
+        });
         if (request !== instancesRequest.current) return;
         setInstances(list.instances);
         setNextToken(list.nextToken ?? null);
         setInstancesError(null);
-      })
-      .catch((e) => {
+      } catch (e) {
         if (request !== instancesRequest.current) return;
         setInstances([]);
         setNextToken(null);
         setInstancesError(errorMessage(e));
-      })
-      .finally(() => {
+      } finally {
         if (request === instancesRequest.current) setInstancesLoading(false);
-      });
+      }
+    })();
   }, [apiClient, namespace, loaded, builtAt, listsReload, classIri, query]);
 
   async function loadMore() {
@@ -388,13 +390,13 @@ function NamespaceDomainData({ apiClient, namespace }: DomainDataTabProps) {
     const want = wanted.current;
     if (!namespace || !want) return;
     const request = ++detailRequest.current;
-    getDomainInstance(apiClient, namespace, want.iri)
-      .then((detail) => {
+    void (async () => {
+      try {
+        const detail = await getDomainInstance(apiClient, namespace, want.iri);
         if (request !== detailRequest.current) return;
         setSelected(detail);
         setDetailError(null);
-      })
-      .catch((e) => {
+      } catch (e) {
         if (request !== detailRequest.current) return;
         if (e instanceof ApiError && e.status === 404) {
           // Focus would be lost with the panel; hand it to the notice.
@@ -411,7 +413,8 @@ function NamespaceDomainData({ apiClient, namespace }: DomainDataTabProps) {
         } else {
           setDetailError(errorMessage(e));
         }
-      });
+      }
+    })();
   }, [apiClient, namespace, builtAt, t]);
 
   useEffect(() => {
@@ -453,11 +456,12 @@ function NamespaceDomainData({ apiClient, namespace }: DomainDataTabProps) {
     if (!namespace || !loaded) return;
     let cancelled = false;
     setMappingsLoading(true);
-    listAboxMappings(apiClient, namespace, {
-      kind: mappingKind,
-      status: mappingStatus ?? undefined,
-    })
-      .then((result) => {
+    void (async () => {
+      try {
+        const result = await listAboxMappings(apiClient, namespace, {
+          kind: mappingKind,
+          status: mappingStatus ?? undefined,
+        });
         if (cancelled) return;
         setMappings({
           kind: mappingKind,
@@ -471,14 +475,13 @@ function NamespaceDomainData({ apiClient, namespace }: DomainDataTabProps) {
           const waiting = [...pending].filter(([, build]) => build === builtAt);
           return waiting.length === pending.size ? pending : new Map(waiting);
         });
-      })
-      .catch((e) => {
+      } catch (e) {
         if (cancelled) return;
         setMappingsError(errorMessage(e));
-      })
-      .finally(() => {
+      } finally {
         if (!cancelled) setMappingsLoading(false);
-      });
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -930,9 +933,12 @@ function NamespaceDomainData({ apiClient, namespace }: DomainDataTabProps) {
             <SegmentedControl
               label={t("Mapping kind")}
               selectedId={mappingKind}
-              onChange={({ detail }) =>
-                setMappingKind(detail.selectedId as AboxMappingKind)
-              }
+              onChange={({ detail }) => {
+                const kind = ABOX_MAPPING_KINDS.find(
+                  (k) => k === detail.selectedId,
+                );
+                if (kind) setMappingKind(kind);
+              }}
               options={ABOX_MAPPING_KINDS.map((k) => ({
                 id: k,
                 text: t(KIND_LABELS[k]),
@@ -947,7 +953,9 @@ function NamespaceDomainData({ apiClient, namespace }: DomainDataTabProps) {
               options={statusOptions}
               onChange={({ detail }) =>
                 setMappingStatus(
-                  (detail.selectedOption.value as AboxMappingStatus) || null,
+                  ABOX_MAPPING_STATUSES.find(
+                    (st) => st === detail.selectedOption.value,
+                  ) ?? null,
                 )
               }
             />
@@ -1169,8 +1177,10 @@ function NamespaceDomainData({ apiClient, namespace }: DomainDataTabProps) {
                   onChange={({ detail }) =>
                     updateDialog(dialog.request, (d) => ({
                       ...d,
-                      direction: detail.selectedOption
-                        .value as AboxMappingDirection,
+                      direction:
+                        ABOX_MAPPING_DIRECTIONS.find(
+                          (dir) => dir === detail.selectedOption.value,
+                        ) ?? null,
                     }))
                   }
                 />

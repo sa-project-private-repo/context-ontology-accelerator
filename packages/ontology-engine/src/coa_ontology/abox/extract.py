@@ -21,13 +21,16 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 
-from coa_common.constants import graphrag_chunk_index_name
+from coa_common import AossVectorClient
+from coa_common.constants import DEFAULT_EMBED_DIMENSIONS, graphrag_chunk_index_name
+from coa_common.embeddings import BedrockEmbedder
 from rdflib.namespace import OWL, RDFS
 
-from . import store
-from .matcher import Judge
-from .model import CURRENT_VALID_TO, Provenance, XEntity, XRelation, norm
-from .tbox import TBox, schema_hash
+from coa_ontology.abox import store
+from coa_ontology.abox.matcher import Judge
+from coa_ontology.abox.model import CURRENT_VALID_TO, Provenance, XEntity, XRelation, norm
+from coa_ontology.abox.tbox import TBox, schema_hash
+from coa_ontology.stores.opensearch_vector import OSS_DIMENSIONS, OSS_ENDPOINT, OSS_REGION
 
 _log = logging.getLogger("abox.extract")
 
@@ -365,10 +368,6 @@ def run(
 
 def default_search() -> Search:
     """A k-NN search over the AOSS collection (endpoint, region and dimensions from the OSS_* settings)."""
-    from coa_common import AossVectorClient
-
-    from coa_ontology.stores.opensearch_vector import OSS_DIMENSIONS, OSS_ENDPOINT, OSS_REGION
-
     client = AossVectorClient(endpoint=OSS_ENDPOINT, region=OSS_REGION, dimensions=OSS_DIMENSIONS, timeout=60)
     return lambda index, vector, k: client.knn_search(index, vector, top_k=k, source=["id", "value", "metadata"])
 
@@ -379,9 +378,6 @@ def default_embed_query() -> Callable[[str], list[float]]:
     kg_build embeds ``chunk_{tenant}`` at ``BEDROCK_EMBED_DIMENSIONS``, as the engine's other
     embedding paths do; a query of another size is rejected or matches poorly.
     """
-    from coa_common.constants import DEFAULT_EMBED_DIMENSIONS
-    from coa_common.embeddings import BedrockEmbedder
-
     return BedrockEmbedder(
         region=os.getenv("AWS_REGION", "us-east-1"),
         dimensions=int(os.getenv("BEDROCK_EMBED_DIMENSIONS", str(DEFAULT_EMBED_DIMENSIONS))),

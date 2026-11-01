@@ -43,10 +43,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 from coa_common.constants import VOCAB_URI
+from pydantic import ValidationError
 from rdflib import Graph, URIRef
 
 from coa_ontology import dynamo_store
 from coa_ontology.datasource_ids import bare_datasource_id
+from coa_ontology.stores import neptune_db_graph
+from coa_ontology.validation.shapes import config as shapes_config
 from coa_ontology.versions import registry, snapshot, storage
 
 _log = logging.getLogger("versions.publish")
@@ -328,15 +331,13 @@ def _vkg_ontology(ontology_nt: str, r2rml_nt: str) -> str:
 def _compile_shapes(req: PublishRequest) -> Graph:
     if not req.constraint_config:
         return Graph()
-    from pydantic import ValidationError
-
-    from coa_ontology.validation.shapes.config import ConstraintConfig, compile_to_shacl
-
     try:
-        config = ConstraintConfig(**req.constraint_config)
+        config = shapes_config.ConstraintConfig(**req.constraint_config)
     except ValidationError as e:
         raise snapshot.SnapshotValidationError(f"Invalid constraint config: {e}") from e
-    return snapshot.parse_turtle(compile_to_shacl(config, req.uri_prefix or req.ontology_id), what="SHACL")
+    return snapshot.parse_turtle(
+        shapes_config.compile_to_shacl(config, req.uri_prefix or req.ontology_id), what="SHACL"
+    )
 
 
 def _parent_file(namespace: str, version: int, name: str) -> Graph:
@@ -481,6 +482,7 @@ def union_candidate(req: PublishRequest, parent_version: int | None) -> tuple[Gr
 def _build_files(
     req: PublishRequest, version: int, parent_version: int | None
 ) -> tuple[dict[str, str], dict[str, Any], int, list[str]]:
+    # Imported lazily: proposals imports this module.
     from coa_ontology.proposals import SchemaSqlCoverageError, _generate_schema_sql
 
     ns = req.namespace
@@ -562,7 +564,6 @@ def _awaiting_bootstrap(namespace: str, ontology_id: str) -> dict[str, Any] | No
 
 def _read_live(namespace: str, ontology_id: str) -> tuple[Graph, Graph]:
     """Read and check the live ontology and mapping; raise :class:`BootstrapError` if they are inconsistent."""
-    from coa_ontology.stores import neptune_db_graph
 
     def inconsistent(problem: str) -> BootstrapError:
         return BootstrapError(

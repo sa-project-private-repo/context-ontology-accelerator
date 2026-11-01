@@ -416,6 +416,15 @@ describe("DomainDataTab", () => {
       ).toBeInTheDocument();
       expect(screen.getByText("Service Unavailable")).toBeInTheDocument();
     });
+
+    it("shows why the state could not be loaded when the failure is not an Error", async () => {
+      getDomainAbox.mockRejectedValue("Service Unavailable");
+      renderTab();
+      expect(
+        await screen.findByText("Could not load the domain ABox"),
+      ).toBeInTheDocument();
+      expect(screen.getByText("Service Unavailable")).toBeInTheDocument();
+    });
   });
 
   describe("polling", () => {
@@ -635,6 +644,17 @@ describe("DomainDataTab", () => {
       await screen.findByText("Ready");
       fireEvent.click(screen.getByRole("button", { name: "Rebuild" }));
       expect(await screen.findByText(message)).toBeInTheDocument();
+      expect(screen.getByText("Could not queue a rebuild")).toBeInTheDocument();
+    });
+
+    it("shows a refusal that is not an Error", async () => {
+      rebuildDomainAbox.mockRejectedValue("The engine is unreachable");
+      renderTab();
+      await screen.findByText("Ready");
+      fireEvent.click(screen.getByRole("button", { name: "Rebuild" }));
+      expect(
+        await screen.findByText("The engine is unreachable"),
+      ).toBeInTheDocument();
       expect(screen.getByText("Could not queue a rebuild")).toBeInTheDocument();
     });
   });

@@ -444,6 +444,18 @@ describe("QueryConsole", () => {
     expect(studio.runSparqlQuery).not.toHaveBeenCalled();
   });
 
+  it("draws the query box with the designer stylesheet, which follows dark mode", () => {
+    renderConsole();
+    // No inline colour: it would stay the light one in dark mode.
+    expect(editor().className).toBe("coa-query-text");
+    expect(editor().style.border).toBe("");
+    fireEvent.change(editor(), {
+      target: { value: `SELECT ?s WHERE { ?s ?p "${"가".repeat(2700)}" }` },
+    });
+    expect(editor().className).toBe("coa-query-text coa-query-text-invalid");
+    expect(editor().style.border).toBe("");
+  });
+
   it("explains a request the API's WAF blocked instead of saying Forbidden", async () => {
     studio.runSparqlQuery.mockRejectedValue(
       new ApiError(403, "UNKNOWN_ERROR", "Forbidden", { message: "Forbidden" }),

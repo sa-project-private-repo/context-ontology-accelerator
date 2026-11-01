@@ -146,6 +146,17 @@ TAG = _COA.tag
 # of the embedding and the prompt. Matches the Ontop context's per-term cap
 # (_MAX_TERMS_IN_PROMPT in the serve T-Box builder), so both paths show the same.
 _MAX_TERMS_PER_HINT = 5
+# Per-column caps on the column description in the class text. A Glue column
+# comment allows 255 characters, and a 100-character cut dropped the deciding
+# clause of long steward notes. The SQL writer's text (rich=True) keeps all 255.
+# The embedded text (rich=False) stays at 100: the embedding input is cut at
+# 8000 characters, and longer notes would push a wide table's last columns out of
+# the vector. The T-Box builder in the serve runtime has its own constant
+# (_MAX_PROPERTY_DESCRIPTION_CHARS), kept equal to _MAX_COLUMN_COMMENT_CHARS on
+# purpose; the two are separate constants and are not linked. Neither is a
+# setting. The 255 cap applies only to ontologies accepted after upgrade.
+_MAX_COLUMN_COMMENT_CHARS = 255
+_MAX_COLUMN_COMMENT_EMBED_CHARS = 100
 _SUPERSEDED_ANNOTATION_PREDICATES: dict[URIRef, URIRef] = {
     RDFS.comment: SUPERSEDED_COMMENT,
     SKOS.definition: SUPERSEDED_DEFINITION,
@@ -463,8 +474,13 @@ def _mapped_predicates_from_r2rml(r2rml_content: bytes | str | Graph | None) -> 
 
 
 def _bare_sql_name(literal: Any) -> str:
-    """The unquoted last segment of an ``rr:tableName`` or ``rr:column`` (``"sales"."orders"`` gives ``orders``)."""
-    return split_sql_ident_path(str(literal))[-1]
+    """The unquoted last segment of an ``rr:tableName`` or ``rr:column`` (``"sales"."orders"`` gives ``orders``).
+
+    Stripped: whitespace around a name or around its qualifying dot (``"sales" . "orders"``) is the
+    mapping's layout, not part of the identifier, and these names are written into the documents and
+    into ``coa:physicalName`` as they are.
+    """
+    return split_sql_ident_path(str(literal))[-1].strip()
 
 
 @dataclass(frozen=True)
@@ -518,6 +534,11 @@ def _physical_names_from_r2rml(r2rml_content: bytes | str | Graph | None) -> Phy
     writer uses, and deploy writes the same names into the graph as
     ``coa:physicalName`` (:func:`projection_specs`). Empty when there is no R2RML or
     it does not parse.
+
+    A logical table that is an ``rr:sqlQuery`` names no table, since a derived
+    relation is not a table NL-to-SQL can name, and a class read from several tables
+    or a property read from several columns names none either rather than one of
+    them arbitrarily; such a term keeps its label.
     """
     names = PhysicalNames()
     rg = _parse_r2rml(r2rml_content, "physical names")
@@ -569,10 +590,14 @@ def _physical_names_from_r2rml(r2rml_content: bytes | str | Graph | None) -> Phy
                 names.property_classes.setdefault(predicate, set()).add(cls)
             for predicate, targets in joined.items():
                 names.joins.setdefault(cls, {}).setdefault(predicate, set()).update(targets)
-    for pom in set(rg.objects(None, _RR.predicateObjectMap)):
-        read, predicates = read_by(pom)
-        for predicate in predicates:
-            names.property_columns.setdefault(predicate, set()).update(read)
+    # Per property across the mapping, of the TriplesMaps it types, as the pass above and the
+    # designer's check (``ops.triples_maps_of_class``) read it: an untyped node is no table of
+    # the ontology, and a column it names must not blank out a name a TriplesMap does give.
+    for tmap in rg.subjects(RDF.type, _RR.TriplesMap):
+        for pom in rg.objects(tmap, _RR.predicateObjectMap):
+            read, predicates = read_by(pom)
+            for predicate in predicates:
+                names.property_columns.setdefault(predicate, set()).update(read)
     return names
 
 
@@ -1530,8 +1555,10 @@ def _accumulate_embeddings(
     Analytics namespace-scoped vertex) write into the correct bucket.
 
     ``physical_names`` (:func:`_physical_names_from_r2rml`) makes the document of
-    each mapped class follow its R2RML; see ``_class_text_for``. Without it every
-    class document is built from the TBox alone.
+    each mapped class follow its R2RML; see ``_class_text_for``. NL-to-SQL executes
+    the names written after ``Table:`` and in ``Columns:``, so those come from the
+    mapping and not from a label a steward edited. Without it every class
+    document is built from the TBox alone.
     """
     from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 
@@ -1573,18 +1600,18 @@ def _accumulate_embeddings(
     def _mapped_columns(cls_uri) -> dict[str, str] | None:
         """Property IRI -> physical column ("" for none) for every property a mapped class's TriplesMaps map.
 
-        None when no mapping was given or the class is unmapped: its document then
-        lists every property of the class, as before mappings were read here.
+        None when no mapping was given or no TriplesMap maps the class: its document
+        then lists every property of the class, as before mappings were read here.
+        Mapped means the mapping maps it, not ``ds_map``: a subjectMap can name several
+        classes, of which ``_class_datasource_map_from_r2rml`` keeps one while
+        ``projection_specs`` names the table of every one of them, and the document and
+        that ``coa:physicalName`` must not disagree.
         """
-        if physical_names is None or str(cls_uri) not in ds_map:
-            return None
-        return physical_names.columns.get(str(cls_uri), {})
+        return physical_names.columns.get(str(cls_uri)) if physical_names else None
 
     def _table_of(cls_uri) -> str:
         """The physical table of a mapped class read from exactly one table, else ""."""
-        if physical_names is None or str(cls_uri) not in ds_map:
-            return ""
-        return physical_names.table_of(str(cls_uri))
+        return physical_names.table_of(str(cls_uri)) if physical_names else ""
 
     def _join_target(cls_uri, prop_uri, prop_range) -> str:
         """The table (else label) a relationship of a mapped class joins to, by its mapping.
@@ -1626,22 +1653,23 @@ def _accumulate_embeddings(
             return []
         return [columns.get(str(prop)) or _label_of(prop) for prop in Collection(graph, key_list)]
 
+    def _hints(*kinds: tuple[str, list[str]]) -> str:
+        """Bracketed ``title: a, b`` kinds, each capped, as the Ontop context writes them; "" when all are empty."""
+        hints = [f"{title}: {', '.join(values[:_MAX_TERMS_PER_HINT])}" for title, values in kinds if values]
+        return f" [{'; '.join(hints)}]" if hints else ""
+
     def _term_hints(subject, labels: Iterable[str] = ()) -> str:
         """Bracketed label / synonyms / glossary terms / tags for one column or relationship.
 
         ``labels`` are the column's TBox labels where they differ from its physical
         name, so the user's words reach the SQL writer without renaming the column.
         """
-        hints = []
-        for title, values in (
+        return _hints(
             ("label", list(labels)),
             ("synonyms", _literals(subject, SKOS.altLabel)),
             ("glossary", _literals(subject, GLOSSARY_TERM)),
             ("tags", _literals(subject, TAG)),
-        ):
-            if values:
-                hints.append(f"{title}: {', '.join(values[:_MAX_TERMS_PER_HINT])}")
-        return f" [{'; '.join(hints)}]" if hints else ""
+        )
 
     def _class_text_for(cls_uri) -> tuple[str, str]:
         """Build structured class text, returning ``(embed_text, context_text)``.
@@ -1651,7 +1679,9 @@ def _accumulate_embeddings(
         terms. It deliberately stays close to its pre-#1167 shape: enrichment fills
         synonyms, glossary terms and tags for nearly every column, and the vector
         input is cut at 8000 characters, so per-column hints would push a wide
-        table's last columns out of the vector.
+        table's last columns out of the vector. The one per-column hint it carries
+        is the label of a column the mapping names otherwise, which only an
+        ontology a steward relabelled has.
 
         ``context_text`` is stored, not embedded, for the serve NL→SQL prompt. It
         adds everything the Ontop context also carries: tags, the mapped parent
@@ -1665,9 +1695,10 @@ def _accumulate_embeddings(
         its join reaches, else by its range when that class is mapped. When the
         class reads exactly one table, tables and columns carry
         their physical names; a label that differs goes into ``Synonyms`` (the
-        table) or a ``label:`` hint (a column), and the ``Table:`` head stays when
-        the class lists no column or relationship. A class read from several
-        tables keeps its labels.
+        table) or a ``label:`` hint (a column), in both texts, and the ``Table:``
+        head stays when the class lists no column or relationship. A class read
+        from several tables keeps its labels, which is what the designer's check
+        tells the steward it does (``studio.checks._attribute_column``).
         """
         table = _table_of(cls_uri)
         mapped = _mapped_columns(cls_uri)
@@ -1684,8 +1715,8 @@ def _accumulate_embeddings(
 
         # (label, target, comment, hints)
         obj_props_list: list[tuple[str, str, str, str]] = []
-        # (label, dtype, comment, distinct_values, hints)
-        data_props_list: list[tuple[str, str, str, list[str], str]] = []
+        # (label, dtype, comment, distinct_values, label hint, hints)
+        data_props_list: list[tuple[str, str, str, list[str], str, str]] = []
 
         props = list(graph.subjects(RDFS.domain, cls_uri))
         if mapped is not None:
@@ -1710,8 +1741,11 @@ def _accumulate_embeddings(
                 dtype = str(prop_range).split("#")[-1] if prop_range else "string"
                 distinct_vals = [str(o) for o in graph.objects(prop_uri, _SCL_NS.distinctValues)]
                 column = columns.get(str(prop_uri), "")
-                hints = _term_hints(prop_uri, _other_labels(prop_uri, column) if column else ())
-                data_props_list.append((column or prop_label, dtype, prop_comment, distinct_vals, hints))
+                labels = _other_labels(prop_uri, column) if column else []
+                hints = _term_hints(prop_uri, labels)
+                data_props_list.append(
+                    (column or prop_label, dtype, prop_comment, distinct_vals, _hints(("label", labels)), hints)
+                )
 
         if not data_props_list and not obj_props_list and not table:
             thin = _text_for(cls_uri)
@@ -1743,17 +1777,23 @@ def _accumulate_embeddings(
             return parts
 
         def _cols(*, rich: bool) -> str:
-            # rich=False → embedded vector: column names + comments (type, sampled
-            # values and per-column terms are low-signal for retrieval and would
-            # crowd columns out of the 8000-character input).
+            # rich=False → embedded vector: column names + comments cut at
+            # _MAX_COLUMN_COMMENT_EMBED_CHARS (type, sampled values and
+            # per-column terms are low-signal for retrieval and would crowd
+            # columns out of the 8000-character input).
             # rich=True → generation context: adds type, steward terms and allowed
-            # values so the LLM writes correct casts and WHERE literals.
+            # values so the LLM writes correct casts and WHERE literals, and keeps
+            # the comment up to _MAX_COLUMN_COMMENT_CHARS.
+            # The label of a column the mapping names otherwise is in both texts:
+            # only a renamed column has one, and the vector is the only place a question
+            # phrased in the steward's word for it can match.
+            comment_cap = _MAX_COLUMN_COMMENT_CHARS if rich else _MAX_COLUMN_COMMENT_EMBED_CHARS
             return ", ".join(
                 (f"{label}:{dtype}" if rich else label)
-                + (f" ({comment[:100]})" if comment else "")
-                + (hints if rich else "")
+                + (f" ({comment[:comment_cap]})" if comment else "")
+                + (hints if rich else label_hint)
                 + (f" allowed values: [{', '.join(vals[:20])}]" if rich and vals else "")
-                for label, dtype, comment, vals, hints in data_props_list
+                for label, dtype, comment, vals, label_hint, hints in data_props_list
             )
 
         embed_parts = _head(rich=False)

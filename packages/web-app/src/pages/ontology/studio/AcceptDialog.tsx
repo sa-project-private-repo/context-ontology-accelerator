@@ -26,12 +26,12 @@ import {
 } from "../../../services/studio";
 import { diffCounts, errorMessage, iriTail } from "./studio-helpers";
 import { errorSentence, studioMessageText } from "./studio-messages";
+import "@pages/pages.css";
 
 const SHOWN = 20;
-const KIND_TITLES: Record<
-  "classes" | "objectProperties" | "datatypeProperties",
-  AppMessage
-> = {
+/** The kinds of term whose removed ones the dialog lists, in this order. */
+const KINDS = ["classes", "objectProperties", "datatypeProperties"] as const;
+const KIND_TITLES: Record<(typeof KINDS)[number], AppMessage> = {
   classes: "Classes removed ({count})",
   objectProperties: "Relationships removed ({count})",
   datatypeProperties: "Attributes removed ({count})",
@@ -177,33 +177,31 @@ export function AcceptDialog({
               )}
             </Alert>
           )}
-          {(Object.keys(KIND_TITLES) as (keyof typeof KIND_TITLES)[]).map(
-            (kind) => {
-              const removed = preview.diff[kind].removed;
-              if (removed.length === 0) return null;
-              return (
-                <div key={kind}>
-                  <Box variant="h4">
-                    {t(KIND_TITLES[kind], { count: removed.length })}
+          {KINDS.map((kind) => {
+            const removed = preview.diff[kind].removed;
+            if (removed.length === 0) return null;
+            return (
+              <div key={kind}>
+                <Box variant="h4">
+                  {t(KIND_TITLES[kind], { count: removed.length })}
+                </Box>
+                <ul className="coa-compact-list">
+                  {removed.slice(0, SHOWN).map((iri) => (
+                    <li key={iri} title={iri}>
+                      {iriTail(iri)}
+                    </li>
+                  ))}
+                </ul>
+                {removed.length > SHOWN && (
+                  <Box variant="small">
+                    {t("and {count} more", {
+                      count: removed.length - SHOWN,
+                    })}
                   </Box>
-                  <ul style={{ margin: 0, paddingInlineStart: 18 }}>
-                    {removed.slice(0, SHOWN).map((iri) => (
-                      <li key={iri} title={iri}>
-                        {iriTail(iri)}
-                      </li>
-                    ))}
-                  </ul>
-                  {removed.length > SHOWN && (
-                    <Box variant="small">
-                      {t("and {count} more", {
-                        count: removed.length - SHOWN,
-                      })}
-                    </Box>
-                  )}
-                </div>
-              );
-            },
-          )}
+                )}
+              </div>
+            );
+          })}
           {preview.renamed.length > 0 && (
             <div>
               <Box variant="h4">
@@ -211,7 +209,7 @@ export function AcceptDialog({
                   count: preview.renamed.length,
                 })}
               </Box>
-              <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+              <ul className="coa-compact-list">
                 {preview.renamed.map((r) => (
                   <li key={r.fromIri}>
                     {t(
@@ -249,7 +247,7 @@ export function AcceptDialog({
                   count: unansweredCount,
                 })}
               </Box>
-              <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+              <ul className="coa-compact-list">
                 {unanswered.map((term) => (
                   <li key={term.iri} title={term.iri}>
                     {term.label}
@@ -272,7 +270,7 @@ export function AcceptDialog({
                   count: removedCount,
                 })}
               </Box>
-              <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+              <ul className="coa-compact-list">
                 {removedTerms.slice(0, SHOWN).map((term) => {
                   const read = term.tables?.join(", ") ?? term.physicalName;
                   return (
@@ -301,7 +299,7 @@ export function AcceptDialog({
               type="warning"
               header={t("Governed metrics this version breaks")}
             >
-              <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+              <ul className="coa-compact-list">
                 {preview.breakingMetrics.map((m) => (
                   <li key={m.metricId}>
                     {t("{name} (uses {class})", {

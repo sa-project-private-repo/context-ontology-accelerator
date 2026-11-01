@@ -14,13 +14,19 @@ from collections.abc import Callable
 
 from coa_common.constants import to_graphrag_tenant_id
 
+from coa_ontology.abox.model import (
+    CURRENT_VALID_TO,
+    LOCAL_ENTITY_CLASS,
+    LexEntity,
+    LexFact,
+    LexicalSnapshot,
+    Provenance,
+)
 from coa_ontology.inducer.unstructured.stores.na_lexical import (
     _extract_spc_predicate_complement,
     _extract_spo_predicate,
 )
 from coa_ontology.inducer.unstructured.stores.ndb_lexical import NeptuneDatabaseLexicalStore
-
-from .model import CURRENT_VALID_TO, LOCAL_ENTITY_CLASS, LexEntity, LexFact, LexicalSnapshot, Provenance
 
 # Fact ids come back in pages of ``PAGE_SIZE``; each page's details are fetched ``BATCH_SIZE`` ids at a time,
 # which keeps a single openCypher request small and gives the caller a progress tick per batch.

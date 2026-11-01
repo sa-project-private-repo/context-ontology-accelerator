@@ -15,7 +15,9 @@ the last ``WITH``. It fails closed: a parenthesis it cannot read as a node patte
 expression is refused, and so are backtick names other than labels and any non-ASCII identifier.
 
 Both guards work on a masked copy of the query, in which strings, comments and (for SPARQL) IRIs
-are blanked, so a keyword or a brace inside one of them changes nothing. A SPARQL ``<`` right after
+are blanked, so a keyword or a brace inside one of them changes nothing. The masking ends a comment
+at a line feed, so both refuse any other line break: an engine ends one at a lone carriage return
+too, and the rest of the line would run unchecked. A SPARQL ``<`` right after
 an operand inside an expression is less-than, not the start of an IRI, so a comparison written
 without spaces (``?y<2000&&?y>1900``) is read as one. Both cap the rows at the top level and set
 Neptune's own timeout; a query may not set its own query hints.
@@ -27,7 +29,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from . import draft as store
+from rdflib.plugins.sparql.parser import parseQuery
+from rdflib.plugins.sparql.parserutils import CompValue
+
+from coa_ontology.stores.neptune_db_graph import _esc, _iri
+from coa_ontology.studio import draft as store
 
 MAX_QUERY_CHARS = 20_000
 # The rewrite of isBlank, isIRI and isURI copies each call's argument, so calls nested in one another
@@ -304,6 +310,17 @@ def _check_escapes(query: str) -> None:
         raise QueryRefused("Unicode escapes (\\u, \\U) are not allowed; write the characters themselves")
 
 
+# SPARQL ends a comment at a carriage return as well as at a line feed, and lexers written in Java at
+# U+0085, U+2028 and U+2029 too; rdflib and the masking here end one at a line feed only.
+_LINE_BREAK = re.compile("\r(?!\n)|[\x85\u2028\u2029]")
+
+
+def _check_line_breaks(query: str) -> None:
+    """Refuse a line break other than LF or CRLF, which could hide the rest of a comment's line from the checks."""
+    if _LINE_BREAK.search(query):
+        raise QueryRefused("Line breaks must be LF or CRLF")
+
+
 _HINT_NAME = re.compile(r"(?<![\w.\-])hint\s*:", re.IGNORECASE)
 
 
@@ -314,6 +331,7 @@ def _check_sparql_text(query: str) -> None:
     query with one could hide ``GRAPH`` from one of them. Hints would let a query lift its timeout.
     """
     _check_length(query)
+    _check_line_breaks(query)
     _check_escapes(query)
     iris: list[str] = []
     masked = mask_sparql(query, iris)
@@ -344,8 +362,6 @@ _FORM_NAMES = {"SelectQuery": "SELECT", "AskQuery": "ASK", "ConstructQuery": "CO
 
 
 def _parse(query: str) -> Any:
-    from rdflib.plugins.sparql.parser import parseQuery
-
     try:
         return parseQuery(query)
     except Exception as e:  # noqa: BLE001 - pyparsing raises several kinds; all mean "not a query we run"
@@ -357,8 +373,6 @@ def _parse(query: str) -> Any:
 
 def _names(node: Any, out: set[str]) -> set[str]:
     """Every rule name in an rdflib parse tree."""
-    from rdflib.plugins.sparql.parserutils import CompValue
-
     if isinstance(node, CompValue):
         out.add(node.name)
         for value in node.values():
@@ -450,14 +464,10 @@ def _injection_points(masked: str, form: str) -> _Points:
 
 
 def _iri_text(iri: str) -> str:
-    from coa_ontology.stores.neptune_db_graph import _iri
-
     return _iri(iri)
 
 
 def _string_text(value: str) -> str:
-    from coa_ontology.stores.neptune_db_graph import _esc
-
     return f'"{_esc(value)}"'
 
 
@@ -587,12 +597,14 @@ def check_vkg_sparql(query: Any) -> str:
     r"""The form of a query that may run over the VKG (``SELECT`` or ``ASK``); :class:`QueryRefused` otherwise.
 
     The rule of serve's copy, ``coa_serve.tier2.ontop.sparql_guard.check_vkg_sparql``: the length, no
-    ``\u`` escape, then the form, no dataset clause, no ``GRAPH`` and no ``SERVICE``. A VKG query
-    goes to Ontop, not Neptune, so the Neptune checks (``BASE``, relative IRIs, hints) do not apply.
+    line break other than LF or CRLF, no ``\u`` escape, then the form, no dataset clause, no ``GRAPH``
+    and no ``SERVICE``. A VKG query goes to Ontop, not Neptune, so the Neptune checks (``BASE``,
+    relative IRIs, hints) do not apply.
     """
     if not isinstance(query, str):
         raise QueryRefused("The query must be a string")
     _check_length(query)
+    _check_line_breaks(query)
     _check_escapes(query)
     form, _ = _check_parsed(_parse(query), VKG_FORMS)
     return form
@@ -600,11 +612,13 @@ def check_vkg_sparql(query: Any) -> str:
 
 # ── openCypher ──────────────────────────────────────────────────────────────
 
-# A node pattern: an optional variable, labels and an optional property map, nothing else.
+# A node pattern: an optional variable, labels and an optional property map, nothing else. The
+# quantifiers are possessive: no token after a space starts with one, so giving spaces back never
+# helps, and backtracking over a parenthesis full of spaces held the interpreter for minutes.
 _NODE = re.compile(
-    r"\s*(?P<var>[A-Za-z_][A-Za-z0-9_]*)?\s*"
-    r"(?P<labels>(?::\s*[A-Za-z_][A-Za-z0-9_]*\s*)*)"
-    r"(?P<props>\{[^{}]*\})?\s*"
+    r"\s*+(?P<var>[A-Za-z_][A-Za-z0-9_]*+)?\s*+"
+    r"(?P<labels>(?::\s*+[A-Za-z_][A-Za-z0-9_]*+\s*+)*+)"
+    r"(?P<props>\{[^{}]*\})?\s*+"
 )
 _LABEL = re.compile(r":\s*([A-Za-z_][A-Za-z0-9_]*)")
 # A backtick name after ``:`` (a label or a relationship type) of plain characters.
@@ -640,19 +654,41 @@ def _matching_paren(text: str, start: int) -> int:
     raise QueryRefused("The query has an unclosed (")
 
 
+# A word that starts with a digit is a number: hexadecimal, octal or with an exponent at most. Any
+# other, as in ``LIMIT 1MATCH``, openCypher reads as a number and a name, where ``\b`` sees no keyword.
+_DIGIT_WORD = re.compile(r"(?<![A-Za-z0-9_])[0-9][A-Za-z0-9_]*")
+_NUMBER_WORD = re.compile(r"[0-9]+(?:[eE][0-9]*)?|0[xX][0-9A-Fa-f]+|0[oO][0-7]+")
+
+
 def _cypher_text(query: str) -> str:
     """``query`` with strings and comments blanked and backtick names after ``:`` unquoted; refused if odd."""
     text = _TICKED_NAME.sub(r":\1\2", mask_cypher(query, backticks=False))
     if "`" in text:
         raise QueryRefused("Backtick names are only allowed for labels and relationship types")
-    if any(ord(c) > 127 for c in text):
-        raise QueryRefused("Names must be plain ASCII letters, digits and underscores")
+    # Not only non-ASCII: openCypher's reference lexer lets a name hold the control characters Java
+    # ignores, so ``(a\x01)`` is a node named ``a\x01`` with no label, which the node check cannot read.
+    if re.search(r"[^\t\n\r\x20-\x7e]", text):
+        raise QueryRefused("Names must be plain ASCII letters, digits and underscores, with no control characters")
     if "$" in text:
         raise QueryRefused("Parameters are not supported in the console; write the values in the query")
+    if any(not _NUMBER_WORD.fullmatch(m.group(0)) for m in _DIGIT_WORD.finditer(text)):
+        raise QueryRefused("Write a space between a number and the name after it")
     return text
 
 
 _CLAUSE = re.compile(r"\b(MATCH|WHERE|WITH|RETURN|UNWIND|ORDER|SKIP|LIMIT)\b", re.IGNORECASE)
+
+
+def _closing_parens(text: str) -> dict[int, int]:
+    """The ``)`` that closes each ``(`` of ``text``, found in one pass; an unclosed ``(`` has none."""
+    closing: dict[int, int] = {}
+    opened: list[int] = []
+    for i, c in enumerate(text):
+        if c == "(":
+            opened.append(i)
+        elif c == ")" and opened:
+            closing[opened.pop()] = i
+    return closing
 
 
 def _depths(text: str) -> list[int]:
@@ -677,15 +713,18 @@ def _check_nodes(text: str, allowed: frozenset[str], tenant: str) -> None:
     resets = [m.start() for m in re.finditer(r"\bWITH\b", text, re.IGNORECASE)]
     depth = _depths(text)
     clauses = [(m.start(), m.group(1).upper()) for m in _CLAUSE.finditer(text) if depth[m.start()] == 0]
+    closing = _closing_parens(text)
     bound: set[str] = set()
     for open_at in (i for i, c in enumerate(text) if c == "("):
         while resets and resets[0] < open_at:
             resets.pop(0)
             bound = set()  # a WITH starts a new scope; what it passes on must be matched again
         word = _word_before(text, open_at)
-        if word and word.upper() not in _KEYWORDS:
+        if word and not word[0].isdigit() and word.upper() not in _KEYWORDS:
             continue  # a function call such as count(n): its argument is an expression
-        content = text[open_at + 1 : _matching_paren(text, open_at)]
+        if open_at not in closing:
+            raise QueryRefused("The query has an unclosed (")
+        content = text[open_at + 1 : closing[open_at]]
         node = _NODE.fullmatch(content)
         if node is None:
             if _PATTERN_ONLY.search(content):
@@ -713,6 +752,7 @@ def _check_nodes(text: str, allowed: frozenset[str], tenant: str) -> None:
 def prepare_cypher(query: str, tenant: str, *, limit: int, timeout_ms: int) -> str:
     """``query`` if it only reads the namespace's nodes, with Neptune's timeout and at most ``limit + 1`` rows."""
     _check_length(query)
+    _check_line_breaks(query)
     text = _cypher_text(query)
     forbidden = re.search(rf"\b({'|'.join(CYPHER_FORBIDDEN)})\b", text, re.IGNORECASE)
     if forbidden:
@@ -720,7 +760,7 @@ def prepare_cypher(query: str, tenant: str, *, limit: int, timeout_ms: int) -> s
     _check_nodes(text, tenant_labels(tenant), tenant)
     returns = list(re.finditer(r"\bRETURN\b", text, re.IGNORECASE))
     tail = text[returns[-1].end() :] if returns else text
-    own = re.search(r"\bLIMIT\s+(\d+)\s*;?\s*$", tail, re.IGNORECASE)
+    own = re.search(r"\bLIMIT\s+(\d+)\s*+;?\s*+$", tail, re.IGNORECASE)
     if own is None and re.search(r"\bLIMIT\b", tail, re.IGNORECASE):
         raise QueryRefused("The final LIMIT must be a number")
     if own is not None and int(own.group(1)) > limit + 1:

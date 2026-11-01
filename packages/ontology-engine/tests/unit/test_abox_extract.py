@@ -1,5 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import json
 import time
 
@@ -208,7 +210,7 @@ def test_a_bedrock_answer_that_is_not_an_extraction_is_asked_again_next_time(ver
             calls.append(user)
             return type("R", (), {"result": answer})()
 
-    monkeypatch.setattr("coa_common.bedrock.BedrockClient", FakeBedrock)
+    monkeypatch.setattr("coa_ontology.abox.matcher.BedrockClient", FakeBedrock)
     tb, t = _setup()
     chunk = extract.Chunk("c1", "MSA-7", "ds", "k")
     judge = matcher.bedrock_judge("m")  # the production judge, which turns a JSON array into {}
@@ -437,7 +439,7 @@ def test_chunk_queries_are_embedded_at_the_deployments_dimension(monkeypatch, co
         def embed_query(self, text):
             return [0.0]
 
-    monkeypatch.setattr("coa_common.embeddings.BedrockEmbedder", FakeEmbedder)
+    monkeypatch.setattr("coa_ontology.abox.extract.BedrockEmbedder", FakeEmbedder)
     if configured is None:
         monkeypatch.delenv("BEDROCK_EMBED_DIMENSIONS", raising=False)
     else:

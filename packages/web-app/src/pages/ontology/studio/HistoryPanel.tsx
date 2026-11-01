@@ -19,6 +19,7 @@ import type {
   StudioHistoryEntry,
 } from "../../../services/studio";
 import { studioMessageLines, studioMessageText } from "./studio-messages";
+import "@pages/pages.css";
 
 const KIND_LABELS: Record<StudioHistoryEntry["kind"], AppMessage> = {
   open: "Opened",
@@ -102,7 +103,7 @@ export function HistoryPanel({
                   {e.rationale}
                 </Box>
               )}
-              <ul style={{ margin: "2px 0 0", paddingInlineStart: 18 }}>
+              <ul className="coa-compact-list" style={{ marginTop: 2 }}>
                 {e.summary.map((line, i) => (
                   <li key={i}>
                     {studioMessageText(t, e.summaryMessages?.[i], line)}

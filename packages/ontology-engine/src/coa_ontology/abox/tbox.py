@@ -14,9 +14,8 @@ from rdflib import BNode, Graph, URIRef
 from rdflib.collection import Collection
 from rdflib.namespace import OWL, RDF, RDFS, SKOS
 
+from coa_ontology.abox.model import iri_tail
 from coa_ontology.versions import snapshot
-
-from .model import iri_tail
 
 # Every class is a subclass of these, whether or not the snapshot says so.
 _TOP = frozenset({str(OWL.Thing), str(RDFS.Resource)})

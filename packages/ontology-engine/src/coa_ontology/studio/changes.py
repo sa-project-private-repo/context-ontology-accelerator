@@ -44,11 +44,9 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from coa_ontology.versions import snapshot
-
-from . import draft as store
-from .messages import Message, english, listed, message
-from .ops import (
+from coa_ontology.studio import draft as store
+from coa_ontology.studio.messages import Message, english, listed, message
+from coa_ontology.studio.ops import (
     ANY_OPS,
     USER_OPS,
     AddClass,
@@ -61,6 +59,7 @@ from .ops import (
     apply_ops,
     line_delta,
 )
+from coa_ontology.versions import snapshot
 
 MAX_OPS = 100
 MAX_HISTORY = 100

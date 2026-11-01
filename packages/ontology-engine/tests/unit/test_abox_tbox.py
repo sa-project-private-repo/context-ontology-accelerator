@@ -1,5 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import pytest
 from coa_ontology.abox.tbox import load_tbox, schema_hash
 

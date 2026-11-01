@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Accepting a proposal open in the Ontology designer publishes its draft (replace mode)."""
 
+from __future__ import annotations
+
 import json
 from unittest.mock import MagicMock, patch
 

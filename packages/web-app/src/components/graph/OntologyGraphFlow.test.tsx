@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React from "react";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   render,
   screen,
@@ -291,6 +294,16 @@ describe("OntologyGraphFlow", () => {
     const badge = screen.getByLabelText("12 instances");
     expect(badge.textContent).toBe("12");
     expect(badge.style.opacity).toBe("0.45");
+  });
+
+  it("backs the node badge's class with a rule in the graph stylesheet", () => {
+    // Vitest runs with `css: false`, so there is no computed style: read the
+    // stylesheet the component imports, next to this file.
+    const css = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "graph.css"),
+      "utf8",
+    );
+    expect(css).toMatch(/\.coa-graph-node-badge\s*\{[^}]*position:\s*absolute/);
   });
 
   it("marks preview highlights on nodes and edges and lists them in the legend", () => {

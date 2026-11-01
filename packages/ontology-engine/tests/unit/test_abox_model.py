@@ -1,5 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import hashlib
 
 import pytest
@@ -24,6 +26,18 @@ def test_instance_iri_is_deterministic_and_class_scoped():
     assert len(a.rsplit("/", 1)[1]) == 16
     # Same local name, different class IRI: never the same instance.
     assert a != m.instance_iri(NS, "http://other.com/x#Customer", "ACME Corp")
+
+
+def test_data_iris_keep_their_default_base_byte_for_byte():
+    # Instance IRIs already written to the ABox graph are built on this base: the default must not move.
+    assert m.ns_data(NS) == f"http://coa.amazon.com/namespace/{NS}/data/"
+    assert m.header_iri(NS) == f"http://coa.amazon.com/namespace/{NS}/data/abox"
+
+
+def test_data_iris_follow_the_deployments_graph_base_uri(monkeypatch):
+    monkeypatch.setattr(m, "GRAPH_BASE_URI", "https://graph.example.org")
+    assert m.ns_data(NS) == f"https://graph.example.org/namespace/{NS}/data/"
+    assert m.instance_iri(NS, CUSTOMER, "ACME Corp").startswith(f"https://graph.example.org/namespace/{NS}/data/")
 
 
 def test_local_name_is_iri_safe():

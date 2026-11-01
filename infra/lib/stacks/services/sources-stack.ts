@@ -34,6 +34,7 @@ import {
   namespaceTagKey,
   resolveContext,
   resolveLambdaReservedConcurrency,
+  guardrailProfileResources,
 } from "../../context";
 import { Paths, fromRoot } from "../../paths";
 import { bundlePython } from "../../utils/python-bundling";
@@ -626,7 +627,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.minutes(15),
@@ -891,7 +892,7 @@ export class SourcesStack extends SCLStack {
             Paths.commonLib,
             Paths.smithyGeneratedControlPlanePythonServer,
           ],
-          requirementsFile: fromRoot("packages/sources/requirements.txt"),
+          requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
           architecture: "arm64",
         }),
         timeout: cdk.Duration.minutes(5),
@@ -1356,6 +1357,7 @@ export class SourcesStack extends SCLStack {
         actions: ["bedrock:ApplyGuardrail"],
         resources: [
           `arn:aws:bedrock:${this.region}:${this.account}:guardrail/*`,
+          ...guardrailProfileResources(this),
         ],
       }),
     );
@@ -1706,7 +1708,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),
@@ -1813,7 +1815,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.minutes(5),
@@ -1916,7 +1918,7 @@ export class SourcesStack extends SCLStack {
             Paths.commonLib,
             Paths.smithyGeneratedControlPlanePythonServer,
           ],
-          requirementsFile: fromRoot("packages/sources/requirements.txt"),
+          requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
           architecture: "arm64",
         }),
         // The whole point: 15 minutes instead of the API's 30 seconds.
@@ -2260,6 +2262,7 @@ export class SourcesStack extends SCLStack {
         actions: ["bedrock:ApplyGuardrail"],
         resources: [
           `arn:aws:bedrock:${this.region}:${this.account}:guardrail/*`,
+          ...guardrailProfileResources(this),
         ],
       }),
     );
@@ -2274,8 +2277,11 @@ export class SourcesStack extends SCLStack {
         },
       }),
     );
-    // Bedrock batch job actions scoped to the same model ARN patterns as InvokeModel above.
-    // Prevents launching batch jobs against arbitrary models or stopping jobs from other workloads.
+    // Bedrock batch job actions. CreateModelInvocationJob authorizes against BOTH the
+    // model it runs (foundation-model / inference-profile — same patterns as InvokeModel
+    // above) AND the model-invocation-job resource it creates; Get/List/Stop act on the
+    // job resource. All three ARN patterns are required — omitting model-invocation-job
+    // fails every batch submit with AccessDenied on CreateModelInvocationJob.
     kgBuildTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: [
@@ -2287,6 +2293,7 @@ export class SourcesStack extends SCLStack {
         resources: [
           `arn:aws:bedrock:*::foundation-model/*`,
           `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
+          `arn:aws:bedrock:*:${this.account}:model-invocation-job/*`,
         ],
       }),
     );
@@ -2305,7 +2312,7 @@ export class SourcesStack extends SCLStack {
       this,
       "SourcesOSSDataAccessPolicy",
       {
-        name: this.prefixed("src-ingestion-access"),
+        name: this.aossName("src-ingestion-access"),
         type: "data",
         policy: JSON.stringify([
           {
@@ -2332,10 +2339,9 @@ export class SourcesStack extends SCLStack {
                 ],
               },
             ],
-            Principal: [
-              kgBuildTaskDef.taskRole.roleArn,
-              `arn:aws:iam::${this.account}:root`,
-            ],
+            // Named roles only: an account-root principal would admit every
+            // in-account role with aoss:APIAccessAll.
+            Principal: [kgBuildTaskDef.taskRole.roleArn],
           },
         ]),
       },
@@ -2671,11 +2677,9 @@ export class SourcesStack extends SCLStack {
         runtime: lambda.Runtime.PYTHON_3_12,
         architecture: lambda.Architecture.ARM_64,
         handler: "handler.handler",
+        // The handler uses the standard library only, so the bundle installs nothing.
         code: bundlePython({
           srcDirs: [Paths.sourcesDocumentsAboxRequest],
-          requirementsFile: fromRoot(
-            "packages/sources/documents/abox_request/requirements.txt",
-          ),
           architecture: "arm64",
         }),
         environment: {
@@ -2757,7 +2761,7 @@ export class SourcesStack extends SCLStack {
         code: bundlePython({
           srcDirs: [Paths.sourcesDocumentsDeletion, Paths.commonLib],
           requirementsFile: fromRoot(
-            "packages/sources/documents/deletion/requirements.txt",
+            "packages/sources/documents/deletion/requirements.lock.txt",
           ),
           architecture: "arm64",
         }),
@@ -2924,7 +2928,7 @@ export class SourcesStack extends SCLStack {
         code: bundlePython({
           srcDirs: [Paths.sourcesDocumentsTrigger, Paths.commonLib],
           requirementsFile: fromRoot(
-            "packages/sources/documents/trigger/requirements.txt",
+            "packages/sources/documents/trigger/requirements.lock.txt",
           ),
           architecture: "arm64",
         }),
@@ -2985,7 +2989,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),
@@ -3637,7 +3641,7 @@ export class SourcesStack extends SCLStack {
           Paths.commonLib,
           Paths.smithyGeneratedControlPlanePythonServer,
         ],
-        requirementsFile: fromRoot("packages/sources/requirements.txt"),
+        requirementsFile: fromRoot("packages/sources/requirements.lock.txt"),
         architecture: "arm64",
       }),
       timeout: cdk.Duration.seconds(30),

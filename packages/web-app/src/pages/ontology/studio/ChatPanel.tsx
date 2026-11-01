@@ -244,7 +244,9 @@ export function ChatPanel({
    * landed; resolves the new ones and the newest turn.
    */
   const fetchEvents = useCallback(() => {
-    const read = reading.current.then(async () => {
+    const inFlight = reading.current;
+    const read = (async () => {
+      await inFlight;
       const fresh: StudioChatEvent[] = [];
       let after = lastSeq.current;
       let latest: StudioTurn | null;
@@ -269,7 +271,7 @@ export function ChatPanel({
         setTurn(latest);
       }
       return { fresh, latest };
-    });
+    })();
     reading.current = read.catch(() => undefined);
     return read;
   }, [apiClient, namespace, proposalId]);

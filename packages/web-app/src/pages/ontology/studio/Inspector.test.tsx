@@ -1103,6 +1103,16 @@ describe("Inspector", () => {
       expect(screen.getByText("Acme")).toBeTruthy();
     });
 
+    it("says why the evidence could not be read when the failure is not an Error", async () => {
+      getDomainInstance.mockRejectedValue("Evidence is unavailable");
+      renderInspector();
+      await screen.findByText("Acme");
+      fireEvent.click(
+        screen.getByRole("button", { name: "Evidence for Acme" }),
+      );
+      expect(await screen.findByText("Evidence is unavailable")).toBeTruthy();
+    });
+
     it("shows why the examples could not be read", async () => {
       listDomainInstances.mockRejectedValue(new Error("Domain data is down"));
       renderInspector();

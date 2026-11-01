@@ -6,6 +6,7 @@
  * caller's `t` and default to English (as the Versions tab helpers do).
  */
 import { ApiError } from "@components/ApiClientProvider";
+import { objectField } from "@utils/object-field";
 import type {
   GraphEdgeData,
   GraphNodeBadge,
@@ -22,7 +23,7 @@ import {
 } from "../../../services/studio";
 import { formatAppMessage } from "../../../i18n/appMessages";
 import type { AppTranslate } from "../../../i18n/LocaleProvider";
-import { splitSqlIdentPath } from "../induce/grounding";
+import { splitSqlIdentPath } from "@pages/ontology/induce/grounding";
 
 const englishTranslate: AppTranslate = (message, values) =>
   formatAppMessage("en", message, values);
@@ -63,13 +64,11 @@ export function errorMessage(
   }
   const message = studioErrorDetail(e)?.message;
   if (typeof message === "string" && message) return message;
-  const body =
-    typeof e.body === "object" && e.body !== null
-      ? (e.body as { detail?: unknown; message?: unknown })
-      : {};
-  if (typeof body.detail === "string" && body.detail) return body.detail;
+  const detail = objectField(e.body, "detail");
+  if (typeof detail === "string" && detail) return detail;
+  const bodyMessage = objectField(e.body, "message");
   // API Gateway's answer for a request its WAF blocked: no word on why.
-  if (e.status === 403 && body.message === "Forbidden")
+  if (e.status === 403 && bodyMessage === "Forbidden")
     return t(
       "The request was blocked before it reached the server, most likely because it is larger than 8 KB (Japanese, Korean and other non-Latin characters take up to 3 bytes each). Shorten the text and try again.",
     );
@@ -77,7 +76,7 @@ export function errorMessage(
   // it): its text names IAM policies, so say it as the API client does.
   if (e.status === 403)
     return t("You are not authorized to perform this action.");
-  if (typeof body.message === "string" && body.message) return body.message;
+  if (typeof bodyMessage === "string" && bodyMessage) return bodyMessage;
   return t(
     "The request failed (HTTP {status}). Reload the page and try again.",
     { status: e.status },

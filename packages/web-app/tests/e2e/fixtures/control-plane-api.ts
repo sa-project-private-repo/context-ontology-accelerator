@@ -23,7 +23,7 @@ import type { Page } from "@playwright/test";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Read the app's current (auto-renewed) id token from the live page. */
-async function readLiveToken(page: Page): Promise<string | null> {
+export async function readLiveToken(page: Page): Promise<string | null> {
   try {
     const hasToken = await page.evaluate(() =>
       Object.keys(localStorage).some((k) => k.startsWith("oidc.user:")),
@@ -52,7 +52,7 @@ async function readLiveToken(page: Page): Promise<string | null> {
 }
 
 let cachedEndpoint: string | null | undefined;
-async function getApiEndpoint(baseURL: string): Promise<string | null> {
+export async function getApiEndpoint(baseURL: string): Promise<string | null> {
   if (cachedEndpoint !== undefined) return cachedEndpoint;
   try {
     const res = await fetch(

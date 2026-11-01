@@ -25,13 +25,12 @@ from botocore.exceptions import ClientError
 
 from coa_ontology import dynamo_store
 from coa_ontology.abox.store import from_dynamo
+from coa_ontology.studio import changes, chat_store, graph_view
+from coa_ontology.studio import draft as store
+from coa_ontology.studio.iris import check_iri
+from coa_ontology.studio.messages import english, listed
+from coa_ontology.studio.ops import USER_OPS, ChangeSetError, apply_ops
 from coa_ontology.versions import snapshot
-
-from . import changes, chat_store, graph_view
-from . import draft as store
-from .iris import check_iri
-from .messages import english, listed
-from .ops import USER_OPS, ChangeSetError, apply_ops
 
 CS_SK_PREFIX = "STUDIOCS#"
 PENDING, APPLIED, DISCARDED = "pending", "applied", "discarded"
