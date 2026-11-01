@@ -5,6 +5,8 @@
 Datatype repair is the exception that works on the draft: as a change set of ``replace_datatype`` ops.
 """
 
+from __future__ import annotations
+
 from unittest.mock import MagicMock, patch
 
 import pytest

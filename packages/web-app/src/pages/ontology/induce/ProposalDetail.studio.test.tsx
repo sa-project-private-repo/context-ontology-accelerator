@@ -455,6 +455,20 @@ describe("ProposalDetail with the Ontology designer", () => {
       expect(screen.queryByText("Editing in Ontology designer")).toBeNull();
     });
 
+    it("says why the draft could not be opened when the failure is not an Error", async () => {
+      getProposal.mockResolvedValue(proposal());
+      openStudioDraft.mockRejectedValue("The engine is unreachable");
+      renderPage();
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Open in Ontology designer",
+        }),
+      );
+      expect(
+        await screen.findByText("The engine is unreachable"),
+      ).toBeInTheDocument();
+    });
+
     it.each(["pending", "updated", "accept_failed"])(
       "is enabled for a %s proposal",
       async (status) => {

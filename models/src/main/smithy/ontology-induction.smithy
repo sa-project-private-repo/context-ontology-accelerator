@@ -153,14 +153,22 @@ enum InductionSourceType {
 /// to observe the transition.
 ///
 /// ``accepting`` is a later in-flight state: the user submitted ``AcceptProposal``
-/// and a background worker is merging the ontology. It is followed by
-/// ``embeddingsSync`` while the just-written embeddings become searchable in the
-/// (eventually-consistent) vector index. The status then flips to ``accepted``
-/// on success, or to ``acceptFailed`` with ``acceptError`` naming the pipeline
-/// step that failed. An ``acceptFailed`` proposal is re-acceptable — the accept
-/// pipeline is idempotent on re-run — so the client may submit
-/// ``AcceptProposal`` again once the cause is resolved. Clients poll
+/// and a background worker is publishing the proposal as the namespace's next
+/// immutable ontology version, merged onto the newest version (a proposal open in
+/// the Ontology designer is published as its draft, which becomes the whole next
+/// version). Publishing changes nothing that is served. The status then flips to
+/// ``accepted`` with ``publishedVersion``, or to ``accept_failed`` with
+/// ``acceptError`` giving the reason. A deployment serves the published version
+/// once it completes: one starts right after the accept unless ``deploy`` was false
+/// (``autoDeployId``, or ``autoDeployHeld`` when it could not start), and
+/// ``DeployOntologyVersion`` deploys the version otherwise. A failed publish leaves
+/// serving untouched, so an ``accept_failed`` proposal is re-acceptable: the client
+/// may submit ``AcceptProposal`` again once the cause is resolved. Clients poll
 /// ``GetProposal`` to observe the transitions.
+///
+/// ``embeddings_sync`` is no longer entered. The accept pipeline before ontology
+/// versions set it while the embeddings it had written became searchable; a
+/// proposal still in it counts as an accept in progress.
 enum ProposalStatus {
     /// First in-flight state: induction triggered, a worker is building the ontology.
     INDUCING = "inducing"
@@ -168,21 +176,21 @@ enum ProposalStatus {
     /// The ontology finished building and the proposal awaits review.
     PENDING = "pending"
 
-    /// In-flight state: a worker is merging the accepted ontology into the namespace.
+    /// In-flight state: a worker is publishing the accepted proposal as the namespace's next ontology version.
     ACCEPTING = "accepting"
 
-    /// In-flight state following ``accepting``: the ontology is merged and the
-    /// worker is waiting for the embeddings it wrote to become searchable in the
-    /// eventually-consistent vector index.
+    /// In-flight state of the accept pipeline before ontology versions, no longer entered: it waited
+    /// for the embeddings that accept wrote to become searchable. A proposal still in it counts as an
+    /// accept in progress.
     EMBEDDINGS_SYNC = "embeddings_sync"
 
-    /// The proposal was accepted and merged successfully.
+    /// The accept published the proposal as version ``publishedVersion``; that version is served once
+    /// a deployment of it completes.
     ACCEPTED = "accepted"
 
-    /// An accept ran but a pipeline step exhausted its retries. ``acceptError``
-    /// names the failing step. Terminal for that attempt, but the proposal stays
-    /// re-acceptable: the pipeline is idempotent, so re-submitting
-    /// ``AcceptProposal`` after fixing the cause converges.
+    /// An accept ran but its publish failed; ``acceptError`` gives the reason. Terminal for that
+    /// attempt, but the proposal stays re-acceptable: a failed publish leaves serving untouched, so
+    /// re-submitting ``AcceptProposal`` after fixing the cause publishes again.
     ACCEPT_FAILED = "accept_failed"
 
     /// The proposal was rejected by a reviewer.
@@ -234,7 +242,10 @@ operation StartInduction {
         @httpLabel
         namespaceId: Uuid
 
-        /// Data source IDs to induct from.
+        /// Data source IDs to induct from. The table-based strategies
+        /// (`table_to_ontology`, `rigor_ontology`) need at least one; an empty
+        /// list is rejected with a 400. `unstructured_lexical_graph` reads the
+        /// lexical graph instead and accepts an empty list.
         @required
         @length(max: 1000)
         datasourceIds: DataSourceIdList
@@ -353,7 +364,10 @@ operation ListInductionJobs {
         @httpLabel
         namespaceId: Uuid
 
-        /// Filter by job status.
+        /// Filter by job status. Also accepts `ingested` (the job's proposal
+        /// was accepted) and `cancelled`, which the service stores but this
+        /// enum does not list. Any other value returns 400 listing the allowed
+        /// values.
         @httpQuery("status")
         status: InductionJobStatus
 
@@ -522,6 +536,10 @@ operation GetProposal {
         /// Identifier of the deployment started automatically after accept; absent when none was started.
         autoDeployId: String
 
+        /// Progress of the latest accept (`step`, `state`, and `code` for a failure that has one, such as
+        /// `RebaseRequired`); absent until an accept runs.
+        acceptProgress: Document
+
         /// Ontology designer draft state (`base_version`, `revision`, `ontology_id`, `style`, `applied`, `redo`,
         /// `counts`, `opened_at`, `opened_by`, `updated_at`, `updated_by`); absent until the proposal is
         /// opened in the Ontology designer, after which its Turtle edits go through the designer only.
@@ -548,7 +566,7 @@ operation GetProposal {
 /// `revision`) when the draft moved on; 409 `RebaseRequired` (with `baseVersion` and `headVersion`)
 /// when a newer version was published after the draft was built. When a newer version lands after
 /// those checks the publish fails instead: ``accept_failed``, with an ``acceptError`` that advises a
-/// rebase and `accept_progress.code` set to `RebaseRequired` on the proposal row.
+/// rebase and `acceptProgress.code` set to `RebaseRequired` on the proposal row.
 @http(method: "POST", uri: "/namespaces/{namespaceId}/proposals/{proposalId}/accept", code: 202)
 operation AcceptProposal {
     input := {
@@ -560,7 +578,8 @@ operation AcceptProposal {
         @httpLabel
         proposalId: Uuid
 
-        /// Target ontology ID to merge into. If omitted, uses the proposal's own ontology ID.
+        /// Target ontology ID to merge into. If omitted, uses the proposal's own ontology ID. While the
+        /// namespace publishes versions of an ontology, an ID other than that ontology's is refused with 409.
         ontologyId: OntologyId
 
         /// Deploy the published version immediately (default true). When false the version is only published.

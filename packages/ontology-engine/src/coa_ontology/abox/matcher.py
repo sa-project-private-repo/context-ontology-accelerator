@@ -17,10 +17,23 @@ import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from coa_common.bedrock import BedrockTruncationError
+from coa_common.bedrock import BedrockClient, BedrockTruncationError
+from coa_common.constants import DEFAULT_EMBED_DIMENSIONS
 
-from .mapping import ATTRIBUTE, CLASS, FORWARD, FREE, IGNORE, INVERSE, MANUAL, RELATION, MappingRow, mapping_id
-from .tbox import PropInfo, TBox
+from coa_ontology.abox.mapping import (
+    ATTRIBUTE,
+    CLASS,
+    FORWARD,
+    FREE,
+    IGNORE,
+    INVERSE,
+    MANUAL,
+    RELATION,
+    MappingRow,
+    mapping_id,
+)
+from coa_ontology.abox.tbox import PropInfo, TBox
+from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 
 logger = logging.getLogger(__name__)
 
@@ -347,8 +360,6 @@ def _max_tokens() -> int:
 
 def bedrock_judge(model_id: str | None = None) -> Judge:
     """A judge that sends one batch to Bedrock as JSON and returns the parsed object."""
-    from coa_common.bedrock import BedrockClient
-
     # No temperature by default: newer models (Claude Sonnet 5, Opus 4.7+) reject a non-default value
     # with a ValidationException, as the inducer's llm.py and grounding.py already note. Repeatable
     # mappings come from the candidate-hash cache and the saved rows, not from sampling at zero.
@@ -385,10 +396,6 @@ def bedrock_embed() -> Embed:
     the library default size whatever ``BEDROCK_EMBED_DIMENSIONS`` says: the ranking, and so the
     ``candidate_hash`` of the saved rows, does not depend on how a deployment sized its chunk index.
     """
-    from coa_common.constants import DEFAULT_EMBED_DIMENSIONS
-
-    from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
-
     return BedrockEmbeddingClient(
         region=os.getenv("AWS_REGION", "us-east-1"), dimensions=DEFAULT_EMBED_DIMENSIONS
     ).embed_texts

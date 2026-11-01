@@ -10,7 +10,8 @@
  * Accepting a draft is not here: it is `acceptProposal` in `ontology-engine.ts`
  * with the reviewed revision as `expectedRevision`.
  */
-import { ApiError, type ApiClient } from "../components/ApiClientProvider";
+import { ApiError, type ApiClient } from "@components/ApiClientProvider";
+import { objectField } from "@utils/object-field";
 import type { BreakingMetric, SchemaKind } from "./ontology-engine";
 
 export type StudioTermKind = "class" | "objectProperty" | "datatypeProperty";
@@ -475,12 +476,21 @@ export type StudioErrorDetail = { code?: string; message?: string } & Record<
  */
 export function studioErrorDetail(e: unknown): StudioErrorDetail | null {
   if (!(e instanceof ApiError)) return null;
-  const body = e.body;
-  if (typeof body !== "object" || body === null) return null;
-  const detail = (body as { detail?: unknown }).detail;
-  return typeof detail === "object" && detail !== null && !Array.isArray(detail)
-    ? (detail as StudioErrorDetail)
-    : null;
+  const detail = objectField(e.body, "detail");
+  return isStudioErrorDetail(detail) ? detail : null;
+}
+
+/** An object, not a list, whose `code` and `message` are strings where present. */
+function isStudioErrorDetail(value: unknown): value is StudioErrorDetail {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    ["code", "message"].every((key) => {
+      const field = objectField(value, key);
+      return field === undefined || typeof field === "string";
+    })
+  );
 }
 
 export type StudioTurnStatus = "running" | "completed" | "limited" | "failed";
@@ -739,11 +749,20 @@ export function isRebaseRequired(e: unknown): boolean {
   return e instanceof ApiError && e.code === "RebaseRequired";
 }
 
-/** The ops a rebase could not replay, when `e` is a `RebaseFailed` 409. */
+/** The ops a rebase could not replay, when `e` is a `RebaseFailed` 409; an entry that is not one is left out. */
 export function rebaseFailures(e: unknown): StudioRebaseFailure[] {
   if (!(e instanceof ApiError) || e.code !== "RebaseFailed") return [];
   const failures = studioErrorDetail(e)?.failures;
-  return Array.isArray(failures) ? (failures as StudioRebaseFailure[]) : [];
+  return Array.isArray(failures) ? failures.filter(isRebaseFailure) : [];
+}
+
+/** A failure with the fields the rebase dialog shows: the op's id, its kind and the error. */
+function isRebaseFailure(value: unknown): value is StudioRebaseFailure {
+  return (
+    typeof objectField(value, "opId") === "string" &&
+    typeof objectField(objectField(value, "op"), "op") === "string" &&
+    typeof objectField(value, "error") === "string"
+  );
 }
 
 // ── Checks, the query console and competency questions ───────────────────

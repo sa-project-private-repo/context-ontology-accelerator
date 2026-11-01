@@ -168,7 +168,10 @@ class TestDesignerEditsAfterDeploy:
     def test_the_documents_keep_the_physical_names_and_leave_the_new_terms_out(self, deployed):
         documents = deployed["documents"]
         customer = documents[sf.CUSTOMER]
-        assert customer["text"] == "Table: customer | Description: A buyer | Synonyms: Client | Columns: email"
+        # The column's own label is in the embedded text too: a question may name it that way.
+        assert customer["text"] == (
+            "Table: customer | Description: A buyer | Synonyms: Client | Columns: email [label: E-mail address]"
+        )
         assert _context(customer) == (
             "Table: customer | Description: A buyer | Synonyms: Client | Columns: email:string [label: E-mail address]"
         )

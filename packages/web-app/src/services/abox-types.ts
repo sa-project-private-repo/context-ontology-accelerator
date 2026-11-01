@@ -20,4 +20,6 @@ export const ABOX_MAPPING_STATUSES = ["active", "stale", "ignored"] as const;
 
 export type AboxMappingStatus = (typeof ABOX_MAPPING_STATUSES)[number];
 
-export type AboxMappingDirection = "forward" | "inverse";
+export const ABOX_MAPPING_DIRECTIONS = ["forward", "inverse"] as const;
+
+export type AboxMappingDirection = (typeof ABOX_MAPPING_DIRECTIONS)[number];

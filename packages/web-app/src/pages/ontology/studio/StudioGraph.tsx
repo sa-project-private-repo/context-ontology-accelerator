@@ -38,6 +38,7 @@ import type { AppMessage } from "../../../i18n/appMessages";
 import { useAppI18n } from "../../../i18n/LocaleProvider";
 import { iriTail, toFlowEdges, toFlowNodes } from "./studio-helpers";
 import { TermPicker } from "./TermPicker";
+import "./studio.css";
 
 export type GraphActionKind =
   | "addSubclass"
@@ -147,7 +148,8 @@ export function StudioGraph({
       if (e.key === "Escape") closeMenu(true);
     };
     const onPress = (e: MouseEvent) => {
-      if (!menuRef.current?.contains(e.target as Node)) closeMenu(false);
+      if (!(e.target instanceof Node) || !menuRef.current?.contains(e.target))
+        closeMenu(false);
     };
     window.addEventListener("keydown", onKey);
     document.addEventListener("mousedown", onPress, true);
@@ -165,7 +167,7 @@ export function StudioGraph({
     const items = Array.from(
       menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? [],
     );
-    const at = items.indexOf(document.activeElement as HTMLElement);
+    const at = items.findIndex((item) => item === document.activeElement);
     const last = items.length - 1;
     let target: number;
     switch (e.key) {
@@ -186,6 +188,20 @@ export function StudioGraph({
     }
     e.preventDefault();
     items[target]?.focus();
+  }
+
+  // The page opens the action's dialog outside the graph, where nothing is
+  // drawn while the graph is full screen. Opened once that is over, the dialog
+  // takes the focus too.
+  async function runAction(action: GraphAction) {
+    if (document.fullscreenElement) {
+      try {
+        await document.exitFullscreen();
+      } catch {
+        // Still full screen: the dialog opens all the same.
+      }
+    }
+    onAction(action);
   }
 
   const focusLabel =
@@ -282,18 +298,8 @@ export function StudioGraph({
               aria-label={t("Actions for {label}", { label: menu.label })}
               onKeyDown={onMenuKeyDown}
               onContextMenu={(e) => e.preventDefault()}
-              style={{
-                position: "fixed",
-                left: menu.x,
-                top: menu.y,
-                width: MENU_WIDTH,
-                zIndex: 1000,
-                background: "#ffffff",
-                border: "1px solid #d1d5db",
-                borderRadius: 6,
-                padding: 4,
-                boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
-              }}
+              className="coa-graph-menu"
+              style={{ left: menu.x, top: menu.y, width: MENU_WIDTH }}
             >
               {MENU.map((item, i) => (
                 <button
@@ -304,39 +310,21 @@ export function StudioGraph({
                   // menu always has to be able to.
                   aria-disabled={menu.editable ? undefined : true}
                   tabIndex={-1}
+                  className={
+                    activeItem === i
+                      ? "coa-graph-menu-item coa-graph-menu-item-active"
+                      : "coa-graph-menu-item"
+                  }
                   onFocus={() => setActiveItem(i)}
                   onMouseEnter={(e) => e.currentTarget.focus()}
                   onClick={() => {
                     if (!menu.editable) return;
                     closeMenu(true);
-                    const act = () =>
-                      onAction({
-                        kind: item.kind,
-                        iri: menu.iri,
-                        label: menu.label,
-                      });
-                    // The page opens the action's dialog outside the graph,
-                    // where nothing is drawn while the graph is full screen.
-                    // Opened once that is over, the dialog takes the focus too.
-                    if (document.fullscreenElement)
-                      void document.exitFullscreen().then(act, act);
-                    else act();
-                  }}
-                  style={{
-                    display: "block",
-                    width: "100%",
-                    padding: "6px 12px",
-                    border: 0,
-                    borderRadius: 4,
-                    background: activeItem === i ? "#f2f8fd" : "transparent",
-                    outline: activeItem === i ? "2px solid #0972d3" : "none",
-                    outlineOffset: -2,
-                    color: menu.editable ? "#000716" : "#8d99a8",
-                    cursor: menu.editable ? "pointer" : "default",
-                    font: "inherit",
-                    fontSize: 14,
-                    lineHeight: "20px",
-                    textAlign: "left",
+                    void runAction({
+                      kind: item.kind,
+                      iri: menu.iri,
+                      label: menu.label,
+                    });
                   }}
                 >
                   {t(item.text)}

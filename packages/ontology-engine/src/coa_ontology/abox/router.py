@@ -20,13 +20,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from coa_ontology.abox import build, mapping, queries, store
+from coa_ontology.abox.model import iri_tail
+from coa_ontology.abox.tbox import TBox, load_tbox
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, encode_next_token, page_body
 from coa_ontology.stores.neptune_db_graph import _iri
 from coa_ontology.versions import principal, registry, storage
-
-from . import build, mapping, queries, store
-from .model import iri_tail
-from .tbox import TBox, load_tbox
 
 _log = logging.getLogger("abox.router")
 # A deeper OFFSET is an expensive scan: the listing is narrowed with ``classIri`` or ``q`` instead.

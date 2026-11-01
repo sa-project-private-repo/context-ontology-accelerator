@@ -35,9 +35,8 @@ from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 from coa_ontology import dynamo_store
-
-from . import store
-from .tbox import TBox
+from coa_ontology.abox import store
+from coa_ontology.abox.tbox import TBox
 
 _log = logging.getLogger("abox.mapping")
 

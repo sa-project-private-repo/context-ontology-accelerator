@@ -401,6 +401,16 @@ describe("StudioPage", () => {
     expect(screen.getByText("Revision 2, built on v3, 2 classes")).toBeTruthy();
   });
 
+  it("names the draft after its proposal when the label is not text", async () => {
+    getProposal.mockResolvedValue({
+      proposal_id: "p-1",
+      status: "updated",
+      metadata: { label: 7 },
+    });
+    renderPage();
+    expect(await screen.findByText("Proposal p-1")).toBeTruthy();
+  });
+
   describe("context-menu actions", () => {
     it("says that keeping the properties of a deleted class drops their table mappings", async () => {
       renderPage();

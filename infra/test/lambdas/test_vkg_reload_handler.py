@@ -3,9 +3,12 @@
 
 """Unit tests for VKG reload Lambda handler."""
 
+from __future__ import annotations
+
 import json
 import os
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -37,6 +40,10 @@ def _make_event(namespace="test-ns", version="v1"):
 # Depth-1 files in ``latest/`` after a deploy, and what ``clear_latest`` leaves behind.
 SERVABLE_LATEST = ("ontology.ttl", "mappings.r2rml", "schema.sql", "examples.json")
 EMPTIED_LATEST = ("examples.json",)
+# When the files in ``latest/`` were written, and when running tasks were created:
+# after them, as once a deploy's reload has run, unless a test says otherwise.
+LATEST_WRITTEN = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+TASKS_CREATED = LATEST_WRITTEN + timedelta(minutes=5)
 
 
 def _answer_latest(mock_s3, by_namespace=None, default=SERVABLE_LATEST):
@@ -45,7 +52,8 @@ def _answer_latest(mock_s3, by_namespace=None, default=SERVABLE_LATEST):
 
     def paginate(Bucket, Prefix, Delimiter):
         ns = Prefix.split("/")[1]
-        return [{"Contents": [{"Key": Prefix + name} for name in by_namespace.get(ns, default)]}]
+        names = by_namespace.get(ns, default)
+        return [{"Contents": [{"Key": Prefix + name, "LastModified": LATEST_WRITTEN} for name in names]}]
 
     mock_s3.get_paginator.return_value.paginate.side_effect = paginate
 
@@ -100,6 +108,16 @@ def _dispatched(index):
         (c.kwargs["FunctionName"], c.kwargs["InvocationType"], json.loads(c.kwargs["Payload"]))
         for c in index.lambda_client.invoke.call_args_list
     ]
+
+
+def _run_sweep(index, event):
+    """Run a sweep, then every invocation it dispatched, as Lambda would.
+
+    Returns the sweep's own result and ``{namespace: status}`` of the dispatched runs.
+    """
+    sweep = index.handler(event, None)
+    runs = {payload["sweep_namespace"]: index.handler(payload, None)["status"] for _, _, payload in _dispatched(index)}
+    return sweep, runs
 
 
 def _reload_failed_for(index):
@@ -1185,13 +1203,413 @@ class TestSweep:
         assert result["total"] == 2  # the non-vkg service is filtered out
         assert result["dispatched"] == 2
         assert _dispatched(index) == [
-            ("coa-dev-vkg-reload", "Event", {"sweep_namespace": "ns1"}),
-            ("coa-dev-vkg-reload", "Event", {"sweep_namespace": "ns2"}),
+            ("coa-dev-vkg-reload", "Event", {"sweep_namespace": "ns1", "trigger": "schedule"}),
+            ("coa-dev-vkg-reload", "Event", {"sweep_namespace": "ns2", "trigger": "schedule"}),
         ]
         # Reconciling is left to the per-namespace invocations.
         mock_ecs.describe_services.assert_not_called()
         mock_ecs.update_service.assert_not_called()
         mock_s3.get_paginator.return_value.paginate.assert_not_called()
+
+    @staticmethod
+    def _load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr=None):
+        import importlib
+
+        import index
+
+        mock_ecs.exceptions.ServiceNotFoundException = type("ServiceNotFoundException", (Exception,), {})
+        mock_ecs.exceptions.ServiceNotActiveException = type("ServiceNotActiveException", (Exception,), {})
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "d"}]}}
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.ecr = mock_ecr if mock_ecr is not None else MagicMock()
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+        return index
+
+    # A tag that CI pushes again for every build, as in `{repo}:{name}-latest`.
+    REUSED_TAG = "111111111111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-latest"
+    OLD_DIGEST = "sha256:" + "a" * 64
+    NEW_DIGEST = "sha256:" + "b" * 64
+
+    @staticmethod
+    def _running(mock_ecs, digest_by_service, created=TASKS_CREATED):
+        """Running tasks per service, each reporting the given image digest and creation time."""
+        mock_ecs.list_tasks.side_effect = lambda cluster, serviceName, desiredStatus: {
+            "taskArns": [f"arn:task/{serviceName}"] if serviceName in digest_by_service else []
+        }
+        mock_ecs.describe_tasks.side_effect = lambda cluster, tasks: {
+            "tasks": [
+                {"createdAt": created, "containers": [{"imageDigest": digest_by_service[t.split("/", 1)[1]]}]}
+                for t in tasks
+            ]
+        }
+
+    @staticmethod
+    def _tag_points_at(mock_ecr, digest):
+        mock_ecr.describe_images.return_value = {"imageDetails": [{"imageDigest": digest}]}
+
+    @classmethod
+    def _same_uri_everywhere(cls, mock_ssm, mock_ecs, image, *namespaces):
+        """SSM and every service's task definition name the same image URI."""
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": image}}
+        cls._services(mock_ecs, *namespaces)
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:current"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": image}]}
+        }
+
+    @staticmethod
+    def _services(mock_ecs, *namespaces):
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"serviceArns": [f"arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-vkg-{ns}" for ns in namespaces]}
+        ]
+        mock_ecs.get_paginator.return_value = paginator
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_leaves_services_already_on_latest_image_alone(self, mock_ssm, mock_sd, mock_ecs):
+        """A service already running the image's current digest is not restarted (no update, no new revision)."""
+        self._same_uri_everywhere(mock_ssm, mock_ecs, self.REUSED_TAG, "ns1", "ns2")
+        self._running(mock_ecs, {"coa-dev-vkg-ns1": self.NEW_DIGEST, "coa-dev-vkg-ns2": self.NEW_DIGEST})
+        mock_ecr = MagicMock()
+        self._tag_points_at(mock_ecr, self.NEW_DIGEST)
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        sweep, runs = _run_sweep(index, {"sweep": True})
+
+        assert sweep["status"] == "sweep_dispatched"
+        assert sweep["total"] == 2
+        assert runs == {"ns1": "unchanged", "ns2": "unchanged"}
+        mock_ecs.update_service.assert_not_called()
+        mock_ecs.register_task_definition.assert_not_called()
+        mock_ecs.create_service.assert_not_called()
+        # Each namespace runs in its own invocation, so each looks the tag up once.
+        assert mock_ecr.describe_images.call_count == 2
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_moves_only_the_stale_services(self, mock_ssm, mock_sd, mock_ecs):
+        """In a mixed cluster only the service on an old image gets a new revision and deployment."""
+        new_image = self.REUSED_TAG.replace("vkg-latest", "vkg-new")
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": new_image}}
+        self._services(mock_ecs, "fresh", "stale")
+        mock_ecs.describe_services.side_effect = lambda cluster, services: {
+            "services": [{"taskDefinition": f"arn:td:{services[0]}"}]
+        }
+        mock_ecs.describe_task_definition.side_effect = lambda taskDefinition: {
+            "taskDefinition": {
+                "containerDefinitions": [{"image": new_image if taskDefinition.endswith("fresh") else "img:old"}]
+            }
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:stale-rev"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "d"}]}}
+        self._running(mock_ecs, {"coa-dev-vkg-fresh": self.NEW_DIGEST})
+        mock_ecr = MagicMock()
+        self._tag_points_at(mock_ecr, self.NEW_DIGEST)
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"fresh": "unchanged", "stale": "reload_triggered"}
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-stale",
+            taskDefinition="arn:td:stale-rev",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+        )
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_deploy_trigger_runs_the_sweep_against_the_ssm_image(self, mock_ssm, mock_sd, mock_ecs):
+        """The deploy-time payload runs the sweep; the target image still comes from SSM, not the payload."""
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "img:from-ssm"}}
+        self._services(mock_ecs, "ns1")
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "img:old"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:rev"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "d"}]}}
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs)
+
+        sweep, runs = _run_sweep(index, {"sweep": True, "trigger": "deploy", "image": "img:from-payload"})
+
+        assert sweep["status"] == "sweep_dispatched"
+        # Only the namespace and the trigger are passed on, never the payload's image.
+        assert [payload for _, _, payload in _dispatched(index)] == [{"sweep_namespace": "ns1", "trigger": "deploy"}]
+        assert runs == {"ns1": "reload_triggered"}
+        container = mock_ecs.register_task_definition.call_args.kwargs["containerDefinitions"][0]
+        assert container["image"] == "img:from-ssm"
+        # Read by the sweep (to fail fast) and again by the namespace's own invocation.
+        assert [c.kwargs for c in mock_ssm.get_parameter.call_args_list] == [{"Name": "/coa/vkg/container-image"}] * 2
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_deploy_trigger_with_unchanged_images_restarts_nothing(self, mock_ssm, mock_sd, mock_ecs):
+        """A deploy-time sweep where every service already runs the tag's digest is a pure no-op."""
+        self._same_uri_everywhere(mock_ssm, mock_ecs, self.REUSED_TAG, "ns1", "ns2", "ns3")
+        self._running(mock_ecs, {f"coa-dev-vkg-ns{i}": self.NEW_DIGEST for i in (1, 2, 3)})
+        mock_ecr = MagicMock()
+        self._tag_points_at(mock_ecr, self.NEW_DIGEST)
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True, "trigger": "deploy"})
+
+        assert runs == {"ns1": "unchanged", "ns2": "unchanged", "ns3": "unchanged"}
+        mock_ecs.update_service.assert_not_called()
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_restarts_a_reused_tag_that_points_at_a_new_build(self, mock_ssm, mock_sd, mock_ecs):
+        """Same URI text, new digest behind the tag: the service is restarted so ECS pulls the new build."""
+        self._same_uri_everywhere(mock_ssm, mock_ecs, self.REUSED_TAG, "ns1")
+        self._running(mock_ecs, {"coa-dev-vkg-ns1": self.OLD_DIGEST})
+        mock_ecr = MagicMock()
+        self._tag_points_at(mock_ecr, self.NEW_DIGEST)
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"ns1": "reload_triggered"}
+        mock_ecr.describe_images.assert_called_once_with(
+            registryId="111111111111", repositoryName="scl", imageIds=[{"imageTag": "vkg-latest"}]
+        )
+        mock_ecs.list_tasks.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"], serviceName="coa-dev-vkg-ns1", desiredStatus="RUNNING"
+        )
+        # Same URI -> no new revision, just a fresh deployment that re-resolves the tag.
+        mock_ecs.register_task_definition.assert_not_called()
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-ns1",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+        )
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_restarts_when_any_running_task_has_another_digest(self, mock_ssm, mock_sd, mock_ecs):
+        """One task on the old digest is enough to roll the service."""
+        self._same_uri_everywhere(mock_ssm, mock_ecs, self.REUSED_TAG, "ns1")
+        mock_ecs.list_tasks.return_value = {"taskArns": ["t1", "t2"]}
+        mock_ecs.describe_tasks.return_value = {
+            "tasks": [
+                {"containers": [{"imageDigest": self.NEW_DIGEST}]},
+                {"containers": [{"imageDigest": self.OLD_DIGEST}]},
+            ]
+        }
+        mock_ecr = MagicMock()
+        self._tag_points_at(mock_ecr, self.NEW_DIGEST)
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"ns1": "reload_triggered"}
+        mock_ecs.update_service.assert_called_once()
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_digest_pinned_uri_needs_no_registry_lookup(self, mock_ssm, mock_sd, mock_ecs):
+        """A URI pinned with @sha256: is its own digest: equal -> unchanged, without calling ECR."""
+        pinned = f"111111111111.dkr.ecr.us-west-2.amazonaws.com/scl@{self.NEW_DIGEST}"
+        self._same_uri_everywhere(mock_ssm, mock_ecs, pinned, "same", "other")
+        self._running(mock_ecs, {"coa-dev-vkg-same": self.NEW_DIGEST, "coa-dev-vkg-other": self.OLD_DIGEST})
+        mock_ecr = MagicMock()
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"same": "unchanged", "other": "reload_triggered"}
+        mock_ecr.describe_images.assert_not_called()
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_falls_back_to_force_new_deployment_when_the_registry_lookup_fails(self, mock_ssm, mock_sd, mock_ecs):
+        """ECR error -> digest unknown -> restart as before; a lookup failure never stops a rollout."""
+        self._same_uri_everywhere(mock_ssm, mock_ecs, self.REUSED_TAG, "ns1")
+        self._running(mock_ecs, {"coa-dev-vkg-ns1": self.NEW_DIGEST})
+        mock_ecr = MagicMock()
+        mock_ecr.describe_images.side_effect = Exception("AccessDeniedException")
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"ns1": "reload_triggered"}
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-ns1",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+        )
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_falls_back_to_force_new_deployment_when_task_digests_are_unknown(self, mock_ssm, mock_sd, mock_ecs):
+        """No running task, an ECS error, or a task without a digest -> restart as before."""
+        self._same_uri_everywhere(mock_ssm, mock_ecs, self.REUSED_TAG, "none", "err", "nodigest")
+
+        def list_tasks(cluster, serviceName, desiredStatus):
+            if serviceName.endswith("err"):
+                raise Exception("ThrottlingException")
+            return {"taskArns": [] if serviceName.endswith("none") else ["t1"]}
+
+        mock_ecs.list_tasks.side_effect = list_tasks
+        mock_ecs.describe_tasks.return_value = {"tasks": [{"containers": [{"name": "ontop"}]}]}
+        mock_ecr = MagicMock()
+        self._tag_points_at(mock_ecr, self.NEW_DIGEST)
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"none": "reload_triggered", "err": "reload_triggered", "nodigest": "reload_triggered"}
+        assert mock_ecs.update_service.call_count == 3
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_restarts_when_the_image_is_not_in_ecr(self, mock_ssm, mock_sd, mock_ecs):
+        """A non-ECR image's digest cannot be resolved, so the service is restarted as before."""
+        self._same_uri_everywhere(mock_ssm, mock_ecs, "public.example/vkg:latest", "ns1")
+        self._running(mock_ecs, {"coa-dev-vkg-ns1": self.NEW_DIGEST})
+        mock_ecr = MagicMock()
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"ns1": "reload_triggered"}
+        mock_ecr.describe_images.assert_not_called()
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_restores_a_service_at_zero_even_on_the_current_digest(self, mock_ssm, mock_sd, mock_ecs):
+        """The digest skip never leaves a servable namespace at zero, even while its
+        stopping tasks still report the digest the tag points at."""
+        self._same_uri_everywhere(mock_ssm, mock_ecs, self.REUSED_TAG, "ns1")
+        mock_ecs.describe_services.return_value = _service(0)
+        self._running(mock_ecs, {"coa-dev-vkg-ns1": self.NEW_DIGEST})
+        mock_ecr = MagicMock()
+        self._tag_points_at(mock_ecr, self.NEW_DIGEST)
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"ns1": "reload_triggered"}
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-ns1",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+            desiredCount=1,
+        )
+        assert index.autoscaling.register_scalable_target.call_args.kwargs["MinCapacity"] == 1
+
+    @pytest.mark.parametrize(
+        "created",
+        [
+            pytest.param(LATEST_WRITTEN - timedelta(days=2), id="task-older-than-latest"),
+            pytest.param(None, id="task-age-unknown"),
+        ],
+    )
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_restarts_a_current_digest_service_that_has_not_loaded_latest(
+        self, mock_ssm, mock_sd, mock_ecs, created
+    ):
+        """VKG reads latest/ only when a task starts. A task on the current digest created
+        before the files there were written missed that deploy's ontology.deployed (lost
+        or late), so the sweep restarts it to load them; so it does when the age is unknown."""
+        self._same_uri_everywhere(mock_ssm, mock_ecs, self.REUSED_TAG, "ns1")
+        mock_ecs.describe_services.return_value = _service(1)
+        self._running(mock_ecs, {"coa-dev-vkg-ns1": self.NEW_DIGEST}, created=created)
+        mock_ecr = MagicMock()
+        self._tag_points_at(mock_ecr, self.NEW_DIGEST)
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"ns1": "reload_triggered"}
+        mock_ecs.register_task_definition.assert_not_called()
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-ns1",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+        )
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_ignores_latest_files_vkg_does_not_load(self, mock_ssm, mock_sd, mock_ecs, mock_s3):
+        """Only the files VKG loads count: an examples.json written after the tasks were
+        created does not restart a service that already serves the deployed files."""
+        vkg_files = ("ontology.ttl", "mappings.r2rml", "schema.sql")
+        mock_s3.get_paginator.return_value.paginate.side_effect = lambda Bucket, Prefix, Delimiter: [
+            {
+                "Contents": [{"Key": Prefix + name, "LastModified": LATEST_WRITTEN} for name in vkg_files]
+                + [{"Key": Prefix + "examples.json", "LastModified": TASKS_CREATED + timedelta(days=1)}]
+            }
+        ]
+        self._same_uri_everywhere(mock_ssm, mock_ecs, self.REUSED_TAG, "ns1")
+        self._running(mock_ecs, {"coa-dev-vkg-ns1": self.NEW_DIGEST})
+        mock_ecr = MagicMock()
+        self._tag_points_at(mock_ecr, self.NEW_DIGEST)
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs, mock_ecr)
+
+        _, runs = _run_sweep(index, {"sweep": True})
+
+        assert runs == {"ns1": "unchanged"}
+        mock_ecs.update_service.assert_not_called()
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_ontology_publish_still_restarts_a_service_on_the_latest_image(self, mock_ssm, mock_sd, mock_ecs):
+        """The skip is sweep-only: a publish must restart the task so it loads the new mappings."""
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "img:same"}}
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:current"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "img:same"}]}
+        }
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "d"}]}}
+        index = self._load_index(mock_ssm, mock_sd, mock_ecs)
+
+        result = index.handler(_make_event(), None)
+
+        assert result["status"] == "reload_triggered"
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-test-ns",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+        )
 
     @patch.dict(os.environ, ENV)
     @patch("index.ecs")

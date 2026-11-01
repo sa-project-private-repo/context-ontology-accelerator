@@ -23,6 +23,7 @@ import StatusIndicator, {
 import Table from "@cloudscape-design/components/table";
 import { useCanManageOntology } from "@api-hooks/use-can-manage-ontology";
 import { formatTimestamp } from "@utils/helpers";
+import { objectField } from "@utils/object-field";
 import { ApiError, type ApiClient } from "@components/ApiClientProvider";
 import type { AppMessage } from "../../../i18n/appMessages";
 import { useAppI18n, type AppTranslate } from "../../../i18n/LocaleProvider";
@@ -111,12 +112,6 @@ function actionAriaLabel(
   if (action === "Redeploy")
     return t("Redeploy version {version}", { version });
   return t("Deploy version {version}", { version });
-}
-
-function objectField(value: unknown, key: string): unknown {
-  return value && typeof value === "object" && key in value
-    ? Reflect.get(value, key)
-    : undefined;
 }
 
 function isBreakingMetric(value: unknown): value is BreakingMetric {

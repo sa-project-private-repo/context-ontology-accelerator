@@ -34,8 +34,7 @@ from botocore.exceptions import ClientError
 
 from coa_ontology import dynamo_store
 from coa_ontology.abox.store import from_dynamo
-
-from . import draft as store
+from coa_ontology.studio import draft as store
 
 CHAT_SK = "STUDIOCHAT"
 TURN_SK_PREFIX = "STUDIOTURN#"

@@ -1,0 +1,73 @@
+/* Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+   SPDX-License-Identifier: Apache-2.0 */
+
+/* Ontology designer. The colours are Cloudscape design tokens, written as the
+   custom properties they resolve to, with their light-mode values as
+   fallbacks: Cloudscape gives each one another value in dark mode, so these
+   rules follow the mode as its components do. studio-css.test.ts checks that
+   the installed Cloudscape still does. */
+
+/* The graph's right-click menu (StudioGraph), drawn as a Cloudscape dropdown.
+   The element sets its position and width. */
+.coa-graph-menu {
+  position: fixed;
+  z-index: 1000;
+  padding: 4px;
+  border: 1px solid var(--color-border-dropdown-container-cmthq7, #b4b4bb);
+  border-radius: 6px;
+  background: var(--color-background-dropdown-item-default-qmc033, #ffffff);
+  box-shadow: var(
+    --shadow-dropdown-isf0w4,
+    0px 4px 20px 1px rgba(0, 7, 22, 0.1)
+  );
+}
+
+/* Scoped to the menu, so that the global button rules (Firefox's focus ring
+   among them) do not override them. */
+.coa-graph-menu .coa-graph-menu-item {
+  display: block;
+  width: 100%;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 4px;
+  outline: none;
+  outline-offset: -2px;
+  background: transparent;
+  color: var(--color-text-dropdown-item-default-f1jr9u, #0f141a);
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  line-height: 20px;
+  text-align: left;
+}
+
+/* The item with the focus, which the arrow keys and the pointer move. */
+.coa-graph-menu .coa-graph-menu-item-active {
+  outline: 2px solid var(--color-border-item-focused-uk47pl, #006ce0);
+  background: var(--color-background-dropdown-item-hover-yunepc, #f3f3f7);
+}
+
+/* The actions of a class the draft cannot change. */
+.coa-graph-menu .coa-graph-menu-item[aria-disabled="true"] {
+  color: var(--color-text-dropdown-item-disabled-8m65hf, #b4b4bb);
+  cursor: default;
+}
+
+/* The query box of the Query tab (QueryConsole). */
+.coa-query-text {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 2px solid var(--color-border-input-default-317xk5, #8c8c94);
+  border-radius: 8px;
+  background: var(--color-background-input-default-ifz5bb, #ffffff);
+  color: var(--color-text-body-default-vvtq8u, #0f141a);
+  font-family: Monaco, Menlo, Consolas, monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+/* A query too long, or too large to send. */
+.coa-query-text-invalid {
+  border-color: var(--color-border-status-error-j8acpp, #db0000);
+}

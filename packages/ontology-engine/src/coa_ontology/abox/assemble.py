@@ -24,9 +24,20 @@ from urllib.parse import unquote
 from rdflib import Graph, Literal, URIRef
 from rdflib.namespace import RDF, RDFS, SKOS
 
-from . import model as m
-from .mapping import ACTIVE, ATTRIBUTE, CLASS, FREE, IGNORE, INVERSE, RELATION, MappingRow, mapping_id, valid_target
-from .tbox import TBox
+from coa_ontology.abox import model as m
+from coa_ontology.abox.mapping import (
+    ACTIVE,
+    ATTRIBUTE,
+    CLASS,
+    FREE,
+    IGNORE,
+    INVERSE,
+    RELATION,
+    MappingRow,
+    mapping_id,
+    valid_target,
+)
+from coa_ontology.abox.tbox import TBox
 
 MAX_EVIDENCE = 5
 

@@ -33,6 +33,7 @@ import {
   MAX_REQUEST_BYTES,
   requestBytes,
 } from "./studio-helpers";
+import "./studio.css";
 
 /** What a console query reads. */
 export type ConsoleTarget = "draft" | "lexical" | "vkg";
@@ -327,8 +328,10 @@ export function QueryConsole({
           selectedOption={targets.find((o) => o.value === target) ?? null}
           options={targets}
           onChange={({ detail }) => {
-            const next = detail.selectedOption.value as ConsoleTarget;
-            if (next === target) return;
+            const next = TARGETS.find(
+              (o) => o.value === detail.selectedOption.value,
+            )?.value;
+            if (!next || next === target) return;
             // The rows shown, and a run still on its way, read the other
             // target: under this one they would read as its answer.
             runs.current++;
@@ -349,17 +352,11 @@ export function QueryConsole({
         onKeyDown={(e) => {
           if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) void run();
         }}
-        style={{
-          width: "100%",
-          boxSizing: "border-box",
-          fontFamily: "Monaco, Menlo, Consolas, monospace",
-          fontSize: 12,
-          padding: 8,
-          borderRadius: 8,
-          border:
-            tooLong || tooLarge ? "2px solid #d91515" : "2px solid #8c8c94",
-          resize: "vertical",
-        }}
+        className={
+          tooLong || tooLarge
+            ? "coa-query-text coa-query-text-invalid"
+            : "coa-query-text"
+        }
       />
       <SpaceBetween direction="horizontal" size="xs" alignItems="center">
         <Button

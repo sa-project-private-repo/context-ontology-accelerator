@@ -13,6 +13,9 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as servicediscovery from "aws-cdk-lib/aws-servicediscovery";
 import * as ssm from "aws-cdk-lib/aws-ssm";
+import * as cr from "aws-cdk-lib/custom-resources";
+import { DockerImageAsset, Platform } from "aws-cdk-lib/aws-ecr-assets";
+import { randomUUID } from "crypto";
 import { Construct } from "constructs";
 import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/alarm/action";
 
@@ -71,6 +74,7 @@ export interface VkgStackProps extends cdk.StackProps {
  * - ECS cluster for per-namespace VKG Fargate tasks
  * - Task definition template (image, roles, logging)
  * - Reload Lambda (EventBridge → provision or restart per-namespace service)
+ * - Deploy-time rollout (custom resource → async sweep when the image changes)
  * - SSM parameters (cluster ARN, image URI, endpoint pattern)
  */
 export class VkgStack extends SCLStack {
@@ -145,6 +149,13 @@ export class VkgStack extends SCLStack {
       | undefined;
 
     let containerImage: ecs.ContainerImage;
+    // The ECR repository the image lives in; the reload Lambda reads the
+    // digest a tag currently points at from it (ecr:DescribeImages).
+    let imageRepositoryArn: string;
+    // A CI-supplied tag may be pushed again for a new build (e.g. `-latest`),
+    // so the URI alone does not say whether the image changed. An asset image
+    // is tagged with its content hash, so its URI changes exactly when it does.
+    let imageTagMayBeReused: boolean;
     if (vkgImageUri && ecrRepositoryArn && ecrRepositoryName) {
       const ecrRepo = cdk.aws_ecr.Repository.fromRepositoryAttributes(
         this,
@@ -155,10 +166,19 @@ export class VkgStack extends SCLStack {
         ecrRepo,
         vkgImageUri.split(":").pop() || "latest",
       );
+      imageRepositoryArn = ecrRepositoryArn;
+      imageTagMayBeReused = !vkgImageUri.includes("@sha256:");
     } else {
-      containerImage = ecs.ContainerImage.fromAsset("../packages/vkg", {
-        platform: cdk.aws_ecr_assets.Platform.LINUX_ARM64,
+      // Same asset (and so the same content-hash image URI) that
+      // ContainerImage.fromAsset builds; created explicitly so its repository
+      // is known for the reload Lambda's least-privilege ECR read.
+      const imageAsset = new DockerImageAsset(this, "VkgImageAsset", {
+        directory: "../packages/vkg",
+        platform: Platform.LINUX_ARM64,
       });
+      containerImage = ecs.ContainerImage.fromDockerImageAsset(imageAsset);
+      imageRepositoryArn = imageAsset.repository.repositoryArn;
+      imageTagMayBeReused = false;
     }
 
     taskDef.addContainer("OntopContainer", {
@@ -271,7 +291,10 @@ export class VkgStack extends SCLStack {
         VKG_TASK_MEMORY: String(memoryLimitMiB),
         VKG_ONTOP_JAVA_ARGS: ontopJavaArgs,
       },
-      timeout: cdk.Duration.seconds(30),
+      // A sweep run lists the services and invokes this function once per
+      // namespace, which grows with the namespace count, and one namespace's
+      // run may act on latest/ up to four times; 2 minutes leaves room for both.
+      timeout: cdk.Duration.minutes(2),
       reservedConcurrentExecutions: reservedConcurrency,
       logRetention: logs.RetentionDays.ONE_MONTH,
       vpc,
@@ -302,6 +325,32 @@ export class VkgStack extends SCLStack {
         conditions: {
           ArnEquals: { "ecs:cluster": this.cluster.clusterArn },
         },
+      }),
+    );
+    reloadFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        // The sweep compares the digest of each service's running tasks with
+        // the digest the image tag points at, so a reused tag still rolls out.
+        // ecs:ListTasks has no resource type either; scoped by ecs:cluster.
+        actions: ["ecs:ListTasks"],
+        resources: ["*"],
+        conditions: {
+          ArnEquals: { "ecs:cluster": this.cluster.clusterArn },
+        },
+      }),
+    );
+    reloadFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["ecs:DescribeTasks"],
+        resources: [
+          `arn:aws:ecs:${this.region}:${this.account}:task/${this.cluster.clusterName}/*`,
+        ],
+      }),
+    );
+    reloadFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["ecr:DescribeImages"],
+        resources: [imageRepositoryArn],
       }),
     );
     reloadFn.addToRolePolicy(
@@ -398,8 +447,9 @@ export class VkgStack extends SCLStack {
     );
     vkgImageParam.grantRead(reloadFn);
     // The handler lists ontologies/{ns}/latest/ to decide between reloading and
-    // scaling to zero (ListObjectsV2 is authorized as s3:ListBucket), scoped to
-    // those prefixes only.
+    // scaling to zero, and in a sweep whether the running tasks predate those
+    // files (ListObjectsV2 is authorized as s3:ListBucket), scoped to those
+    // prefixes only.
     reloadFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["s3:ListBucket"],
@@ -464,13 +514,16 @@ export class VkgStack extends SCLStack {
     // base-image digest bumps never reach a running task, leaving stale
     // (Inspector-flagged) VKG images. The sweep closes that gap. Like an event,
     // it first matches serving to the files in latest/ (scale to zero without
-    // them, back to one with them), which also repairs a lost event. A running
-    // service is force-deployed even when the image already matches (its task
-    // restarts), and each reload deploys with the circuit-breaker + rollback in
-    // the handler, so a bad image self-heals. The {sweep:true} invocation only
-    // lists the services and asynchronously invokes the function once per
-    // namespace ({sweep_namespace}), so each namespace has its own timeout and
-    // retries instead of the whole sweep sharing one 30 s run.
+    // them, back to one with them), which also repairs a lost event. It is a
+    // no-op for a running service whose tasks already have the image's current
+    // digest and were created after its files in latest/ were written (the
+    // handler skips the service). A task created before them missed a lost or
+    // late event and is restarted, since VKG reads latest/ only at task start.
+    // Each reload deploys with the circuit-breaker + rollback in the handler,
+    // so a bad image self-heals. The {sweep:true} invocation only lists the
+    // services and asynchronously invokes the function once per namespace
+    // ({sweep_namespace}), so each namespace has its own timeout and retries
+    // instead of the whole sweep sharing one run.
     new events.Rule(this, "VkgReloadSweepRule", {
       ruleName: this.prefixed("vkg-reload-sweep"),
       schedule: events.Schedule.rate(cdk.Duration.days(7)),
@@ -480,6 +533,60 @@ export class VkgStack extends SCLStack {
         }),
       ],
     });
+
+    // Deploy-time rollout: after a deploy that may have changed the VKG image,
+    // run the same sweep once so existing namespaces move to it right away
+    // instead of at the next weekly sweep. The image URI is part of the
+    // payload, so CloudFormation calls this whenever the URI changes (and once
+    // on create). When the image comes from a CI tag that can be pushed again
+    // for a new build, the URI cannot show a change, so a per-synth deploy id
+    // makes it run on every deploy; the sweep compares digests, so services
+    // already on the image the tag points at (and on the files in their
+    // latest/) are not restarted. The invoke is
+    // asynchronous (InvocationType Event): a slow or failing ECS rollout (e.g. a
+    // namespace with broken ontology artifacts) never blocks or rolls back the
+    // deploy, and an ECS API error in the sweep raises the ReloadFailed alarm
+    // below (a task that never goes healthy is rolled back by the circuit
+    // breaker in the handler's deployment configuration).
+    // The handler reads the image from SSM, so the parameter must be written
+    // before the invoke (explicit dependency).
+    const imageRolloutCall: cr.AwsSdkCall = {
+      service: "Lambda",
+      action: "invoke",
+      parameters: {
+        FunctionName: reloadFn.functionName,
+        InvocationType: "Event",
+        Payload: this.toJsonString({
+          sweep: true,
+          trigger: "deploy",
+          image: ontopContainer.imageName,
+          ...(imageTagMayBeReused ? { deployId: randomUUID() } : {}),
+        }),
+      },
+      outputPaths: ["StatusCode"],
+      physicalResourceId: cr.PhysicalResourceId.of(
+        this.prefixed("vkg-image-rollout"),
+      ),
+    };
+    const imageRollout = new cr.AwsCustomResource(this, "VkgImageRollout", {
+      functionName: this.prefixed("vkg-image-rollout"),
+      installLatestAwsSdk: false,
+      logGroup: new logs.LogGroup(this, "VkgImageRolloutLogs", {
+        logGroupName: `/aws/lambda/${this.prefixed("vkg-image-rollout")}`,
+        retention: logs.RetentionDays.ONE_MONTH,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      onCreate: imageRolloutCall,
+      onUpdate: imageRolloutCall,
+      policy: cr.AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions: ["lambda:InvokeFunction"],
+          resources: [reloadFn.functionArn],
+        }),
+      ]),
+    });
+    imageRollout.node.addDependency(vkgImageParam);
+    imageRollout.node.addDependency(reloadFn);
 
     // ================================================================
     // OE monitoring (cdk-monitoring-constructs)

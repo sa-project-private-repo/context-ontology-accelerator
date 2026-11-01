@@ -37,13 +37,17 @@ from typing import TYPE_CHECKING, Any
 
 from coa_common.language_tags import DEFAULT_LANGUAGE, describe_language, primary_language
 from rdflib import URIRef
+from strands import Agent, tool
+from strands.hooks import AfterModelCallEvent, AfterToolCallEvent, BeforeToolCallEvent, HookProvider
+from strands.models import BedrockModel
+from strands.tools.executors import SequentialToolExecutor
+from strands.types.exceptions import MaxTokensReachedException
 
 from coa_ontology.catalog.namespace_language import namespace_language
-
-from . import agent_tools, changesets, chat_store, questions
-from . import draft as store
-from .iris import check_iri
-from .ops import KIND_WORDS, kind_of, label_of
+from coa_ontology.studio import agent_tools, changesets, chat_store, questions
+from coa_ontology.studio import draft as store
+from coa_ontology.studio.iris import check_iri
+from coa_ontology.studio.ops import KIND_WORDS, kind_of, label_of
 
 if TYPE_CHECKING:
     from strands.models.model import Model
@@ -192,16 +196,12 @@ class Deps:
 
 
 def _bedrock_model() -> Model:
-    from strands.models import BedrockModel
-
     # No temperature: newer Claude models reject a non-default one (see abox.matcher.bedrock_judge).
     return BedrockModel(model_id=MODEL_ID, region_name=os.getenv("AWS_REGION", "us-east-1"), max_tokens=MAX_TOKENS)
 
 
 def _summarizer(model: Callable[[], Model]) -> Callable[[str, list[dict[str, str]]], str]:
     def summarize(previous: str, messages: list[dict[str, str]]) -> str:
-        from strands import Agent
-
         summary_agent = Agent(model=model(), tools=[], system_prompt=SUMMARY_PROMPT, callback_handler=None)
         timer = threading.Timer(SUMMARY_SECONDS, summary_agent.cancel)
         timer.daemon = True
@@ -359,8 +359,6 @@ def _result_text(result: Any) -> str:
 
 
 def _hooks(run: _Run, log: chat_store.EventLog, tools: agent_tools.TurnTools) -> Any:
-    from strands.hooks import AfterModelCallEvent, AfterToolCallEvent, BeforeToolCallEvent, HookProvider
-
     def emit(type_: str, **fields: Any) -> None:
         if run.lost:
             return
@@ -411,7 +409,6 @@ def _hooks(run: _Run, log: chat_store.EventLog, tools: agent_tools.TurnTools) ->
 
 def _strands_tools(tools: agent_tools.TurnTools) -> list[Any]:
     """The nine tools as the model sees them; each docstring is its description."""
-    from strands import tool
 
     @tool
     def get_overview() -> str:
@@ -661,10 +658,6 @@ def _check_follow_up(turn: Turn, tools: agent_tools.TurnTools, run: _Run) -> str
 
 def _converse(namespace: str, proposal_id: str, turn: Turn, deps: Deps, run: _Run) -> tuple[str, str]:
     """Run the agent; return the status the turn ends with and the answer."""
-    from strands import Agent
-    from strands.tools.executors import SequentialToolExecutor
-    from strands.types.exceptions import MaxTokensReachedException
-
     log = turn.log
     emit_box: list[Callable[..., None]] = []
 

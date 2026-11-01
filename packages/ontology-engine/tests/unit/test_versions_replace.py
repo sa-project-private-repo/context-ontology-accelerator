@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Replace-mode publish (Ontology designer drafts) and shape pruning."""
 
+from __future__ import annotations
+
 import dataclasses
 import json
 from unittest.mock import patch

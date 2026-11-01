@@ -537,20 +537,25 @@ function FullValidation({
   useEffect(() => {
     if (!polling || !jobId) return;
     const handle = window.setTimeout(() => {
-      getProposalValidationJob(apiClient, namespace, proposalId, jobId).then(
-        (next) => {
+      void (async () => {
+        try {
+          const next = await getProposalValidationJob(
+            apiClient,
+            namespace,
+            proposalId,
+            jobId,
+          );
           if (!mounted.current) return;
           setJob(next);
           setError(null);
           setFailedPolls(0);
-        },
-        (e: unknown) => {
+        } catch (e) {
           if (!mounted.current) return;
           setError(errorMessage(e, t));
           // The new count runs this effect again, which reads again.
           setFailedPolls((n) => n + 1);
-        },
-      );
+        }
+      })();
     }, VALIDATION_POLL_MS);
     return () => window.clearTimeout(handle);
   }, [apiClient, namespace, proposalId, jobId, polling, job, failedPolls, t]);

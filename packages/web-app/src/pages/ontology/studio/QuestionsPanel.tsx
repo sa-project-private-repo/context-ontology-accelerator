@@ -282,8 +282,9 @@ export function QuestionsPanel({
       {questions?.length === 0 && (
         <Box color="text-body-secondary">{t("No question yet.")}</Box>
       )}
-      {questions?.map((q) =>
-        editing?.questionId === q.questionId ? (
+      {questions?.map((q) => {
+        const lastQuery = q.lastCheck?.query;
+        return editing?.questionId === q.questionId ? (
           <Container key={q.questionId}>
             <QuestionForm
               editing={editing}
@@ -354,12 +355,12 @@ export function QuestionsPanel({
                 >
                   {t("Check")}
                 </Button>
-                {q.lastCheck?.query && (
+                {lastQuery && (
                   <Button
                     ariaLabel={t('Open query of question "{question}"', {
                       question: q.text,
                     })}
-                    onClick={() => onOpenQuery(q.lastCheck!.query!)}
+                    onClick={() => onOpenQuery(lastQuery)}
                   >
                     {t("Open query")}
                   </Button>
@@ -394,8 +395,8 @@ export function QuestionsPanel({
               </SpaceBetween>
             </SpaceBetween>
           </Container>
-        ),
-      )}
+        );
+      })}
       {editable && (
         <Container>
           <QuestionForm

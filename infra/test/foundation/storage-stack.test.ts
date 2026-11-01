@@ -2,14 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as cdk from "aws-cdk-lib";
-import { Template, Match } from "aws-cdk-lib/assertions";
+import { Annotations, Template, Match } from "aws-cdk-lib/assertions";
 import { NetworkStack } from "../../lib/stacks/foundation/network-stack";
 import { StorageStack } from "../../lib/stacks/foundation/storage-stack";
 
 const TEST_ENV = { account: "123456789012", region: "us-east-1" };
 
-function buildStacks(): { network: NetworkStack; template: Template } {
-  const app = new cdk.App();
+function buildStacks(context: Record<string, string> = {}): {
+  network: NetworkStack;
+  template: Template;
+} {
+  const app = new cdk.App({ context });
   const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
   const storage = new StorageStack(app, "TestStorage", {
     network,
@@ -80,9 +83,12 @@ describe("StorageStack", () => {
         network,
         env: TEST_ENV,
       });
-      Template.fromStack(storage).hasResourceProperties("AWS::Neptune::DBInstance", {
-        DBInstanceClass: "db.r8g.2xlarge",
-      });
+      Template.fromStack(storage).hasResourceProperties(
+        "AWS::Neptune::DBInstance",
+        {
+          DBInstanceClass: "db.r8g.2xlarge",
+        },
+      );
     });
 
     it("applies DESTROY removal policy to cluster and instance", () => {
@@ -129,6 +135,98 @@ describe("StorageStack", () => {
           },
         },
       );
+    });
+
+    it("allows the created aoss-data endpoint in the network policy", () => {
+      const { template } = buildStacks();
+      template.hasResourceProperties(
+        "AWS::OpenSearchServerless::SecurityPolicy",
+        {
+          Type: "network",
+          Policy: {
+            "Fn::Join": [
+              "",
+              Match.arrayWith([
+                Match.stringLikeRegexp('"SourceVPCEs":\\["$'),
+                {
+                  "Fn::ImportValue": Match.stringLikeRegexp("AossEndpoint"),
+                },
+              ]),
+            ],
+          },
+        },
+      );
+    });
+
+    it.each(["dev", "tst", "demo", "pentest", "beta", "prod", undefined])(
+      "network policy is VPC-only for env=%s",
+      (envName) => {
+        const app = new cdk.App();
+        if (envName) app.node.setContext("env", envName);
+        const network = new NetworkStack(app, "N", { env: TEST_ENV });
+        const storage = new StorageStack(app, "S", { network, env: TEST_ENV });
+        const policies = Template.fromStack(storage).findResources(
+          "AWS::OpenSearchServerless::SecurityPolicy",
+          { Properties: { Type: "network" } },
+        );
+        const docs = Object.values(policies).map((p) =>
+          JSON.stringify(p.Properties.Policy),
+        );
+        expect(docs).toHaveLength(1);
+        expect(docs[0]).toContain("SourceVPCEs");
+        expect(docs[0]).not.toContain("AllowFromPublic");
+      },
+    );
+
+    it.each(["dev", "tst"])(
+      "allows the supplied aoss-data endpoint when importing a VPC (env %s)",
+      (envName) => {
+        const { template } = buildStacks({
+          env: envName,
+          vpc_id: "vpc-0abc123",
+          aoss_vpc_endpoint_id: "vpce-0abc123def4567890",
+        });
+        const [policy] = Object.values(
+          template.findResources("AWS::OpenSearchServerless::SecurityPolicy", {
+            Properties: { Type: "network" },
+          }),
+        );
+        const rules = JSON.parse(String(policy.Properties.Policy));
+        expect(rules[0].SourceVPCEs).toEqual(["vpce-0abc123def4567890"]);
+      },
+    );
+
+    it("synthesizes an imported VPC with no explicit stack env, as app.ts does", () => {
+      // app.ts passes no env: the account and region come from the CDK CLI.
+      const saved = { ...process.env };
+      process.env.CDK_DEFAULT_ACCOUNT = "123456789012";
+      process.env.CDK_DEFAULT_REGION = "us-west-2";
+      try {
+        const app = new cdk.App({
+          context: {
+            env: "tst",
+            vpc_id: "vpc-0abc123",
+            aoss_vpc_endpoint_id: "vpce-0abc123def4567890",
+          },
+        });
+        const network = new NetworkStack(app, "TestNetwork");
+        const storage = new StorageStack(app, "TestStorage", { network });
+        const template = Template.fromStack(storage);
+
+        expect(storage.account).toBe(network.account);
+        expect(storage.region).toBe(network.region);
+        expect(storage.region).toBe("us-west-2");
+        const [policy] = Object.values(
+          template.findResources("AWS::OpenSearchServerless::SecurityPolicy", {
+            Properties: { Type: "network" },
+          }),
+        );
+        const rules = JSON.parse(String(policy.Properties.Policy));
+        expect(rules[0].SourceVPCEs).toEqual(["vpce-0abc123def4567890"]);
+        app.synth();
+      } finally {
+        process.env = { ...saved };
+      }
     });
 
     it("collection depends on encryption and network policies", () => {
@@ -314,6 +412,63 @@ describe("StorageStack", () => {
 
     it("rejects min OCU greater than max OCU", () => {
       expect(buildWithOcu(16, 8)).toThrow(/cannot exceed/);
+    });
+  });
+
+  describe("OCU capacity limits", () => {
+    // `cdk deploy --context aoss_min_ocu=4` (what deploy.sh passes) arrives as a string.
+    function storageWithContext(context: Record<string, string>): StorageStack {
+      const app = new cdk.App({ context });
+      const network = new NetworkStack(app, "TestNetwork", { env: TEST_ENV });
+      return new StorageStack(app, "TestStorage", { network, env: TEST_ENV });
+    }
+
+    function capacityLimits(min: number, max: number) {
+      return {
+        CapacityLimits: {
+          MinIndexingCapacityInOcu: min,
+          MinSearchCapacityInOcu: min,
+          MaxIndexingCapacityInOcu: max,
+          MaxSearchCapacityInOcu: max,
+        },
+      };
+    }
+
+    const ZERO_FLOOR_WARNING = Match.stringLikeRegexp("AOSS min OCU is 0");
+
+    it("defaults to a floor of 2 and a ceiling of 96 without a warning", () => {
+      const storage = storageWithContext({});
+      Template.fromStack(storage).hasResourceProperties(
+        "AWS::OpenSearchServerless::CollectionGroup",
+        capacityLimits(2, 96),
+      );
+      Annotations.fromStack(storage).hasNoWarning("*", ZERO_FLOOR_WARNING);
+    });
+
+    it("applies string context values to indexing and search", () => {
+      const storage = storageWithContext({
+        aoss_min_ocu: "4",
+        aoss_max_ocu: "32",
+      });
+      Template.fromStack(storage).hasResourceProperties(
+        "AWS::OpenSearchServerless::CollectionGroup",
+        capacityLimits(4, 32),
+      );
+    });
+
+    it("warns on a string floor of 0", () => {
+      const storage = storageWithContext({ aoss_min_ocu: "0" });
+      Template.fromStack(storage).hasResourceProperties(
+        "AWS::OpenSearchServerless::CollectionGroup",
+        capacityLimits(0, 96),
+      );
+      Annotations.fromStack(storage).hasWarning("*", ZERO_FLOOR_WARNING);
+    });
+
+    it("rejects an invalid string value", () => {
+      expect(() => storageWithContext({ aoss_min_ocu: "3" })).toThrow(
+        /min OCU must be/,
+      );
     });
   });
 });

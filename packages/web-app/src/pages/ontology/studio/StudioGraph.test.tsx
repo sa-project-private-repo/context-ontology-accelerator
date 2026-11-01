@@ -240,6 +240,25 @@ describe("StudioGraph", () => {
       expect(document.activeElement).toBe(items[0]);
     });
 
+    it("draws the menu with the designer stylesheet, which follows dark mode", () => {
+      render(<StudioGraph graph={graph()} {...props()} />);
+      const menu = openMenu("Customer");
+      // No inline colour: it would stay the light one in dark mode.
+      expect(menu.className).toBe("coa-graph-menu");
+      expect(menu.style.background).toBe("");
+      const [focused, other] = within(menu).getAllByRole("menuitem");
+      expect(focused.className).toBe(
+        "coa-graph-menu-item coa-graph-menu-item-active",
+      );
+      expect(other.className).toBe("coa-graph-menu-item");
+      expect(focused.style.background).toBe("");
+      expect(other.style.color).toBe("");
+      fireEvent.keyDown(menu, { key: "ArrowDown" });
+      expect(other.className).toBe(
+        "coa-graph-menu-item coa-graph-menu-item-active",
+      );
+    });
+
     it("closes on Escape and gives focus back to the node", () => {
       const { container } = render(
         <StudioGraph graph={graph()} {...props()} />,

@@ -22,6 +22,7 @@ import type {
   StudioChangeSetPreview,
 } from "../../../services/studio";
 import { studioMessageLines } from "./studio-messages";
+import "@pages/pages.css";
 
 export interface ChangeSetCardProps {
   changeSet: StudioChangeSet;
@@ -185,7 +186,7 @@ export function ChangeSetCard({
             ))}
           </SpaceBetween>
         ) : (
-          <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+          <ul className="coa-compact-list">
             {lines.map((line, i) => (
               <li
                 key={i}

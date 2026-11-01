@@ -269,6 +269,42 @@ describe("Ontology designer error helpers", () => {
       ).toEqual([]);
     }
   });
+
+  it("leaves out the entries of a RebaseFailed that are not failures", () => {
+    const failure = {
+      opId: "3:0",
+      op: { op: "add_class", label: "X" },
+      error: "taken",
+    };
+    const failed = new ApiError(409, "RebaseFailed", "x", {
+      detail: {
+        code: "RebaseFailed",
+        failures: [
+          failure,
+          "taken",
+          null,
+          { opId: "3:1", error: "taken" },
+          { opId: "3:2", op: "add_class", error: "taken" },
+          { opId: 4, op: { op: "add_class" }, error: "taken" },
+          { opId: "3:3", op: { op: "add_class" } },
+        ],
+      },
+    });
+    expect(rebaseFailures(failed)).toEqual([failure]);
+  });
+
+  it("answers null for a detail whose code or message is not a string", () => {
+    for (const detail of [
+      { code: 409, message: "moved" },
+      { code: "DraftConflict", message: { text: "moved" } },
+    ]) {
+      expect(
+        studioErrorDetail(
+          new ApiError(409, "DraftConflict", "moved", { detail }),
+        ),
+      ).toBeNull();
+    }
+  });
 });
 
 describe("Ontology designer chat service functions", () => {

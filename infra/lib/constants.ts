@@ -33,6 +33,10 @@ export const CTX_LOGOUT_URLS = "logoutUrls";
 export const CTX_GRAPH_BASE_URI = "graph_base_uri";
 export const CTX_EVENT_SOURCE_PREFIX = "event_source_prefix";
 export const CTX_LAMBDA_RESERVED_CONCURRENCY = "lambda_reserved_concurrency";
+/** Bedrock Guardrails safeguard tier for both guardrails: "classic" (default) or "standard". */
+export const CTX_GUARDRAIL_TIER = "guardrail_tier";
+/** System-defined guardrail profile for the Standard tier, e.g. "apac.guardrail.v1:0". */
+export const CTX_GUARDRAIL_PROFILE = "guardrail_profile";
 
 /** Default values when context keys are not provided. */
 export const DEFAULT_PROJECT_TAG = "semantic-context";
@@ -228,7 +232,7 @@ export const VECTOR_COLLECTION_SUFFIX = "vector-store";
 /** Default extraction configuration — mirrors constants.py. */
 export const DEFAULT_EXTRACTION_CONFIG = {
   extraction_mode: ExtractionMode.CONTINUOUS,
-  use_batch_inference: "false",
+  use_batch_inference: "true",
   enable_versioning: "true",
   enable_proposition_extraction: "true",
   // Corpus-derived entity-class vocabulary; see graph_build.py.

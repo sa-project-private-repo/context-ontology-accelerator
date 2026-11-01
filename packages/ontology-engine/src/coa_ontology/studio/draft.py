@@ -36,12 +36,11 @@ from coa_common import validate_namespace_name
 from coa_ontology import dynamo_store
 from coa_ontology.abox import store as abox_store
 from coa_ontology.catalog.ingest import schema_subjects
+from coa_ontology.studio import iris
+from coa_ontology.studio.messages import english, message
+from coa_ontology.studio.ops import Draft, parse_nt
 from coa_ontology.versions import publish as version_publish
 from coa_ontology.versions import registry, snapshot
-
-from . import iris
-from .messages import english, message
-from .ops import Draft, parse_nt
 
 EDITABLE_STATUSES = ("pending", "updated", "accept_failed")
 FORMAT_VERSION = 1
@@ -337,6 +336,33 @@ def get_record(namespace: str, proposal_id: str, revision: int) -> dict[str, Any
     return record
 
 
+def renames(namespace: str, proposal_id: str, state: StudioState) -> list[dict[str, str]]:
+    """Where each IRI the change sets in effect renamed or merged away ended up, oldest first.
+
+    Every op moves the IRIs that had ended up at its ``old`` IRI on to its ``new`` one, and a merge
+    makes them ``merged``. ``old`` itself is listed too, unless an earlier ``change_iri`` introduced
+    it: that IRI was never in the base, so only the IRIs that reached it are listed.
+    """
+    moved: dict[str, tuple[str, str]] = {}  # an IRI -> (where it ended up, "renamed" or "merged")
+    introduced: set[str] = set()  # the ``newIri`` of every ``change_iri`` so far
+    for n in state.applied:
+        for op in get_record(namespace, proposal_id, n).get("ops") or []:
+            if op.get("op") == "change_iri":
+                old, new, kind = op["iri"], op["newIri"], "renamed"
+            elif op.get("op") == "merge_classes":
+                old, new, kind = op["source"], op["target"], "merged"
+            else:
+                continue
+            for origin, (to, was) in moved.items():
+                if to == old:
+                    moved[origin] = (new, "merged" if "merged" in (was, kind) else "renamed")
+            if old not in introduced:
+                moved[old] = (new, kind)
+            if kind == "renamed":
+                introduced.add(new)
+    return [{"fromIri": o, "toIri": to, "kind": kind} for o, (to, kind) in moved.items() if o != to]
+
+
 def claim_and_write(
     namespace: str, proposal_id: str, start: int, record: dict[str, Any], tbox_nt: str, r2rml_nt: str
 ) -> int:
@@ -480,6 +506,7 @@ def merged_base(
     version (:class:`SnapshotValidationError`, wrapped). Errors of ``bootstrap_if_needed`` and
     ``publish_request_for`` propagate unchanged.
     """
+    # Imported here: proposals imports this module, so a module-level import would be circular.
     from coa_ontology import proposals
 
     head = registry.head_version(namespace)

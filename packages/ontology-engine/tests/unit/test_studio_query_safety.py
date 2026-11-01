@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -210,6 +212,32 @@ def test_service_is_refused_inside_exists_and_subqueries_too(query):
 def test_reserved_prefixes_hints_escapes_and_oversized_queries_are_refused(query):
     with pytest.raises(qs.QueryRefused):
         _prepare(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT * # x\rFROM <http://other>\nWHERE { ?s ?p ?o }",
+        "SELECT * WHERE { ?s ?p ?o # x\rGRAPH ?g { ?a ?b ?c }\n}",
+        "SELECT * WHERE { ?s ?p ?o # x\rSERVICE <http://evil/sparql> { ?a ?b ?c }\n}",
+        f"SELECT * WHERE {{ ?s ?p ?o . # x\r{qs.HINT_PREFIX}:Query {qs.HINT_PREFIX}:queryTimeout 600000 .\n}}",
+        "SELECT * WHERE { ?s ?p ?o # x\u2028GRAPH ?g { ?a ?b ?c }\n}",
+        "SELECT * WHERE { ?s ?p ?o # x\x85GRAPH ?g { ?a ?b ?c }\n}",
+    ],
+)
+def test_a_line_break_that_ends_a_comment_for_the_engine_but_not_for_rdflib_is_refused(query):
+    """SPARQL ends a comment at a lone CR, rdflib and the masking only at LF: the rest of the line ran unchecked."""
+    with pytest.raises(qs.QueryRefused) as raised:
+        _prepare(query)
+    assert raised.value.message == "Line breaks must be LF or CRLF"
+    with pytest.raises(qs.QueryRefused):
+        qs.check_vkg_sparql(query)
+
+
+def test_a_query_with_crlf_line_ends_still_runs():
+    query = "SELECT ?s\r\nWHERE { ?s ?p ?o } # the subjects\r\n"
+    assert _dataset(_prepare(query).text) == sorted(GRAPHS)
+    assert qs.check_vkg_sparql(query) == "SELECT"
 
 
 def test_the_final_query_can_only_see_the_scoped_graphs():
@@ -581,6 +609,8 @@ SERVE_VKG_DECISIONS = {
     "service": ("SELECT * WHERE { SERVICE <http://evil/sparql> { ?s ?p ?o } }", None),
     "insert-data": ("INSERT DATA { <http://e/a> <http://e/b> <http://e/c> }", None),
     "unicode-escape": ('SELECT * WHERE { ?s ?p "\\u0041" }', None),
+    "a-lone-cr-ending-a-comment": ("SELECT * # x\rFROM <http://other>\nWHERE { ?s ?p ?o }", None),
+    "crlf": ("SELECT *\r\nWHERE { ?s ?p ?o } # x\r\n", "SELECT"),
     "20000-characters": (_PLAIN + " " * (20_000 - len(_PLAIN)), "SELECT"),
     "20001-characters": (_PLAIN + " " * (20_001 - len(_PLAIN)), None),
     "not-a-string": (None, None),
@@ -612,6 +642,9 @@ def test_the_vkg_guard_decides_as_serve_s_copy_does(query, decision):
         f"MATCH (e:{ENTITY} {{value: 'x'}}) RETURN size(collect(e))",
         f"MATCH (e:{ENTITY}) WHERE (e.value STARTS WITH 'A' OR e.value IS NULL) RETURN e",
         f"MATCH (e:{ENTITY}) WITH e MATCH (e2:{ENTITY}) RETURN e, e2",
+        f"MATCH (e:{ENTITY}) WHERE e.score > 1.5e-3 OR e.n = 0x1F OR e.m = 1E5 RETURN e",
+        f"MATCH (e:{ENTITY}) // the namespace's entities\r\nRETURN e",
+        f"MATCH (e:{ENTITY})\tRETURN e",
     ],
 )
 def test_cypher_reading_the_namespace_s_nodes_runs(query):
@@ -669,6 +702,21 @@ def test_cypher_reading_the_namespace_s_nodes_runs(query):
         f"MATCH (a:{ENTITY}) WHERE (a)-->(b:{ENTITY}) MATCH (b) RETURN b",
         # A parameter as the property map is not a node pattern the guard reads.
         "MATCH (n $p) RETURN n",
+        # The swarm review's: a lone CR ends a // comment where the masking does not, and a keyword
+        # written right after a number has no \b before it.
+        f"MATCH (n:{ENTITY}) RETURN n // x\rMATCH (m) RETURN m",
+        f"MATCH (n:{ENTITY}) // x\rDETACH DELETE n\nRETURN n",
+        f"MATCH (n:{ENTITY}) WITH n LIMIT 1MATCH (x) RETURN x",
+        f"MATCH (n:{ENTITY}) RETURN 1UNION MATCH (n) RETURN n",
+        f"MATCH (n:{ENTITY}) WITH n LIMIT 1000SET n.value = 'x' RETURN n",
+        f"MATCH (n:{ENTITY}) WITH n LIMIT 1CREATE (m:{ENTITY}) RETURN m",
+        f"MATCH (n:{ENTITY}) WHERE n.value = 1WITH n MATCH (n) RETURN n",
+        # The guard review's: openCypher's reference lexer lets a name hold an ASCII control
+        # character, so (a\x01) is an unlabeled node the node check could not read.
+        "MATCH (a\x01) RETURN a\x01 LIMIT 100",
+        f"MATCH (e:{ENTITY})-->(b\x7f) RETURN b\x7f",
+        f"MATCH (e:{ENTITY}) WHERE (e)--(a\x00) RETURN e",
+        f"MATCH (e:{ENTITY})\x0bRETURN e",
     ],
 )
 def test_cypher_refuses_untenanted_patterns_and_writes(query):
@@ -692,6 +740,22 @@ def test_cypher_refuses_drop_and_an_unterminated_backtick_name(query, message):
     with pytest.raises(qs.QueryRefused) as raised:
         qs.prepare_cypher(query, TENANT, limit=1000, timeout_ms=20000)
     assert raised.value.message == message
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MATCH (" + " " * 19_900 + "!) RETURN 1",
+        "MATCH (/*" + " " * 19_890 + "*/!) RETURN 1",
+        f"MATCH (e:{ENTITY}) RETURN e LIMIT 5" + " " * 19_000 + "x",
+    ],
+)
+def test_cypher_checks_take_linear_time_on_a_long_run_of_spaces(query):
+    """The node pattern's regex backtracked cubically over spaces (minutes at a few thousand), holding the GIL."""
+    started = time.perf_counter()
+    with contextlib.suppress(qs.QueryRefused):
+        qs.prepare_cypher(query, TENANT, limit=1000, timeout_ms=20000)
+    assert time.perf_counter() - started < 1
 
 
 def test_cypher_caps_the_final_return_whatever_comes_before():

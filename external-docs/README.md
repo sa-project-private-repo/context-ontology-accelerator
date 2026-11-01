@@ -15,6 +15,16 @@ pnpm dev        # http://localhost:5175
 pnpm build      # outputs to dist/
 ```
 
+## Images
+
+Put a page's images in `public/images/<page>/`, for example
+`public/images/ontologies/`, and link them with a relative path:
+`![What the screenshot shows](images/ontologies/versions-tab.png)`. Without a
+leading slash the path resolves against the site's own URL, so it works in
+`pnpm dev` and under the base path of the built site (`VITE_BASE`). Crop a
+screenshot to the part that matters, cover account ids, hostnames and email
+addresses, and keep the PNG small (ideally under 300 KB).
+
 ## Generate PDF
 
 Requires [Pandoc](https://pandoc.org/) and LuaLaTeX:
@@ -48,6 +58,7 @@ pandoc \
   content/databricks-sources.md \
   content/package-guide.md \
   content/smithy-codegen.md \
+  --resource-path=.:public \
   --toc --toc-depth=2 --pdf-engine=lualatex \
   -V mainfont="Helvetica Neue" \
   -V monofont="Menlo" \

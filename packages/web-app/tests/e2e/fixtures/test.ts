@@ -4,12 +4,15 @@
 import { test as base, expect } from "@playwright/test";
 import { uniqueName } from "./resources";
 import { forceDeleteNamespaces } from "./control-plane-api";
+import { restoreLabels } from "./designer-api";
 import { NamespacesPage } from "../pages/NamespacesPage";
 import { SourcesPage } from "../pages/SourcesPage";
 import { MetricsPage } from "../pages/MetricsPage";
 import { GrantsPage } from "../pages/GrantsPage";
 import { PlaygroundPage } from "../pages/PlaygroundPage";
 import { SystemHealthPage } from "../pages/SystemHealthPage";
+import { OntologyDesignerPage } from "../pages/OntologyDesignerPage";
+import { OntologyPage } from "../pages/OntologyPage";
 
 /**
  * Extended Playwright `test` for the Context Ontology Accelerator E2E suite: provides the `uniqueName`
@@ -25,6 +28,8 @@ export interface E2EFixtures {
   grantsPage: GrantsPage;
   playgroundPage: PlaygroundPage;
   systemHealthPage: SystemHealthPage;
+  ontologyDesignerPage: OntologyDesignerPage;
+  ontologyPage: OntologyPage;
 }
 
 export const test = base.extend<E2EFixtures>({
@@ -57,6 +62,16 @@ export const test = base.extend<E2EFixtures>({
   },
   systemHealthPage: async ({ page }, use) => {
     await use(new SystemHealthPage(page));
+  },
+  ontologyDesignerPage: async ({ page }, use) => {
+    const pom = new OntologyDesignerPage(page);
+    await use(pom);
+    // A shared draft: put back, through the API, any label the test changed
+    // and did not restore (it failed before its Undo).
+    await restoreLabels(page, pom.renamedTerms());
+  },
+  ontologyPage: async ({ page }, use) => {
+    await use(new OntologyPage(page));
   },
 });
 

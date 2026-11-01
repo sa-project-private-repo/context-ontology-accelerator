@@ -39,6 +39,7 @@ import {
   type Edge,
   type NodeTypes,
   type NodeChange,
+  type AriaLabelConfig,
   Handle,
   Position,
   ReactFlowProvider,
@@ -632,22 +633,7 @@ function OntologyNode({ data }: { data: GraphNodeData }) {
           role="img"
           title={data.badge.title}
           aria-label={data.badge.title ?? data.badge.text}
-          style={{
-            position: "absolute",
-            top: 4,
-            left: "50%",
-            transform: "translateX(-50%)",
-            minWidth: 20,
-            padding: "0 5px",
-            borderRadius: 8,
-            background: "#0f172a",
-            color: "#ffffff",
-            fontSize: 9,
-            fontWeight: 700,
-            lineHeight: "14px",
-            textAlign: "center",
-            opacity: data.badge.dimmed ? 0.45 : 1,
-          }}
+          style={{ opacity: data.badge.dimmed ? 0.45 : 1 }}
         >
           {data.badge.text}
         </span>
@@ -925,6 +911,18 @@ function OntologyGraphFlowInner({
   );
 
   const { t } = useAppI18n();
+  // React Flow's own control and minimap labels are English defaults; route
+  // them through the catalogue so screen readers hear the UI language.
+  const ariaLabelConfig: Partial<AriaLabelConfig> = useMemo(
+    () => ({
+      "controls.ariaLabel": t("Control Panel"),
+      "controls.zoomIn.ariaLabel": t("Zoom In"),
+      "controls.zoomOut.ariaLabel": t("Zoom Out"),
+      "controls.fitView.ariaLabel": t("Fit View"),
+      "minimap.ariaLabel": t("Mini Map"),
+    }),
+    [t],
+  );
   const flowNodes: OntologyFlowNode[] = useMemo(
     () =>
       visibleNodes.map((n) => ({
@@ -1666,6 +1664,7 @@ function OntologyGraphFlowInner({
           maxZoom={2.5}
           nodesDraggable
           proOptions={{ hideAttribution: true }}
+          ariaLabelConfig={ariaLabelConfig}
         >
           <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
           <Controls showInteractive={false} />
@@ -1694,9 +1693,9 @@ function OntologyGraphFlowInner({
               {isFullscreen ? t("Exit full screen") : t("Full screen")}
             </button>
           </Panel>
-          <MiniMap
+          <MiniMap<OntologyFlowNode>
             nodeColor={(n) => {
-              const mark = n.data?.highlight as GraphHighlight | undefined;
+              const mark = n.data?.highlight;
               if (mark) return HIGHLIGHT_COLORS[mark].border;
               const kind =
                 typeof n.data?.kind === "string" ? n.data.kind : "unknown";

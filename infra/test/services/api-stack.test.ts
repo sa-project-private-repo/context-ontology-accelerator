@@ -345,6 +345,34 @@ describe("ApiStack request throttling", () => {
     });
   });
 
+  describe("ontology version and domain ABox routes", () => {
+    // A version deploy starts a graph swap and an embedding rebuild; each domain
+    // ABox route queues a full rebuild. Asserted on the stage, not the constant:
+    // a route missing from the served spec is skipped without a throttle.
+    let template: Template;
+    beforeAll(() => {
+      template = mkApi();
+    });
+
+    it.each([
+      ["POST", "/namespaces/{namespaceId}/ontology/versions/{version}/deploy"],
+      ["POST", "/namespaces/{namespaceId}/abox/rebuild"],
+      ["PUT", "/namespaces/{namespaceId}/abox/mappings/{mappingId}"],
+      ["DELETE", "/namespaces/{namespaceId}/abox/mappings/{mappingId}"],
+    ])("applies the per-method throttle to %s %s", (method, route) => {
+      template.hasResourceProperties("AWS::ApiGateway::Stage", {
+        MethodSettings: Match.arrayWith([
+          Match.objectLike({
+            HttpMethod: method,
+            ResourcePath: `/${route.replaceAll("/", "~1")}`,
+            ThrottlingRateLimit: 5,
+            ThrottlingBurstLimit: 10,
+          }),
+        ]),
+      });
+    });
+  });
+
   it("honors per-operation throttle overrides", () => {
     const template = mkApi({
       expensiveThrottleRateLimit: 2,

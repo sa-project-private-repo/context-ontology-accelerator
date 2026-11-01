@@ -25,11 +25,10 @@ from rdflib import URIRef
 
 from coa_ontology.abox import queries as abox_queries
 from coa_ontology.catalog.ingest import schema_subjects
-
-from . import changes, changesets, checks, graph_view, iris, queries, questions
-from . import draft as store
-from .iris import check_iri
-from .ops import (
+from coa_ontology.studio import changes, changesets, checks, graph_view, iris, queries, questions
+from coa_ontology.studio import draft as store
+from coa_ontology.studio.iris import check_iri
+from coa_ontology.studio.ops import (
     CLASS,
     DATATYPE_PROPERTY,
     KIND_WORDS,
@@ -39,7 +38,7 @@ from .ops import (
     mentioned,
     named_parents,
 )
-from .query_safety import QueryRefused, tenant_labels
+from coa_ontology.studio.query_safety import QueryRefused, tenant_labels
 
 _log = logging.getLogger("studio.agent_tools")
 TOOL_FAILED = "The tool failed on the server; try again later."

@@ -44,6 +44,7 @@ from coa_serve.lexical.strategies import (
     StrategySpec,
 )
 from coa_serve.tier3.graph_traverser import GraphEntity
+from coa_serve.tier3.synthesizer import MAX_PROMPT_CHUNKS
 from coa_serve.tier3.vector_retriever import ChunkResult
 
 # ── Endpoint fixtures (NDB / NA) ────────────────────────────────────
@@ -103,13 +104,18 @@ class _FakeNode:
     attributes.
     """
 
+    node_id: str
+    text: str
+    score: float
+    metadata: dict
+
     __slots__ = ("node_id", "text", "score", "metadata")
 
 
 def make_toolkit_node(
     node_id: str = "n1",
     text: str = "some text",
-    score: float = 0.5,
+    score: float | None = 0.5,
     metadata: dict | None = None,
 ) -> _FakeNode:
     """Build a fake toolkit node carrying ``metadata`` for ``_map_results``."""
@@ -171,7 +177,11 @@ def topic_beam_nodes(results: list[tuple[str, str, list[str]]]) -> list:
     retriever = TopicBeamSearch(
         graph_store=MagicMock(),
         vector_store=MagicMock(),
-        processor_args=ProcessorArgs(reranker="tfidf", max_search_results=10, max_statements_per_topic=10),
+        # ``include_chunk_details`` as the topic_beam engine now sets it: without it the
+        # toolkit returns each chunk with no text and the baseline drops it.
+        processor_args=ProcessorArgs(
+            reranker="tfidf", max_search_results=10, max_statements_per_topic=10, include_chunk_details=True
+        ),
     )
     raw = [
         {
@@ -182,7 +192,9 @@ def topic_beam_nodes(results: list[tuple[str, str, list[str]]]) -> list:
                     {
                         "topic": statements[0],
                         "topicId": f"topic-{chunk_id}",
-                        "chunks": [{"chunkId": chunk_id}],
+                        # The shape the toolkit returns with ``include_chunk_details``:
+                        # the text is under ``metadata``, never at the top level.
+                        "chunks": [{"chunkId": chunk_id, "value": None, "metadata": {"value": " ".join(statements)}}],
                         "statements": [
                             {"statementId": f"{chunk_id}-{n}", "statement": text, "chunkId": chunk_id, "score": 1.0}
                             for n, text in enumerate(statements)
@@ -207,14 +219,25 @@ def make_synthesizer(
     duration_ms: int = 42,
     guardrail_blocked: bool = False,
 ) -> AsyncMock:
-    """An ``AsyncMock`` synthesizer returning a fixed synthesis result."""
+    """An ``AsyncMock`` synthesizer returning a fixed synthesis result.
+
+    Like the real ``Synthesizer`` (no screener configured), it reports the first
+    ``MAX_PROMPT_CHUNKS`` input chunks as ``prompt_chunks``, the chunks the
+    retriever then cites, and passes the graph entities through unchanged.
+    """
     synth = AsyncMock()
-    synth.synthesize.return_value = MagicMock(
-        answer=answer,
-        confidence=confidence,
-        duration_ms=duration_ms,
-        guardrail_blocked=guardrail_blocked,
-    )
+
+    async def _synthesize(query, chunks, graph_entities, **kwargs):
+        return MagicMock(
+            answer=answer,
+            confidence=confidence,
+            duration_ms=duration_ms,
+            guardrail_blocked=guardrail_blocked,
+            prompt_chunks=tuple(chunks[:MAX_PROMPT_CHUNKS]),
+            graph_entities=tuple(graph_entities),
+        )
+
+    synth.synthesize.side_effect = _synthesize
     return synth
 
 

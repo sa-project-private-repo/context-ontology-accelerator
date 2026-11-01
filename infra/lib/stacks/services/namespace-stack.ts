@@ -653,7 +653,9 @@ export class NamespaceStack extends SCLStack {
         Paths.commonLib,
         Paths.smithyGeneratedControlPlanePythonServer,
       ],
-      requirementsFile: fromRoot("packages/control-plane/requirements.txt"),
+      requirementsFile: fromRoot(
+        "packages/control-plane/requirements.lock.txt",
+      ),
     });
 
     // ── Namespace API Lambda (combined create + list + delete-trigger) ──
@@ -829,6 +831,7 @@ export class NamespaceStack extends SCLStack {
     const deletionPipeline: NamespaceDeletionPipeline =
       new NamespaceDeletionPipeline(this, "DeletionPipeline", {
         prefixed: (name: string) => this.prefixed(name),
+        aossName: (name: string) => this.aossName(name),
         lambdaCode,
         vpc: props.vpc,
         vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },

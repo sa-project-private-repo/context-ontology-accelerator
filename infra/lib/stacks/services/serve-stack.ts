@@ -12,7 +12,11 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import { DockerImageAsset, Platform } from "aws-cdk-lib/aws-ecr-assets";
 import { Construct } from "constructs";
 import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/alarm/action";
-import { resolveContext, namespaceTagKey } from "../../context";
+import {
+  resolveContext,
+  namespaceTagKey,
+  guardrailProfileResources,
+} from "../../context";
 import { agentCoreSupportedSubnets } from "../../utils/agentcore-az";
 import { retainAgentCoreSecurityGroup } from "../../utils/agentcore-teardown";
 import { brandEnv } from "../../utils/brand-env";
@@ -299,22 +303,12 @@ export class ServeStack extends SCLStack {
         // index.py imports coa_common (resolve_region); include
         // libs/common/src + its runtime deps or the Lambda fails at import
         // with Runtime.ImportModuleError: No module named
-        // 'coa_common'. Each dep is single-quoted in the install command, so a
-        // `>=` spec is not read as a shell redirect.
+        // 'coa_common'.
         fromRoot("libs/common/src"),
       ],
-      pipDeps: [
-        "opensearch-py",
-        "requests-aws4auth",
-        "cedarpy",
-        "cryptography",
-        "pydantic-settings",
-        "PyJWT",
-        "requests",
-        "structlog",
-        // First certifi without the roots behind the compromised emSign intermediates.
-        "certifi>=2026.10.19",
-      ],
+      requirementsFile: fromRoot(
+        "packages/context-manager/lambda/aoss-search-proxy/requirements.lock.txt",
+      ),
       architecture: "arm64",
     });
 
@@ -352,7 +346,7 @@ export class ServeStack extends SCLStack {
     );
 
     new opensearchserverless.CfnAccessPolicy(this, "OSSProxyDataAccess", {
-      name: this.prefixed("proxy-read-only"),
+      name: this.aossName("proxy-read-only"),
       type: "data",
       // NOTE: keep this description in sync with the deployed policy. AOSS's
       // UpdateAccessPolicy API rejects an update that only removes the
@@ -494,6 +488,11 @@ export class ServeStack extends SCLStack {
           // TODO(aoss-proxy): Remove when AgentCore supports AOSS directly
           OPENSEARCH_PROXY_LAMBDA_ARN: aossProxyFn.functionArn,
           ATHENA_OUTPUT_S3: `s3://${props.athenaResultsBucketName ?? this.prefixed("athena-results")}/`,
+          // Platform bucket that holds UPLOADED documents (<namespaceId>/raw/<uploadId>/...).
+          // Upload sources carry no bucket of their own, so Deep Reasoning's document
+          // reads resolve them here. Same name the sources stack gives the bucket; the
+          // prefix-scoped S3 read grant below already covers it.
+          SOURCES_DATA_BUCKET: `${this.prefixed("sources-data")}-${account}`,
           ATHENA_WORKGROUP_PREFIX: `${this.prefixed("")}`,
           // ATHENA_WORKGROUP_PREFIX is a fallback; primary resolution reads
           // athenaWorkgroupName from the namespaces DDB table at runtime.
@@ -578,6 +577,17 @@ export class ServeStack extends SCLStack {
               this.node.tryGetContext("serve_nl2sql_graph_expand"),
             ),
           }),
+          // Deployment-wide switch for the recommended Deep Reasoning options that a
+          // request leaves unset. "off" puts every option back to off, for callers
+          // that cannot send per-request options (the REST Query contract carries
+          // none). Absent: the variable is not set and the recommended set applies.
+          ...(this.node.tryGetContext(
+            "serve_deep_reasoning_default_options",
+          ) !== undefined && {
+            DEEP_REASONING_DEFAULT_OPTIONS: String(
+              this.node.tryGetContext("serve_deep_reasoning_default_options"),
+            ),
+          }),
           // Companion budget: how many walked tables may be appended (default 8 in
           // code — the value the walk was benchmarked at). Raise when the missing
           // join table is plausibly further down the FK ordering.
@@ -644,7 +654,11 @@ export class ServeStack extends SCLStack {
           GRAPH_URI_TEMPLATE: `${DEFAULT_GRAPH_URI_BASE}/{namespace}`,
           // Tier 3 appends the domain ABox's facts to the lexical prompt. Serve still
           // skips the ABox when its version differs from the deployed domain graph's.
-          ABOX_CONTEXT_ENABLED: "true",
+          // `-c abox_context_enabled=false` turns it off; a value set on the runtime
+          // outside CDK does not last, since every deploy writes this one.
+          ABOX_CONTEXT_ENABLED: String(
+            this.node.tryGetContext("abox_context_enabled") ?? "true",
+          ),
           DATA_SOURCES_TABLE: dataSourcesTableName,
           NAMESPACES_TABLE: namespacesTableName,
           // Serve-path Cedar: DDB role-policy loading (control-plane parity).
@@ -739,6 +753,7 @@ export class ServeStack extends SCLStack {
             `arn:aws:bedrock:*:${account}:inference-profile/*`,
             `arn:aws:bedrock:*::foundation-model/*`,
             `arn:aws:bedrock:${region}:${account}:guardrail/*`,
+            ...guardrailProfileResources(this),
           ],
         }),
       );
@@ -1272,7 +1287,7 @@ export class ServeStack extends SCLStack {
       );
 
       new opensearchserverless.CfnAccessPolicy(this, "OSSServeDataAccess", {
-        name: this.prefixed("serve-read-only"),
+        name: this.aossName("serve-read-only"),
         type: "data",
         // Keep in sync with the deployed policy — AOSS rejects a description-only
         // removal on update (see OSSProxyDataAccess note above).

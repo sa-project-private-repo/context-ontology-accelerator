@@ -24,6 +24,10 @@ omitted Tool and the missing endpoint/config (Req 12.6):
 | ``nl_to_sql``              | a ``StructuredQueryTier`` is supplied           |
 | ``nl_to_sparql``           | a ``StructuredQueryTier`` is supplied           |
 | ``ontology_lookup``        | ALWAYS (the file source needs no endpoint)      |
+| ``read_document``          | a ``SourcesRegistry`` is supplied (and          |
+|                            | available); offered per request only            |
+| ``find_documents``         | as ``read_document``, plus Neptune and/or       |
+|                            | OpenSearch; offered per request only            |
 
 ``nl_to_sql`` / ``nl_to_sparql`` are additionally PER-NAMESPACE gated at request time: the retriever
 withholds it from the planner on a namespace with no structured source (endpoint
@@ -61,6 +65,9 @@ from ..vector_retriever import VectorRetriever
 from .budget import AgenticBudgetConfig
 from .ontology import OntologyFileSource, OntologyGraphSource
 from .tools.chunk_tool import build_chunk_expansion_tool
+from .tools.document_tool import build_document_tool
+from .tools.find_documents_tool import build_find_documents_tool
+from .tools.graph_tool import TOOL_NAME as GRAPH_TOOL
 from .tools.graph_tool import build_graph_tool
 from .tools.ontology_tool import build_ontology_tool
 from .tools.registry import ToolRegistry
@@ -142,6 +149,7 @@ def build_tool_registry(
     ontology_source: OntologySource | None = None,
     structured_query_tier: Any | None = None,
     served_versions: ServedVersionReader | None = None,
+    sources_registry: Any | None = None,
 ) -> ToolRegistry:
     """Build the internal :class:`ToolRegistry` with endpoint-gated tools (Req 12.4-12.6).
 
@@ -166,6 +174,9 @@ def build_tool_registry(
         served_versions: Optional reader of the ontology version Neptune serves, the
             one serve shares with Tier 2. The ``graph`` ontology source keys its
             cache on it; ``None`` gives that source a reader of its own.
+        sources_registry: Optional serve-layer ``SourcesRegistry``; when supplied
+            and available the ``read_document`` tool is registered (the retriever
+            still withholds it from the planner unless the request opts in).
 
     Returns:
         The populated :class:`ToolRegistry`, never exposed outside the Serve_Layer
@@ -258,6 +269,37 @@ def build_tool_registry(
             reason="no StructuredQueryTier supplied (structured retrieval unavailable)",
         )
 
+    # ── Read_Document_Tool — when the sources registry is wired ────────
+    # Reads a source document's full text, scoped to the request namespace's
+    # registered DOCUMENTS sources. Registered process-wide; the retriever offers
+    # it to the planner only on requests that set ``options.readDocument``.
+    if sources_registry is not None and getattr(sources_registry, "available", False):
+        # The graph tool's __Source__ lookup resolves a chunk's opaque document id
+        # to its key for chunks whose text carries no source header.
+        graph_tool = registry.get(GRAPH_TOOL)
+        build_document_tool(
+            registry,
+            sources_registry,
+            source_key_resolver=getattr(graph_tool, "resolve_source_key", None),
+        )
+        # Names -> source documents (offered per request via options.entityRouting):
+        # graph entity mentions plus an exact-phrase search of the raw chunk text.
+        from coa_common import graphrag_chunk_index_name
+
+        build_find_documents_tool(
+            registry,
+            sources_registry,
+            graph_tool=graph_tool,
+            vector_client=clients.vector if has_opensearch else None,
+            chunk_index_for=graphrag_chunk_index_name,
+        )
+    else:
+        logger.info(
+            "agentic_tool_omitted",
+            tool="read_document",
+            reason="no sources registry supplied (document sources cannot be scoped)",
+        )
+
     # ── Ontology_Lookup_Tool — ALWAYS (Req 12.4) ───────────────────────
     source = ontology_source if ontology_source is not None else build_ontology_source(config, clients)
     # The graph source reads the deployed ontology, so its cache follows the version
@@ -287,6 +329,7 @@ def build_agentic_retriever(
     structured_query_tier: Any | None = None,
     guardrail_id_provider: Callable[[], str] | None = None,
     served_versions: ServedVersionReader | None = None,
+    sources_registry: Any | None = None,
 ) -> AgenticRetriever:
     """Compose the :class:`AgenticRetriever` from the registry and its collaborators.
 
@@ -323,6 +366,8 @@ def build_agentic_retriever(
             reaches the warm agentic path without a redeploy.
         served_versions: Optional reader of the served ontology version, forwarded
             to :func:`build_tool_registry` for the ontology lookup's cache.
+        sources_registry: Optional serve-layer ``SourcesRegistry`` forwarded to
+            :func:`build_tool_registry` to enable the ``read_document`` tool.
 
     Returns:
         The composed :class:`AgenticRetriever`.
@@ -342,6 +387,7 @@ def build_agentic_retriever(
             vector_retriever=vector_retriever,
             structured_query_tier=structured_query_tier,
             served_versions=served_versions,
+            sources_registry=sources_registry,
         )
     )
     # The agentic path synthesizes over EVERY chunk its multi-step session gathered

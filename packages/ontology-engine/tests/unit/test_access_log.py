@@ -3,6 +3,8 @@
 
 """uvicorn's access log lines keep no query string (``coa_ontology.main``)."""
 
+from __future__ import annotations
+
 import logging
 
 import coa_ontology.main  # noqa: F401 - installs the access log filter

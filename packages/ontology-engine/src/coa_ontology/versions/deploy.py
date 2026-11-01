@@ -719,6 +719,7 @@ def _request_abox_build(namespace: str, version: int) -> None:
     """
     for attempt in (1, 2):
         try:
+            # Imported here: abox.build imports this module, so a module-level import would be circular.
             from coa_ontology.abox import build as abox_build
 
             abox_build.request_build(namespace, f"deploy v{version}")

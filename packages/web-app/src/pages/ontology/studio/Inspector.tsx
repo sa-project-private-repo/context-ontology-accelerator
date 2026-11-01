@@ -35,9 +35,10 @@ import type {
   StudioTermRef,
 } from "../../../services/studio";
 import { useAppI18n, type AppTranslate } from "../../../i18n/LocaleProvider";
-import { sourceFileName } from "../abox/abox-helpers";
+import { sourceFileName } from "@pages/ontology/abox/abox-helpers";
 import { DATATYPES, iriTail, sqlName } from "./studio-helpers";
 import { TermPicker } from "./TermPicker";
+import "@pages/pages.css";
 
 const XSD = "http://www.w3.org/2001/XMLSchema#";
 function matchKinds(t: AppTranslate): SelectProps.Option[] {
@@ -215,7 +216,7 @@ function DomainExamples({
       if (request === evidenceRequest.current) setOpen(detail);
     } catch (e) {
       if (request === evidenceRequest.current) {
-        setEvidenceError((e as Error).message);
+        setEvidenceError(e instanceof Error ? e.message : String(e));
       }
     }
   }
@@ -227,7 +228,7 @@ function DomainExamples({
   }
   return (
     <SpaceBetween size="xs">
-      <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+      <ul className="coa-compact-list">
         {rows.map((r) => (
           <li key={r.iri}>
             {r.label}{" "}
@@ -243,7 +244,7 @@ function DomainExamples({
               (open.evidence.length === 0 ? (
                 <Box color="text-body-secondary">{t("No evidence")}</Box>
               ) : (
-                <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                <ul className="coa-compact-list">
                   {open.evidence.slice(0, EVIDENCE_SHOWN).map((ev) => (
                     <li key={ev.chunkId}>
                       <Box variant="small" display="inline">
@@ -726,7 +727,7 @@ function TermForms({
               </Box>
             </SpaceBetween>
           ) : (
-            <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+            <ul className="coa-compact-list">
               {term.mappings.map((m, i) => (
                 <li key={`${m.triplesMap}-${i}`}>
                   {[

@@ -24,20 +24,30 @@ from rdflib import OWL, RDF, RDFS, Graph, URIRef
 from rdflib.namespace import SKOS
 from rdflib.term import Node
 
+from coa_ontology import proposals
 from coa_ontology.abox import mapping as abox_mapping
 from coa_ontology.abox.model import iri_tail, norm
 from coa_ontology.abox.tbox import load_tbox
 from coa_ontology.catalog.ingest import _mapped_predicates_from_r2rml, schema_subjects
 from coa_ontology.datasource_ids import bare_datasource_id
+from coa_ontology.studio import draft as store
+from coa_ontology.studio import graph_view, iris, ops
+from coa_ontology.studio.iris import IriError, IriScheme
+from coa_ontology.studio.messages import Message, english, message
+from coa_ontology.studio.ops import (
+    CLASS,
+    DATATYPE_PROPERTY,
+    OBJECT_PROPERTY,
+    RR,
+    Draft,
+    answered_classes,
+    kind_of,
+    label_of,
+    mapped_classes,
+)
 from coa_ontology.versions import deploy as version_deploy
 from coa_ontology.versions import publish as version_publish
 from coa_ontology.versions import registry, snapshot, storage
-
-from . import draft as store
-from . import graph_view, iris, ops
-from .iris import IriError, IriScheme
-from .messages import Message, english, message
-from .ops import CLASS, DATATYPE_PROPERTY, OBJECT_PROPERTY, RR, Draft, kind_of, label_of
 
 _log = logging.getLogger("studio.checks")
 MAX_FINDINGS = 200
@@ -199,41 +209,6 @@ def instant_checks(d: Draft, scheme: IriScheme) -> dict[str, Any]:
 
 
 # ── Structured queries ──────────────────────────────────────────────────────
-
-
-def mapped_classes(r2rml: Graph) -> set[URIRef]:
-    """The classes the mapping maps: each is the ``rr:class`` of the subject map of a node typed ``rr:TriplesMap``."""
-    return {
-        c
-        for t in r2rml.subjects(RDF.type, RR.TriplesMap)
-        for sm in r2rml.objects(t, RR.subjectMap)
-        for c in r2rml.objects(sm, RR["class"])
-        if isinstance(c, URIRef)
-    }
-
-
-def answered_classes(g: Graph, mapped: set[URIRef]) -> set[URIRef]:
-    """The mapped classes and the unmapped ones structured queries still answer, by serve's rule.
-
-    Serve's rule (``coa_serve.tier2.unmapped_terms``, whose ``coa:isMapped true`` is this ``mapped``):
-    a class without a mapping is answered when a mapped class reaches it by a forward
-    ``rdfs:subClassOf|owl:equivalentClass`` path, or when the class itself states
-    ``owl:equivalentClass`` to a mapped class. A class whose own ``owl:equivalentClass``
-    names a class that is only answered, not a mapped one, is not answered (an equivalence the
-    answered class states is part of the forward path, and does answer the other class): serve lists
-    it as a term no table maps, and both Tier 2 writers decline a question about it. The query console
-    (``refuse_vkg_terms``) is looser and refuses no such class.
-    """
-    answered = set(mapped)
-    stack = list(mapped)
-    while stack:
-        c = stack.pop()
-        for n in (*g.objects(c, RDFS.subClassOf), *g.objects(c, OWL.equivalentClass)):
-            if isinstance(n, URIRef) and n not in answered:  # a class already answered ends a cycle
-                answered.add(n)
-                stack.append(n)
-    # The one hop serve allows the other way round, stated on the unmapped class's own side.
-    return answered | {c for m in mapped for c in g.subjects(OWL.equivalentClass, m) if isinstance(c, URIRef)}
 
 
 def _group(terms: list[dict[str, Any]]) -> dict[str, Any]:
@@ -490,18 +465,16 @@ def structured(
 
 def _tables(namespace: str, item: dict[str, Any], state: store.StudioState, d: Draft, r2rml_nt: str) -> dict:
     """The tables the draft's mapping names that the source catalog does not have (as the version publish checks it)."""
-    from coa_ontology.proposals import SchemaSqlCoverageError, _generate_schema_sql
-
     if not r2rml_nt.strip():
         return {"checked": False, "missing": []}
     metadata = item.get("metadata") or {}
     datasources = {bare_datasource_id(str(x)) for x in metadata.get("datasource_ids") or []}
     datasources |= version_publish._datasource_ids(d.r2rml)
     try:
-        _generate_schema_sql(
+        proposals._generate_schema_sql(
             namespace, state.ontology_id, r2rml_nt, extra_datasource_ids=sorted(datasources), scan_accepted=False
         )
-    except SchemaSqlCoverageError as e:
+    except proposals.SchemaSqlCoverageError as e:
         return {"checked": True, "missing": sorted(e.missing)}
     return {"checked": True, "missing": []}
 
@@ -511,10 +484,10 @@ def _moved(namespace: str, proposal_id: str, state: store.StudioState, classes: 
 
     As in the accept preview, a class whose last IRI is no class of the draft any more was removed.
     """
-    from .router import _renames
-
     return {
-        r["fromIri"]: (r["toIri"], r["kind"]) for r in _renames(namespace, proposal_id, state) if r["toIri"] in classes
+        r["fromIri"]: (r["toIri"], r["kind"])
+        for r in store.renames(namespace, proposal_id, state)
+        if r["toIri"] in classes
     }
 
 

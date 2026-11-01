@@ -9,6 +9,8 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
+from coa_common.constants import GRAPH_BASE_URI
+
 COA = "urn:coa:vocab#"
 DOMAIN_ABOX = f"{COA}DomainAbox"
 CONFORMS_TO_VERSION = f"{COA}conformsToVersion"
@@ -59,8 +61,8 @@ def norm_key(name: str) -> str:
 
 
 def ns_data(namespace: str) -> str:
-    """Base IRI of a namespace's data resources."""
-    return f"http://coa.amazon.com/namespace/{namespace}/data/"
+    """Base IRI of a namespace's data resources: ``{GRAPH_BASE_URI}/namespace/{ns}/data/``."""
+    return f"{GRAPH_BASE_URI}/namespace/{namespace}/data/"
 
 
 def iri_tail(iri: str) -> str:

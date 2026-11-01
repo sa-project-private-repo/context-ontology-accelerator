@@ -9,3 +9,11 @@
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
+
+/* A bulleted list set flush inside a dialog, card or panel: no margins, the
+   bullets in a narrow indent (the Ontology designer's lists of terms, ops and
+   changes). */
+.coa-compact-list {
+  margin: 0;
+  padding-inline-start: 18px;
+}

@@ -93,7 +93,7 @@ npm run test
 End-to-end browser tests live under `tests/e2e/` and drive a real headless
 Chromium against a **deployed** environment (not the local build). They cover
 the core steward/analyst journeys: auth, namespaces, data-source onboarding,
-metrics, grants, and the Playground.
+metrics, grants, the Playground, and the Ontology designer.
 
 #### One-time setup
 
@@ -123,6 +123,27 @@ id, so it has no default — the same rule the credentials above follow:
 
 That spec is also gated behind `E2E_SLOW` (it runs a real scan and enrichment,
 several minutes), so it needs both `E2E_SLOW=1` and `E2E_GLUE_CATALOG_ID` to run.
+
+The Ontology designer specs (`--project=ontology-designer`) run on a draft that
+is already open, because inducing one takes minutes. Neither id has a default:
+the draft spec skips unless both are set, the Versions and Domain data spec
+unless the namespace id is.
+
+| Variable                    | Required                              | Description                                                                                                                                                                                                                                                                                          |
+| --------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `E2E_DESIGNER_NAMESPACE_ID` | Yes (for the ontology-designer specs) | Namespace with a deployed ontology version, built domain data and a proposal open in the Ontology designer.                                                                                                                                                                                          |
+| `E2E_DESIGNER_PROPOSAL_ID`  | Yes (for the draft spec)              | That proposal, with a label: the first test checks that the proposal page and the designer show the same title, and without a label they fall back to different ones. Its draft needs an editable class with a label of its own and a class with no table mapping (a class from documents has none). |
+
+The label change test also needs a test user who may change the namespace's
+ontology: for a data analyst or a platform viewer, Save label stays disabled.
+
+They accept, deploy, roll back and delete nothing. The one write, a class label
+change, is undone by the test, and the fixture puts the label back through the
+API if the test fails first, so the draft keeps its content. Its history grows,
+though: each run adds two revisions and two History entries (the change, then
+its undo), and afterwards Redo holds the change, so pressing Redo renames the
+class to `e2e-designer-<epoch>-<worker>`. Like any change, the test's clears
+what Redo held before it.
 
 When credentials are absent, every environment-dependent test **skips** (the run
 still exits 0), so the suite is safe to run anywhere.

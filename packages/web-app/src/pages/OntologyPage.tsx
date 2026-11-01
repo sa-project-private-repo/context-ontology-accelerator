@@ -59,6 +59,7 @@ import {
 import { SortableTable } from "@components/SortableTable";
 import { OntologyDeleteWarning } from "@components/ontology/OntologyDeleteWarning";
 import {
+  localizeOntologyType,
   ontologyTypeDisplay,
   ontologyTypeGroup,
 } from "@utils/ontology-display";
@@ -1113,13 +1114,6 @@ export const ONTOLOGY_INGEST_STATUS: Record<
   ingesting: { type: "in-progress", label: "Ingesting" },
 };
 
-const ONTOLOGY_TYPE_MESSAGES: Record<string, AppMessage> = {
-  Induced: "Induced",
-  Foundational: "Foundational",
-  Uploaded: "Uploaded",
-  Unknown: "Unknown",
-};
-
 const PROPOSAL_STATUS_MESSAGES: Record<string, AppMessage> = {
   accepted: "accepted",
   "accept failed": "accept failed",
@@ -1130,7 +1124,8 @@ const PROPOSAL_STATUS_MESSAGES: Record<string, AppMessage> = {
   accepting: "accepting",
   pending: "pending",
   updated: "updated",
-  // Falls through proposalStatusDisplay unchanged, like pending and updated.
+  // Set when a pending proposal is cancelled; the label falls through
+  // proposalStatusDisplay unchanged, so it needs its own entry here.
   cancelled: "cancelled",
 };
 
@@ -1592,10 +1587,11 @@ function OntologiesTab({
               if (isAvailable) {
                 return <Badge color="green">{t("Foundational")}</Badge>;
               }
-              const { label, color } = ontologyTypeDisplay(e.ontologyType);
-              const message = ONTOLOGY_TYPE_MESSAGES[label];
+              const { color } = ontologyTypeDisplay(e.ontologyType);
               return (
-                <Badge color={color}>{message ? t(message) : label}</Badge>
+                <Badge color={color}>
+                  {localizeOntologyType(e.ontologyType, t)}
+                </Badge>
               );
             },
           },
